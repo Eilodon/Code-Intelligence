@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# SQLite / codeindex DB
+.codeindex/
+*.db
+*.db-wal
+*.db-shm
+
+# Coverage
+.coverage
+coverage.out
+coverage.xml
+lcov.info
+coverage/
+.nyc_output/
+
+# Node / TypeScript
+node_modules/
+*.js.map
+dist/
+.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

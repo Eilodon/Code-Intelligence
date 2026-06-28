@@ -43,8 +43,8 @@ def find_owners(patterns: list[tuple[str, list[str]]], file_path: str) -> list[s
     file_path_normalized = file_path.lstrip("/")
 
     def _match_path_pattern(pattern_parts: list[str], file_parts: list[str]) -> bool:
-        """Segment-by-segment match: '*' cannot cross '/'."""
-        if len(pattern_parts) > len(file_parts):
+        """Segment-by-segment match: '*' cannot cross '/'. Segment count must match exactly."""
+        if len(pattern_parts) != len(file_parts):
             return False
         return all(fnmatch.fnmatch(fp, pp) for pp, fp in zip(pattern_parts, file_parts))
 

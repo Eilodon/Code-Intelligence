@@ -9,6 +9,9 @@ def compute_hotspots(
     since: str = "6 months ago",
     min_churn: int = 2,
     include_symbols: bool = False,
+    risk_critical_threshold: float = 0.75,
+    risk_high_threshold: float = 0.50,
+    risk_medium_threshold: float = 0.25,
 ) -> dict[str, Any]:
     """
     Returns a dict matching the HotspotsOutput TS schema.
@@ -117,9 +120,9 @@ def compute_hotspots(
             score = norm_compl  # no git: pure complexity score
         
         level = (
-            "critical" if score >= 0.75 else
-            "high"     if score >= 0.50 else
-            "medium"   if score >= 0.25 else
+            "critical" if score >= risk_critical_threshold else
+            "high"     if score >= risk_high_threshold else
+            "medium"   if score >= risk_medium_threshold else
             "low"
         )
         cd = candidates[path]

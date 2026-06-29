@@ -29,3 +29,15 @@ jobs:
 
       - name: Audit
         run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2026-0189
+
+  stack-graphs-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Stack Graphs Regression Corpus
+        run: cargo test --test parity_test test_formal_edges -- --nocapture

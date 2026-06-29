@@ -1,0 +1,19 @@
+[
+  {
+    "steps": [
+      {
+        "symbol": "A",
+        "edge_confidence": null
+      },
+      {
+        "symbol": "B",
+        "edge_confidence": "textual"
+      },
+      {
+        "symbol": "C",
+        "edge_confidence": "textual"
+      }
+    ],
+    "length": 2
+  }
+]

@@ -5,14 +5,41 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Build the synthetic fixture DB in-memory.
+///
+/// Ported from the retired Python `build_synthetic_db.py` (see `legacy/`). Keeping this
+/// as Rust means the parity suite reproduces from a clean checkout with no Python
+/// interpreter and no committed binary `.db` blob.
+///
+/// Graph shape: 3 files, 3 symbols (A, B, C); edges A→B, B→C.
+fn build_synthetic_db(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "CREATE TABLE file_index (path TEXT PRIMARY KEY, hash TEXT NOT NULL, language TEXT, symbol_count INTEGER NOT NULL DEFAULT 0, last_indexed REAL NOT NULL, mtime REAL);
+         CREATE TABLE symbols (id INTEGER PRIMARY KEY AUTOINCREMENT, qualified_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, signature TEXT NOT NULL DEFAULT '', docstring TEXT NOT NULL DEFAULT '', name_tokens TEXT NOT NULL DEFAULT '', caller_count INTEGER NOT NULL DEFAULT 0, is_hub INTEGER NOT NULL DEFAULT 0, coreness INTEGER, is_entry_point INTEGER NOT NULL DEFAULT 0, file_hash TEXT NOT NULL DEFAULT '', indexed_at REAL NOT NULL DEFAULT 0);
+         CREATE TABLE call_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, from_symbol TEXT NOT NULL, to_symbol TEXT NOT NULL, call_site_line INTEGER, edge_confidence TEXT NOT NULL DEFAULT 'textual', from_path TEXT, to_path TEXT);
+
+         INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/a.rs', 'hash_a', 'rust', 1, 0, 0);
+         INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/b.rs', 'hash_b', 'rust', 1, 0, 0);
+         INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/c.rs', 'hash_c', 'rust', 1, 0, 0);
+
+         INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, caller_count, is_hub, coreness) VALUES ('A', 'A', 'function', 'rust', 'src/a.rs', 1, 10, 0, 0, 0);
+         INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, caller_count, is_hub, coreness) VALUES ('B', 'B', 'function', 'rust', 'src/b.rs', 1, 10, 1, 0, 0);
+         INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, caller_count, is_hub, coreness) VALUES ('C', 'C', 'function', 'rust', 'src/c.rs', 1, 10, 1, 0, 0);
+
+         INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, from_path, to_path) VALUES ('A', 'B', 5, 'src/a.rs', 'src/b.rs');
+         INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, from_path, to_path) VALUES ('B', 'C', 5, 'src/b.rs', 'src/c.rs');",
+    )
+    .expect("failed to build synthetic fixture DB");
+}
+
 fn setup_test_db() -> (rusqlite::Connection, PathBuf, PathBuf) {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("synthetic_project");
 
-    let db_path = fixture_dir.join(".antigravity").join("codeindex.db");
-    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    build_synthetic_db(&conn);
     let project_root = fixture_dir.clone();
     (conn, project_root, fixture_dir)
 }

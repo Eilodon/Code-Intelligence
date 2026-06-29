@@ -1,0 +1,4 @@
+*.rs @rust-team
+*.py @python-team
+src/core/ @core-team
+

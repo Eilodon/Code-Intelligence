@@ -1,0 +1,9 @@
+{
+  "source": "lcov",
+  "covered_lines": {
+    "{PROJECT_ROOT}/src/main.rs": [
+      1,
+      3
+    ]
+  }
+}

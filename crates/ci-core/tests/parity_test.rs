@@ -224,10 +224,12 @@ fn test_hotspot_parity() {
 #[test]
 fn test_formal_edges_integration() {
     let mut resolver = ci_core::resolver::formal::FormalResolver::new();
-    
+
     // 1. Phải load thành công rules của Python
-    resolver.load_python().expect("Failed to load Python stack-graphs configuration");
-    
+    resolver
+        .load_python()
+        .expect("Failed to load Python stack-graphs configuration");
+
     let source = r#"
 class DatabaseConnector:
     def connect(self):
@@ -237,15 +239,26 @@ def main():
     db = DatabaseConnector()
     db.connect()
 "#;
-    
+
     // 2. Chạy FormalResolver (Stack Graphs) để extract paths
-    let edges = resolver.resolve_file("python", "synthetic_db.py", source)
+    let edges = resolver
+        .resolve_file("python", "synthetic_db.py", source)
         .expect("Failed to resolve formal edges");
-    
+
     // 3. Nghiệm thu: Kế hoạch yêu cầu formal edges phải xuất hiện
-    let has_class_edge = edges.iter().any(|e| e.reference_symbol == "DatabaseConnector" && e.definition_symbol == "DatabaseConnector");
-    let has_method_edge = edges.iter().any(|e| e.reference_symbol == "connect" && e.definition_symbol == "connect");
-    
-    assert!(has_class_edge, "Parity harness output must contain formal edges for Python class instantiation");
-    assert!(has_method_edge, "Parity harness output must contain formal edges for Python method calls");
+    let has_class_edge = edges.iter().any(|e| {
+        e.reference_symbol == "DatabaseConnector" && e.definition_symbol == "DatabaseConnector"
+    });
+    let has_method_edge = edges
+        .iter()
+        .any(|e| e.reference_symbol == "connect" && e.definition_symbol == "connect");
+
+    assert!(
+        has_class_edge,
+        "Parity harness output must contain formal edges for Python class instantiation"
+    );
+    assert!(
+        has_method_edge,
+        "Parity harness output must contain formal edges for Python method calls"
+    );
 }

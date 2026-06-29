@@ -87,8 +87,13 @@ async fn main() -> Result<()> {
             }
             let mut conn = rusqlite::Connection::open(&db_path)?;
             ci_core::db::schema::init_db(&conn)?;
-            ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn)?;
-            tracing::info!("Indexing complete");
+            ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &root)?;
+            let symbol_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+            let file_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))?;
+            tracing::info!("Indexing complete: {file_count} files, {symbol_count} symbols");
+            println!("Indexed {file_count} files, {symbol_count} symbols.");
         }
         Commands::Doctor { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;

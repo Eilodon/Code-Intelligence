@@ -21,7 +21,8 @@ ACCEPTED
 - *Using Tree-sitter Visitor Wrapper*: Rejected in favor of the direct Cursor API for maximum performance and explicit traversal control.
 
 ## 7. Evidence
-Unit tests for `test_python_symbol_extraction`, `test_insert_symbols_transaction`, and `test_run_indexing_pipeline_transaction` all pass. SQLite is configured with `PRAGMA journal_mode=WAL` (verified in `schema.rs`).
+Unit tests for `test_python_symbol_extraction`, `test_insert_symbols_transaction`, and `test_run_indexing_pipeline_transaction` all pass. [verified 2026-06-30]
+SQLite is configured with `PRAGMA journal_mode=WAL` (verified in `schema.rs`). [verified 2026-06-30]
 
 ## 8. Owner
 Eilodon

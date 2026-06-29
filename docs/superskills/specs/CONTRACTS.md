@@ -175,6 +175,7 @@ SearchKind ::
 
 ```
 EdgeConfidence ::
+  | formal            // Stack Graphs complete path from reference to definition. Highest confidence.
   | resolved          // Callee defined cùng file, explicit import, hoặc alias confirmed. Reliable.
   | inferred          // Callee type inferred qua import + type hints (hoặc alias type). Mostly reliable.
   | textual           // Name-only match. Dễ false positive cả hai chiều.

@@ -80,8 +80,15 @@ async fn main() -> Result<()> {
         }
         Commands::Index { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;
-            tracing::info!("Indexing {} (stub — not yet implemented)", root.display());
-            println!("Index command not yet implemented. Use 'ci serve' to start the MCP server.");
+            tracing::info!("Indexing {}", root.display());
+            let db_path = ci_server::default_db_path(&root);
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            ci_core::db::schema::init_db(&conn)?;
+            ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn)?;
+            tracing::info!("Indexing complete");
         }
         Commands::Doctor { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;

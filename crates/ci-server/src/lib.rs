@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tools::CodeIntelligenceServer;
 
 pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> {
-    let server = CodeIntelligenceServer::new(project_root, db_path)?;
+    let server = CodeIntelligenceServer::new(project_root, db_path.clone())?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();
 
@@ -18,6 +18,19 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Received SIGINT, shutting down");
         ct_clone.cancel();
+    });
+
+    let indexer_db_path = db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        tracing::info!("Background indexer thread started");
+        if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
+            let _ = ci_core::db::schema::init_db(&conn);
+            if let Err(e) = ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn) {
+                tracing::error!("Background indexer failed: {}", e);
+            } else {
+                tracing::info!("Background indexing completed");
+            }
+        }
     });
 
     let transport = stdio();

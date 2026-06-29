@@ -171,14 +171,12 @@ Phase IV  Distribution                     ~3-5 ngày
 
 ---
 
-## Phần E — Checklist hành động ngay
+## Phần E — Checklist (cập nhật tiến độ 2026-06-30)
 
-- [ ] Phase 0: chạy `generate_oracle.py` lần cuối → commit golden JSON vào `tests/fixtures/golden/`
-- [ ] Phase 0: refactor `parity_test.rs` đọc JSON tĩnh, gỡ Python invocation
-- [ ] Phase 0: di chuyển `codeindex/` → `legacy/`, cập nhật CI gỡ Python steps
-- [ ] Phase 0: ADR-0003 "Retire Python to frozen fixtures"
-- [ ] Phase I: tạo `ci-core/src/indexer/` — symbol extraction Python trước (Cursor API)
-- [ ] Phase I: wire edge building → coreness → `is_hub`; nối vào `ci index` + `ci serve`
-- [ ] Phase I: phase ladder + `edges_ready` gating; mở rộng 5 ngôn ngữ còn lại
-- [ ] Phase II: thêm `notify`, watcher debounce, incremental 2-level invalidation
-- [ ] (Hoãn) Phase III embeddings; Phase IV distribution
+- [x] Phase 0: đóng băng golden JSON, in-memory DB port, `codeindex/` → `legacy/`, ADR-0003 *(commit 0c7a89e)*
+- [x] Phase I: `ci-core/src/indexer/` symbol extraction (6 ngôn ngữ, Cursor API), edge build → coreness → `is_hub`, nối `ci index`/`ci serve` *(commit 21d0459)*
+- [x] Phase II: `notify` watcher debounce + incremental hash-diff (`call_sites` + `rebuild_graph`) *(commit 11d5714)*
+- [x] Phase II hardening: alias-aware edges (`resolver::conservative`), live watcher integration test, debounce starvation fix *(commit 9cb40f4)*
+- [~] Phase IV: `release.yml` (musl x3), `Containerfile`, `compose.yaml`; `ci init` đã có sẵn *(đang verify build)*
+- [ ] Phase III embeddings — **HOÃN** (theo quyết định 2026-06-30)
+- [ ] Còn lại: `import_edges`, phase-ladder `edges_ready` gating runtime trong `ci serve`, mở rộng resolver alias→cross-file

@@ -1,0 +1,25 @@
+# Hardened deployment example for the Code Intelligence MCP server.
+#
+# MCP uses stdio transport, so this is a reference for sandboxing rather than a
+# detached daemon — attach a client to the container's stdin/stdout:
+#   docker compose run --rm code-intelligence
+services:
+  code-intelligence:
+    build:
+      context: .
+      dockerfile: Containerfile
+    read_only: true                 # immutable root fs
+    cap_drop: [ALL]                 # drop all Linux capabilities
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    stdin_open: true                # MCP stdio transport
+    tty: false
+    volumes:
+      - ./:/project:ro              # project mounted read-only
+      - ci-data:/data               # index DB on a writable volume
+    command: ["serve", "--project-root", "/project", "--db-path", "/data/index.db"]
+
+volumes:
+  ci-data:

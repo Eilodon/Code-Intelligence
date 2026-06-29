@@ -1,0 +1,8 @@
+target/
+.git/
+legacy/
+docs/
+*.md
+.github/
+.codeindex/
+**/.antigravity/

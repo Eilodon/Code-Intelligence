@@ -108,7 +108,7 @@ impl FormalResolver {
         let mut edges = Vec::new();
         ForwardPartialPathStitcher::find_all_complete_partial_paths(
             &mut DatabaseCandidates::new(&graph, &mut partials, &mut db),
-            reference_nodes.into_iter(),
+            reference_nodes,
             stitch_config,
             &stack_graphs::NoCancellation,
             |g, _ps, path: &PartialPath| {

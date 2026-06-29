@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod fitness;
 pub mod graph;
+pub mod indexer;
 pub mod resolver;
 pub mod sanitize;
 pub mod search;

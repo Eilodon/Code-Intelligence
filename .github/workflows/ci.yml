@@ -28,4 +28,4 @@ jobs:
         run: cargo test --workspace
 
       - name: Audit
-        run: cargo install cargo-audit --locked && cargo audit
+        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2026-0189

@@ -620,6 +620,7 @@ class UnderstandOutput(_BaseOutput):
     callers_summary: list[CallerSummaryEntry] | None = None
     is_hub: bool | None = None
     coreness: int | None = None
+    edges_ready: bool = False
     health: Health | None = None
     ambiguous: AmbiguousResult | None = None
     suggested_next: SuggestedNextSchema | None = None

@@ -23,6 +23,7 @@ impl IndexingPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeConfidence {
+    Formal,
     Resolved,
     Inferred,
     Textual,
@@ -31,9 +32,19 @@ pub enum EdgeConfidence {
 impl EdgeConfidence {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Formal => "formal",
             Self::Resolved => "resolved",
             Self::Inferred => "inferred",
             Self::Textual => "textual",
+        }
+    }
+
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Formal => 3,
+            Self::Resolved => 2,
+            Self::Inferred => 1,
+            Self::Textual => 0,
         }
     }
 }

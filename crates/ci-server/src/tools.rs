@@ -805,7 +805,6 @@ struct SessionContextOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct DiffImpactParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<String>,
@@ -815,10 +814,35 @@ struct DiffImpactParams {
     commits: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct BlastRadiusOutput {
+    direct_callers: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RiskAssessmentOutput {
+    level: String,
+    reasons: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct AffectedSymbolOutput {
+    qualified_name: String,
+    name: String,
+    path: String,
+    kind: String,
+    signature_changed: bool,
+    blast_radius: BlastRadiusOutput,
+    risk_assessment: RiskAssessmentOutput,
+}
+
 #[derive(Serialize, JsonSchema)]
 struct DiffImpactOutput {
     files_changed: Vec<String>,
+    affected_symbols: Vec<AffectedSymbolOutput>,
+    unindexed_files: Vec<String>,
     aggregate_risk: String,
+    suggested_reviewers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -1523,23 +1547,170 @@ impl CodeIntelligenceServer {
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count != 1 {
-                return serde_json::to_string_pretty(&ErrorOutput {
-                    error: ErrorDetail {
-                        code: "INVALID_INPUT".into(),
-                        message: "Exactly one of diff, staged, or commits must be provided".into(),
-                        recoverable: false,
-                    },
+                return error_json(
+                    "INVALID_INPUT",
+                    "Exactly one of diff, staged, or commits must be provided",
+                    false,
+                );
+            }
+
+            const DIFF_GIT_TIMEOUT_SECS: u64 = 10;
+            let diff_text = if let Some(d) = p.diff {
+                d
+            } else {
+                let staged = p.staged.unwrap_or(false);
+                let (diff, err) = ci_core::analysis::diff_impact::get_git_diff(
+                    &self.project_root,
+                    staged,
+                    p.commits.as_deref(),
+                    DIFF_GIT_TIMEOUT_SECS,
+                );
+                match diff {
+                    Some(d) => d,
+                    None => {
+                        return error_json(
+                            "FEATURE_UNAVAILABLE",
+                            &err.unwrap_or_else(|| "git diff failed".into()),
+                            true,
+                        );
+                    }
+                }
+            };
+
+            let file_diffs = ci_core::analysis::diff_impact::parse_unified_diff(&diff_text);
+            let files_changed: Vec<String> = file_diffs.iter().map(|f| f.path.clone()).collect();
+
+            let mut unindexed_files: Vec<String> = Vec::new();
+            let mut affected: Vec<std::collections::HashMap<String, serde_json::Value>> =
+                Vec::new();
+
+            {
+                let conn = self.db();
+                for fd in &file_diffs {
+                    let symbol_count: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                            rusqlite::params![fd.path],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if symbol_count == 0 {
+                        unindexed_files.push(fd.path.clone());
+                        continue;
+                    }
+
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT qualified_name, name, kind, line_start, line_end, caller_count
+                             FROM symbols WHERE path = ?1",
+                        )
+                        .unwrap();
+                    let rows: Vec<(String, String, String, i64, i64, i64)> = stmt
+                        .query_map(rusqlite::params![fd.path], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        })
+                        .unwrap()
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    for (qualified_name, name, kind, line_start, line_end, caller_count) in rows {
+                        let overlaps = fd
+                            .hunks
+                            .iter()
+                            .any(|&(hs, he)| !(he < line_start || hs > line_end));
+                        if !overlaps {
+                            continue;
+                        }
+
+                        let sig_end = line_start + (line_end - line_start).min(2);
+                        let signature_changed =
+                            ci_core::analysis::diff_impact::is_signature_changed(
+                                (line_start, sig_end),
+                                &fd.hunks,
+                            );
+
+                        let base_level = if caller_count > 10 {
+                            "high"
+                        } else if caller_count > 3 {
+                            "medium"
+                        } else {
+                            "low"
+                        };
+                        let mut reasons: Vec<String> = Vec::new();
+                        let level =
+                            ci_core::analysis::diff_impact::escalate_risk_if_signature_changed(
+                                signature_changed,
+                                base_level,
+                                &mut reasons,
+                            );
+
+                        let mut m: std::collections::HashMap<String, serde_json::Value> =
+                            std::collections::HashMap::new();
+                        m.insert("qualified_name".into(), serde_json::json!(qualified_name));
+                        m.insert("name".into(), serde_json::json!(name));
+                        m.insert("path".into(), serde_json::json!(fd.path));
+                        m.insert("kind".into(), serde_json::json!(kind));
+                        m.insert(
+                            "signature_changed".into(),
+                            serde_json::json!(signature_changed),
+                        );
+                        m.insert(
+                            "blast_radius".into(),
+                            serde_json::json!({"direct_callers": caller_count}),
+                        );
+                        m.insert(
+                            "risk_assessment".into(),
+                            serde_json::json!({"level": level, "reasons": reasons}),
+                        );
+                        affected.push(m);
+                    }
+                }
+            }
+
+            let aggregate_risk = ci_core::analysis::diff_impact::compute_aggregate_risk(
+                &affected,
+                &unindexed_files,
+            );
+            const MAX_AFFECTED_SYMBOLS: usize = 20;
+            ci_core::analysis::diff_impact::sort_affected_symbols(
+                &mut affected,
+                MAX_AFFECTED_SYMBOLS,
+            );
+
+            let affected_symbols: Vec<AffectedSymbolOutput> = affected
+                .into_iter()
+                .filter_map(|m| {
+                    serde_json::to_value(m)
+                        .ok()
+                        .and_then(|v| serde_json::from_value(v).ok())
                 })
-                .unwrap_or_default();
+                .collect();
+
+            let codeowner_patterns =
+                ci_core::analysis::codeowners::load_codeowners(&self.project_root);
+            let mut suggested_reviewers: Vec<String> = Vec::new();
+            for f in &files_changed {
+                for owner in ci_core::analysis::codeowners::find_owners(&codeowner_patterns, f) {
+                    if !suggested_reviewers.contains(&owner) {
+                        suggested_reviewers.push(owner);
+                    }
+                }
             }
 
             serde_json::to_string_pretty(&DiffImpactOutput {
-                files_changed: vec![],
-                aggregate_risk: "unknown".into(),
-                note: Some(
-                    "Diff analysis requires git integration — use ci-core diff_impact module"
-                        .into(),
-                ),
+                files_changed,
+                affected_symbols,
+                unindexed_files,
+                aggregate_risk,
+                suggested_reviewers,
+                note: None,
             })
             .unwrap_or_default()
         })
@@ -1847,6 +2018,99 @@ mod tests {
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
         assert_eq!(server.phase_str(), "ready");
         assert!(server.edges_ready());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_impact_raw_diff_maps_to_affected_symbols_and_reviewers() {
+        let dir = std::env::temp_dir().join(format!("ci_diff_impact_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".github")).unwrap();
+        std::fs::write(dir.join(".github/CODEOWNERS"), "*.rs @rust-team\n").unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "mod.foo", "foo", "function", "rust", "src/foo.rs", 10i64, 15i64, "fn foo()",
+                    "", "foo", 5i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+        }
+
+        // Hunk touches only the body (lines 14-15), not the signature heuristic
+        // range (line_start..line_start+2 = 10-12) — should NOT escalate to high.
+        let diff = "diff --git a/src/foo.rs b/src/foo.rs\n\
+                     --- a/src/foo.rs\n\
+                     +++ b/src/foo.rs\n\
+                     @@ -14,1 +14,2 @@ fn foo() {\n\
+                      context\n\
+                     +new line\n";
+
+        let output = server.diff_impact(Parameters(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["files_changed"], serde_json::json!(["src/foo.rs"]));
+        assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(v["affected_symbols"][0]["qualified_name"], "mod.foo");
+        assert_eq!(v["affected_symbols"][0]["signature_changed"], false);
+        assert_eq!(v["aggregate_risk"], "medium");
+        assert_eq!(v["suggested_reviewers"], serde_json::json!(["@rust-team"]));
+        assert!(v["unindexed_files"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_impact_unindexed_file_yields_unknown_risk() {
+        let dir = std::env::temp_dir().join(format!("ci_diff_impact_unindexed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let diff = "diff --git a/src/new.rs b/src/new.rs\n\
+                     new file mode 100644\n\
+                     --- /dev/null\n\
+                     +++ b/src/new.rs\n\
+                     @@ -0,0 +1,3 @@\n\
+                     +fn new_fn() {}\n";
+
+        let output = server.diff_impact(Parameters(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["unindexed_files"], serde_json::json!(["src/new.rs"]));
+        assert_eq!(v["aggregate_risk"], "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_impact_rejects_multiple_inputs() {
+        let dir = std::env::temp_dir().join(format!("ci_diff_impact_multi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let output = server.diff_impact(Parameters(DiffImpactParams {
+            diff: Some("diff --git a/x b/x\n".into()),
+            staged: Some(true),
+            commits: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["error"]["code"], "INVALID_INPUT");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

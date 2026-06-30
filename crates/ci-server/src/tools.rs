@@ -126,6 +126,20 @@ impl CodeIntelligenceServer {
         self.conn.lock().unwrap()
     }
 
+    /// Opens a new dedicated read-only connection to the same DB file.
+    /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
+    /// tool handler is rejected at the SQLite level rather than silently
+    /// contending with the shared write connection.
+    ///
+    /// SINGLE_WRITER enforcement: all tool READ handlers must use this instead
+    /// of `self.db()`. Only schema init and the indexer pipeline may use the
+    /// shared `Arc<Mutex<Connection>>` via `self.db()`.
+    pub(crate) fn make_read_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(conn)
+    }
+
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
     /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
     /// since only this type has access to `session_log`.
@@ -1418,17 +1432,19 @@ impl CodeIntelligenceServer {
     )]
     fn repo_overview(&self) -> String {
         self.timed_tool("repo_overview", || {
-            let total_symbols: i64 = self
-                .db()
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let total_symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
                 .unwrap_or(0);
-            let total_files: i64 = self
-                .db()
+            let total_files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                 .unwrap_or(0);
 
-            let _conn1 = self.db();
-            let mut stmt = _conn1
+            let mut stmt = conn
                 .prepare("SELECT DISTINCT language FROM file_index WHERE language IS NOT NULL")
                 .unwrap();
             let languages: Vec<String> = stmt
@@ -1478,9 +1494,14 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let kind_str = p.kind.as_str();
             match ci_core::search::search(
-                &self.db(),
+                &conn,
                 &p.query,
                 kind,
                 p.limit,
@@ -1539,7 +1560,11 @@ impl CodeIntelligenceServer {
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
         self.timed_tool("file_overview", || {
             self.track_file(&p.path);
-            let conn = self.db();
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let mut out = build_file_overview(&conn, &p.path);
 
             let hub_name: Option<String> = conn
@@ -1561,10 +1586,12 @@ impl CodeIntelligenceServer {
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
         self.timed_tool("symbol_info", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             match resolution {
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
@@ -1574,7 +1601,6 @@ impl CodeIntelligenceServer {
                     let mut out = c.to_symbol_info();
                     let edges_ready = self.edges_ready();
                     out.coreness = if edges_ready { c.coreness } else { None };
-                    let conn = self.db();
                     let health = build_health(&conn, &self.coverage, &self.project_root, &c, edges_ready);
                     out.suggested_next = if c.is_hub {
                         suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
@@ -1596,8 +1622,12 @@ impl CodeIntelligenceServer {
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
         self.timed_tool("source", || {
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let resolution = {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
             };
             let c = match resolution {
@@ -1653,10 +1683,12 @@ impl CodeIntelligenceServer {
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
         self.timed_tool("callers", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1666,7 +1698,6 @@ impl CodeIntelligenceServer {
             self.track_file(&c.path);
 
             let direct: Vec<CallerEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence
@@ -1691,7 +1722,6 @@ impl CodeIntelligenceServer {
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callers.max_depth_cap))
                     .unwrap_or(config.callers.max_depth_cap);
-                let conn = self.db();
                 Some(transitive_bfs(
                     &conn,
                     &c.qualified_name,
@@ -1729,10 +1759,12 @@ impl CodeIntelligenceServer {
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
         self.timed_tool("callees", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1742,7 +1774,6 @@ impl CodeIntelligenceServer {
             self.track_file(&c.path);
 
             let direct: Vec<CalleeEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence
@@ -1767,7 +1798,6 @@ impl CodeIntelligenceServer {
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callees.max_depth_cap))
                     .unwrap_or(config.callees.max_depth_cap);
-                let conn = self.db();
                 Some(transitive_bfs(
                     &conn,
                     &c.qualified_name,
@@ -1803,8 +1833,12 @@ impl CodeIntelligenceServer {
     fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
         self.timed_tool("dependencies", || {
             self.track_file(&p.path);
-            let _conn5 = self.db();
-            let mut stmt_imports = _conn5
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let mut stmt_imports = conn
                 .prepare(
                     "SELECT from_path, COALESCE(to_path, ''), module_name
                      FROM import_edges WHERE from_path = ?1",
@@ -1823,8 +1857,9 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
-            let _conn6 = self.db();
-            let mut stmt_imported_by = _conn6
+            // Drop the first statement before preparing the second on the same conn
+            drop(stmt_imports);
+            let mut stmt_imported_by = conn
                 .prepare(
                     "SELECT from_path, COALESCE(to_path, ''), module_name
                      FROM import_edges WHERE to_path = ?1",
@@ -1864,8 +1899,12 @@ impl CodeIntelligenceServer {
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
         self.timed_tool("path", || {
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let from = {
-                let conn = self.db();
                 resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref())
             };
             let from = match from {
@@ -1877,7 +1916,6 @@ impl CodeIntelligenceServer {
             self.track_file(&from.path);
 
             let to = {
-                let conn = self.db();
                 resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref())
             };
             let to = match to {
@@ -1897,7 +1935,6 @@ impl CodeIntelligenceServer {
             let max_hops = requested_hops.clamp(0, path_config.max_allowed_hops as i64) as usize;
 
             let result = {
-                let conn = self.db();
                 ci_core::graph::path::bidirectional_bfs_path(
                     &conn,
                     &from.qualified_name,
@@ -1952,10 +1989,12 @@ impl CodeIntelligenceServer {
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
         self.timed_tool("edit_context", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1965,7 +2004,6 @@ impl CodeIntelligenceServer {
             self.track_file(&c.path);
 
             let callers: Vec<CallerEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence
@@ -1985,7 +2023,6 @@ impl CodeIntelligenceServer {
             };
 
             let callees: Vec<CalleeEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence
@@ -2041,6 +2078,10 @@ impl CodeIntelligenceServer {
             };
 
             let edges_ready = self.edges_ready();
+            // TODO(SINGLE_WRITER): convert this to make_read_conn() — deferred because
+            // compute_frontier_entries takes &Connection and passing a read conn here
+            // requires plumbing it through the conditional (frontier_degraded) path.
+            // For now this uses the shared write connection, which is safe but sub-optimal.
             let (frontier, frontier_degraded) =
                 if !edges_ready || (explored_files.is_empty() && explored_symbols.is_empty()) {
                     (vec![], !edges_ready)
@@ -2121,8 +2162,12 @@ impl CodeIntelligenceServer {
             let mut affected: Vec<std::collections::HashMap<String, serde_json::Value>> =
                 Vec::new();
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 for fd in &file_diffs {
                     let symbol_count: i64 = conn
                         .query_row(
@@ -2280,16 +2325,18 @@ impl CodeIntelligenceServer {
     )]
     fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
         self.timed_tool("indexing_status", || {
-            let files: i64 = self
-                .db()
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                 .unwrap_or(0);
-            let symbols: i64 = self
-                .db()
+            let symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
                 .unwrap_or(0);
-            let edges: i64 = self
-                .db()
+            let edges: i64 = conn
                 .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap_or(0);
 
@@ -2332,8 +2379,13 @@ impl CodeIntelligenceServer {
             };
             let limit = p.limit.unwrap_or(10);
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let search_output = match ci_core::search::search(
-                &self.db(),
+                &conn,
                 &p.query,
                 kind,
                 limit,
@@ -2385,7 +2437,7 @@ impl CodeIntelligenceServer {
 
             let top_symbol = if effective_depth == "with_symbol" {
                 top.and_then(|t| {
-                    self.db()
+                    conn
                         .query_row(
                             "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
                              FROM symbols WHERE qualified_name = ?1 LIMIT 1",
@@ -2418,7 +2470,6 @@ impl CodeIntelligenceServer {
                 None
             } else {
                 top.map(|t| {
-                    let conn = self.db();
                     build_file_overview(&conn, &t.path)
                 })
             };
@@ -2474,8 +2525,12 @@ impl CodeIntelligenceServer {
             let since = p.since.unwrap_or_else(|| hc.default_since.clone());
             let min_churn = p.min_churn.unwrap_or(hc.default_min_churn as i64);
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let result = {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 ci_core::analysis::hotspot::compute_hotspots(
                     &self.project_root,
                     &conn,
@@ -2524,8 +2579,13 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let search_result =
-                ci_core::search::search(&self.db(), &p.query, kind, 1, self.embedder().as_deref());
+                ci_core::search::search(&conn, &p.query, kind, 1, self.embedder().as_deref());
 
             let top = search_result
                 .ok()
@@ -2534,7 +2594,7 @@ impl CodeIntelligenceServer {
             // Carries `language` alongside `SymbolInfoOutput` (which doesn't have
             // a language field) so `SourceOutput.language` below isn't stubbed.
             let symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
-                self.db()
+                conn
                     .query_row(
                         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language
                          FROM symbols WHERE qualified_name = ?1 LIMIT 1",
@@ -2590,8 +2650,7 @@ impl CodeIntelligenceServer {
             let callers = symbol_info
                 .as_ref()
                 .map(|(info, _)| {
-                    let _conn9 = self.db();
-                    let mut stmt = _conn9
+                    let mut stmt = conn
                         .prepare(
                             "SELECT from_symbol, from_path, edge_confidence
                              FROM call_edges WHERE to_symbol = ?1",
@@ -3398,6 +3457,35 @@ mod tests {
             out2["session_started_at"],
             "session_started_at must not change between calls"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn make_read_conn_opens_read_only_connection() {
+        let dir = std::env::temp_dir().join(format!("ci_rw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        // query_only pragma should be ON — attempting a write must fail
+        let result = conn.execute("CREATE TABLE IF NOT EXISTS _test_write (id INTEGER)", []);
+        assert!(result.is_err(), "read-only connection must reject writes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn make_read_conn_can_query_symbols() {
+        let dir = std::env::temp_dir().join(format!("ci_rw2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        // Schema is initialized in new() — symbols table must be queryable
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .expect("read conn must be able to query symbols");
+        assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

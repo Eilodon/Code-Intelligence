@@ -40,10 +40,15 @@ pub struct CodeIntelligenceServer {
     /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
     coverage: Arc<ci_core::analysis::coverage::CoverageData>,
     session_log: Arc<Mutex<SessionLog>>,
+    preset: String,
 }
 
 impl CodeIntelligenceServer {
     pub fn new(project_root: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_with_preset(project_root, db_path, "full".into())
+    }
+
+    pub fn new_with_preset(project_root: PathBuf, db_path: PathBuf, preset: String) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -59,6 +64,7 @@ impl CodeIntelligenceServer {
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             coverage: Arc::new(coverage),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
+            preset,
         })
     }
 
@@ -104,6 +110,10 @@ impl CodeIntelligenceServer {
     /// The loaded embedder, if semantic search is ready.
     fn embedder(&self) -> Option<Arc<Embedder>> {
         self.embedder.read().unwrap().clone()
+    }
+
+    fn filter_sn(&self, sn: Option<SuggestedNext>) -> Option<SuggestedNext> {
+        filter_suggested_next(sn, &self.preset)
     }
 
     fn embed_status_str(&self) -> String {
@@ -186,6 +196,42 @@ fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
 
 fn suggested_with_args(tool: &str, reason: &str, args: serde_json::Value) -> Option<SuggestedNext> {
     Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: Some(args) })
+}
+
+// ---------------------------------------------------------------------------
+// Tool Presets — selective tool set definitions
+// ---------------------------------------------------------------------------
+
+fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
+    match preset {
+        "orient" => Some(&[
+            "repo_overview", "locate", "dependencies", "hotspots", "indexing_status",
+        ]),
+        "trace" => Some(&[
+            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
+            "callees", "path", "dependencies", "indexing_status",
+        ]),
+        "edit" => Some(&[
+            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
+            "callees", "edit_context", "diff_impact", "indexing_status",
+        ]),
+        "full" | "" => None, // None = all tools, no filtering
+        _ => None,
+    }
+}
+
+fn is_tool_available(preset: &str, tool: &str) -> bool {
+    match preset_tools(preset) {
+        None => true,
+        Some(tools) => tools.contains(&tool),
+    }
+}
+
+fn filter_suggested_next(sn: Option<SuggestedNext>, preset: &str) -> Option<SuggestedNext> {
+    match &sn {
+        Some(s) if !is_tool_available(preset, &s.tool) => None,
+        _ => sn,
+    }
 }
 
 fn error_json(code: &str, message: &str, recoverable: bool) -> String {
@@ -1247,7 +1293,7 @@ impl CodeIntelligenceServer {
                 truncated: false,
                 workflow_guide:
                     "Use locate to find symbols, then source/callers/callees to explore.".into(),
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1306,7 +1352,7 @@ impl CodeIntelligenceServer {
                         truncated: output.truncated,
                         degraded: output.degraded,
                         note: output.note,
-                        suggested_next: sn,
+                        suggested_next: self.filter_sn(sn),
                     })
                     .unwrap_or_default()
                 }
@@ -1429,7 +1475,7 @@ impl CodeIntelligenceServer {
                 source: sanitized,
                 language: c.language,
                 metadata,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1505,7 +1551,7 @@ impl CodeIntelligenceServer {
                 direct,
                 direct_count: count,
                 transitive,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1578,7 +1624,7 @@ impl CodeIntelligenceServer {
                 direct,
                 direct_count: count,
                 transitive,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1640,7 +1686,7 @@ impl CodeIntelligenceServer {
                 path: p.path,
                 imports,
                 imported_by,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1728,7 +1774,7 @@ impl CodeIntelligenceServer {
                 exists,
                 terminated_by,
                 hops_clamped,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1805,7 +1851,7 @@ impl CodeIntelligenceServer {
                 callers,
                 callees,
                 risk_assessment: risk,
-                suggested_next: suggested("diff_impact", "MANDATORY after changes — verify blast radius"),
+                suggested_next: self.filter_sn(suggested("diff_impact", "MANDATORY after changes — verify blast radius")),
             })
             .unwrap_or_default()
         })
@@ -1824,7 +1870,7 @@ impl CodeIntelligenceServer {
                 explored_symbols: log.explored_symbols.iter().cloned().collect(),
                 unique_files_explored: explored_files.len(),
                 explored_files,
-                suggested_next: suggested("repo_overview", "Refresh map"),
+                suggested_next: self.filter_sn(suggested("repo_overview", "Refresh map")),
             })
             .unwrap_or_default()
         })
@@ -2023,7 +2069,7 @@ impl CodeIntelligenceServer {
                 aggregate_risk,
                 suggested_reviewers,
                 note: None,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -2065,7 +2111,7 @@ impl CodeIntelligenceServer {
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -2206,7 +2252,7 @@ impl CodeIntelligenceServer {
                 file_overview,
                 truncated,
                 depth_adjusted,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -2255,7 +2301,7 @@ impl CodeIntelligenceServer {
                 total_files_analyzed: result.total_files_analyzed,
                 hotspot_method: result.hotspot_method,
                 note: result.note,
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -2374,7 +2420,7 @@ impl CodeIntelligenceServer {
                 source: source_output,
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
-                suggested_next: sn,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })

@@ -2714,7 +2714,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params!["mod.foo", "foo bar baz", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "", "foo bar baz", 0i64, 0i64, 0i64],
+                rusqlite::params!["mod.foo", "foo bar baz", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "foo bar baz description", "foo bar baz", 0i64, 0i64, 0i64],
             )
             .unwrap();
         }

@@ -43,7 +43,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --bin ci --target ${{ matrix.target }}
+        run: cross build --release --bin ci --target ${{ matrix.target }} --no-default-features
 
       - name: Build (native)
         if: ${{ !matrix.cross }}

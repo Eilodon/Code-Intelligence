@@ -17,4 +17,5 @@ rmcp = { workspace = true }
 schemars = { workspace = true }
 
 [features]
+default = ["embeddings"]
 embeddings = ["ci-core/embeddings"]

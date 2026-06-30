@@ -215,4 +215,44 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 2, "nearest should be id 2");
     }
+
+    /// KNN latency benchmark: 100k synthetic 256-dim vectors, topK=10.
+    /// Run with: cargo test -p ci-core --features embeddings -- --ignored --nocapture bench_knn_latency
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore]
+    fn bench_knn_latency_100k_256dim() {
+        use rusqlite::Connection;
+        register_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_embedding_table(&conn, 256).unwrap();
+
+        const N: usize = 100_000;
+        const D: usize = 256;
+        let insert_start = std::time::Instant::now();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..N {
+            let v: Vec<f32> = (0..D).map(|j| ((i * D + j) % 997) as f32 / 997.0).collect();
+            store_embedding(&conn, i as i64 + 1, &v).unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        eprintln!("Inserted {N} vectors in {:?}", insert_start.elapsed());
+
+        let query: Vec<f32> = (0..D).map(|j| j as f32 / D as f32).collect();
+        let warmup_hits = knn(&conn, &query, 10).unwrap();
+        assert!(!warmup_hits.is_empty(), "warmup KNN returned nothing");
+
+        const RUNS: u32 = 20;
+        let t = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let h = knn(&conn, &query, 10).unwrap();
+            assert_eq!(h.len(), 10);
+        }
+        let total = t.elapsed();
+        eprintln!(
+            "KNN {N}×{D} topK=10: {RUNS} queries | total={total:?} | avg={:?}/query",
+            total / RUNS
+        );
+    }
 }

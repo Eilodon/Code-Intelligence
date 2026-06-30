@@ -19,4 +19,5 @@ rusqlite = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
+default = ["embeddings"]
 embeddings = ["ci-core/embeddings", "ci-server/embeddings"]

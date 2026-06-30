@@ -30,6 +30,8 @@ sqlite-vec = { version = "0.1.9", optional = true }
 tempfile = "3"
 
 [features]
-# Opt-in semantic embeddings: pure-Rust static code embeddings (model2vec-rs)
-# stored in sqlite-vec. Off by default to keep the musl static binary lean.
+# Semantic embeddings: pure-Rust static code embeddings (model2vec-rs) stored
+# in sqlite-vec. On by default for native builds; musl release builds explicitly
+# opt-out via --no-default-features to keep the static binary lean.
+default = ["embeddings"]
 embeddings = ["dep:model2vec-rs", "dep:sqlite-vec"]

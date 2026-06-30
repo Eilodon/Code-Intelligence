@@ -14,13 +14,67 @@ use ci_core::types::{EmbedStatus, IndexingPhase};
 // Server state
 // ---------------------------------------------------------------------------
 
+fn utc_now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let (y, mo, d) = days_to_ymd(days);
+    (y, mo, d, h, m, s)
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year { break; }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: &[u64] = if leap {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1u64;
+    for &md in month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
 /// In-memory session tracking — tool call count and the set of symbols/files
 /// touched, for the `session_context` tool. Reset only when the server restarts.
-#[derive(Default)]
 struct SessionLog {
     tool_calls: u64,
     explored_symbols: std::collections::HashSet<String>,
     explored_files: std::collections::HashSet<String>,
+    session_started_at: String,
+}
+
+impl Default for SessionLog {
+    fn default() -> Self {
+        Self {
+            tool_calls: 0,
+            explored_symbols: std::collections::HashSet::new(),
+            explored_files: std::collections::HashSet::new(),
+            session_started_at: utc_now_iso8601(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +124,20 @@ impl CodeIntelligenceServer {
 
     fn db(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// Opens a new dedicated read-only connection to the same DB file.
+    /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
+    /// tool handler is rejected at the SQLite level rather than silently
+    /// contending with the shared write connection.
+    ///
+    /// SINGLE_WRITER enforcement: all tool READ handlers must use this instead
+    /// of `self.db()`. Only schema init and the indexer pipeline may use the
+    /// shared `Arc<Mutex<Connection>>` via `self.db()`.
+    pub(crate) fn make_read_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(conn)
     }
 
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
@@ -215,6 +283,10 @@ fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "repo_overview", "search", "locate", "symbol_info", "source", "callers",
             "callees", "edit_context", "diff_impact", "indexing_status",
         ]),
+        "compound" => Some(&[
+            "repo_overview", "locate", "hotspots", "source", "understand",
+            "edit_context", "diff_impact", "session_context", "indexing_status",
+        ]),
         "full" | "" => None, // None = all tools, no filtering
         _ => None,
     }
@@ -306,6 +378,7 @@ struct CandidateRow {
     language: String,
     class_context: Option<String>,
     is_entry_point: bool,
+    coreness: Option<i64>,  // from symbols.coreness column
 }
 
 impl CandidateRow {
@@ -321,6 +394,7 @@ impl CandidateRow {
             docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
             caller_count: self.caller_count,
             is_hub: self.is_hub,
+            coreness: None,  // set by handler based on edges_ready
             health: None,
             suggested_next: None,
         }
@@ -350,10 +424,10 @@ fn resolve_symbol_candidates(
     path: Option<&str>,
 ) -> Vec<CandidateRow> {
     let sql = if path.is_some() {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
          FROM symbols WHERE name = ?1 AND path = ?2"
     } else {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
          FROM symbols WHERE name = ?1"
     };
 
@@ -377,6 +451,7 @@ fn resolve_symbol_candidates(
             language: row.get(10)?,
             class_context: row.get(11)?,
             is_entry_point: row.get::<_, i64>(12)? != 0,
+            coreness: row.get(13)?,
         })
     };
 
@@ -430,6 +505,99 @@ fn ambiguous_json(candidates: &[CandidateRow]) -> String {
         candidates,
     })
     .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Frontier computation helper (for session_context)
+// ---------------------------------------------------------------------------
+
+fn compute_frontier_entries(
+    conn: &rusqlite::Connection,
+    explored_files: &[String],
+    explored_symbols: &[String],
+) -> Vec<FrontierEntry> {
+    use std::collections::HashSet;
+
+    let explored_set: HashSet<&str> = explored_files.iter().map(|s| s.as_str()).collect();
+
+    // Set A: files that import any explored file
+    let mut set_a: HashSet<String> = HashSet::new();
+    if !explored_files.is_empty() {
+        let placeholders: String = explored_files
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM import_edges \
+             WHERE to_path IN ({placeholders}) AND from_path IS NOT NULL"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(explored_files.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        set_a.insert(r);
+                    }
+                });
+        }
+    }
+
+    // Set B: files containing callers of explored symbols
+    let mut set_b: HashSet<String> = HashSet::new();
+    if !explored_symbols.is_empty() {
+        let placeholders: String = explored_symbols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM call_edges \
+             WHERE to_symbol IN ({placeholders}) AND from_path IS NOT NULL"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(explored_symbols.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        set_b.insert(r);
+                    }
+                });
+        }
+    }
+
+    // Union minus already-explored; tag each with reason
+    let mut result: Vec<FrontierEntry> = set_a
+        .union(&set_b)
+        .filter(|p| !explored_set.contains(p.as_str()))
+        .map(|p| {
+            let in_a = set_a.contains(p);
+            let in_b = set_b.contains(p);
+            let reason = match (in_a, in_b) {
+                (true, true) => "both",
+                (true, false) => "imported_by_explored",
+                _ => "contains_callers_of_explored",
+            };
+            FrontierEntry { path: p.clone(), reason: reason.to_string() }
+        })
+        .collect();
+
+    // Deterministic order: "both" first, then by path
+    result.sort_by(|a, b| {
+        let rank = |r: &str| match r {
+            "both" => 0,
+            "imported_by_explored" => 1,
+            _ => 2,
+        };
+        rank(&a.reason).cmp(&rank(&b.reason)).then(a.path.cmp(&b.path))
+    });
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +764,7 @@ struct SymbolInfoOutput {
     docstring: Option<String>,
     caller_count: i64,
     is_hub: bool,
+    coreness: Option<i64>,  // null when edges not yet built; 0 = isolated; >0 = k-core depth
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1002,11 +1171,20 @@ struct EditContextOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, JsonSchema)]
+struct FrontierEntry {
+    path: String,
+    reason: String, // "imported_by_explored" | "contains_callers_of_explored" | "both"
+}
+
+#[derive(Serialize, JsonSchema)]
 struct SessionContextOutput {
+    session_started_at: String,
     tool_calls: u64,
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
     unique_files_explored: usize,
+    frontier: Vec<FrontierEntry>,
+    frontier_degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1254,17 +1432,19 @@ impl CodeIntelligenceServer {
     )]
     fn repo_overview(&self) -> String {
         self.timed_tool("repo_overview", || {
-            let total_symbols: i64 = self
-                .db()
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let total_symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
                 .unwrap_or(0);
-            let total_files: i64 = self
-                .db()
+            let total_files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                 .unwrap_or(0);
 
-            let _conn1 = self.db();
-            let mut stmt = _conn1
+            let mut stmt = conn
                 .prepare("SELECT DISTINCT language FROM file_index WHERE language IS NOT NULL")
                 .unwrap();
             let languages: Vec<String> = stmt
@@ -1322,9 +1502,14 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let kind_str = p.kind.as_str();
             match ci_core::search::search(
-                &self.db(),
+                &conn,
                 &p.query,
                 kind,
                 p.limit,
@@ -1383,7 +1568,11 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
         self.timed_tool("file_overview", || {
             self.track_file(&p.path);
-            let conn = self.db();
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let mut out = build_file_overview(&conn, &p.path);
 
             let hub_name: Option<String> = conn
@@ -1405,10 +1594,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
         self.timed_tool("symbol_info", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             match resolution {
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
@@ -1416,8 +1607,9 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
-                    let conn = self.db();
-                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready());
+                    let edges_ready = self.edges_ready();
+                    out.coreness = if edges_ready { c.coreness } else { None };
+                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, edges_ready);
                     out.suggested_next = if c.is_hub {
                         suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
                     } else if health.test_files.is_empty() {
@@ -1438,8 +1630,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
         self.timed_tool("source", || {
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let resolution = {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
             };
             let c = match resolution {
@@ -1495,10 +1691,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
         self.timed_tool("callers", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1508,7 +1706,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             self.track_file(&c.path);
 
             let direct: Vec<CallerEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence
@@ -1533,7 +1730,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callers.max_depth_cap))
                     .unwrap_or(config.callers.max_depth_cap);
-                let conn = self.db();
                 Some(transitive_bfs(
                     &conn,
                     &c.qualified_name,
@@ -1571,10 +1767,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
         self.timed_tool("callees", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1584,7 +1782,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             self.track_file(&c.path);
 
             let direct: Vec<CalleeEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence
@@ -1609,7 +1806,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callees.max_depth_cap))
                     .unwrap_or(config.callees.max_depth_cap);
-                let conn = self.db();
                 Some(transitive_bfs(
                     &conn,
                     &c.qualified_name,
@@ -1645,8 +1841,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
         self.timed_tool("dependencies", || {
             self.track_file(&p.path);
-            let _conn5 = self.db();
-            let mut stmt_imports = _conn5
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let mut stmt_imports = conn
                 .prepare(
                     "SELECT from_path, COALESCE(to_path, ''), module_name
                      FROM import_edges WHERE from_path = ?1",
@@ -1665,8 +1865,9 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .filter_map(|r| r.ok())
                 .collect();
 
-            let _conn6 = self.db();
-            let mut stmt_imported_by = _conn6
+            // Drop the first statement before preparing the second on the same conn
+            drop(stmt_imports);
+            let mut stmt_imported_by = conn
                 .prepare(
                     "SELECT from_path, COALESCE(to_path, ''), module_name
                      FROM import_edges WHERE to_path = ?1",
@@ -1706,8 +1907,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
         self.timed_tool("path", || {
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let from = {
-                let conn = self.db();
                 resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref())
             };
             let from = match from {
@@ -1719,7 +1924,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             self.track_file(&from.path);
 
             let to = {
-                let conn = self.db();
                 resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref())
             };
             let to = match to {
@@ -1739,7 +1943,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let max_hops = requested_hops.clamp(0, path_config.max_allowed_hops as i64) as usize;
 
             let result = {
-                let conn = self.db();
                 ci_core::graph::path::bidirectional_bfs_path(
                     &conn,
                     &from.qualified_name,
@@ -1794,10 +1997,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
         self.timed_tool("edit_context", || {
-            let resolution = {
-                let conn = self.db();
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -1807,7 +2012,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             self.track_file(&c.path);
 
             let callers: Vec<CallerEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence
@@ -1827,7 +2031,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             };
 
             let callees: Vec<CalleeEntry> = {
-                let conn = self.db();
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence
@@ -1871,14 +2074,51 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
-            let log = self.session_log.lock().unwrap();
-            let explored_files: Vec<String> = log.explored_files.iter().cloned().collect();
+            // Release the lock before DB queries — avoid deadlock if db() is also contended.
+            let (tool_calls, explored_symbols, explored_files, session_started_at) = {
+                let log = self.session_log.lock().unwrap();
+                (
+                    log.tool_calls,
+                    log.explored_symbols.iter().cloned().collect::<Vec<_>>(),
+                    log.explored_files.iter().cloned().collect::<Vec<_>>(),
+                    log.session_started_at.clone(),
+                )
+            };
+
+            let edges_ready = self.edges_ready();
+            // TODO(SINGLE_WRITER): convert this to make_read_conn() — deferred because
+            // compute_frontier_entries takes &Connection and passing a read conn here
+            // requires plumbing it through the conditional (frontier_degraded) path.
+            // For now this uses the shared write connection, which is safe but sub-optimal.
+            let (frontier, frontier_degraded) =
+                if !edges_ready || (explored_files.is_empty() && explored_symbols.is_empty()) {
+                    (vec![], !edges_ready)
+                } else {
+                    let conn = self.db();
+                    let frontier =
+                        compute_frontier_entries(&conn, &explored_files, &explored_symbols);
+                    (frontier, false)
+                };
+
+            let sn = if !frontier.is_empty() {
+                self.filter_sn(suggested_with_args(
+                    "file_overview",
+                    "Explore top frontier file",
+                    serde_json::json!({"path": frontier[0].path}),
+                ))
+            } else {
+                self.filter_sn(suggested("repo_overview", "Frontier exhausted — refresh map"))
+            };
+
             serde_json::to_string_pretty(&SessionContextOutput {
-                tool_calls: log.tool_calls,
-                explored_symbols: log.explored_symbols.iter().cloned().collect(),
+                session_started_at,
+                tool_calls,
+                explored_symbols,
                 unique_files_explored: explored_files.len(),
                 explored_files,
-                suggested_next: self.filter_sn(suggested("repo_overview", "Refresh map")),
+                frontier,
+                frontier_degraded,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1930,8 +2170,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let mut affected: Vec<std::collections::HashMap<String, serde_json::Value>> =
                 Vec::new();
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 for fd in &file_diffs {
                     let symbol_count: i64 = conn
                         .query_row(
@@ -2089,16 +2333,18 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     )]
     fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
         self.timed_tool("indexing_status", || {
-            let files: i64 = self
-                .db()
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                 .unwrap_or(0);
-            let symbols: i64 = self
-                .db()
+            let symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
                 .unwrap_or(0);
-            let edges: i64 = self
-                .db()
+            let edges: i64 = conn
                 .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap_or(0);
 
@@ -2141,8 +2387,13 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             };
             let limit = p.limit.unwrap_or(10);
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let search_output = match ci_core::search::search(
-                &self.db(),
+                &conn,
                 &p.query,
                 kind,
                 limit,
@@ -2194,7 +2445,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
 
             let top_symbol = if effective_depth == "with_symbol" {
                 top.and_then(|t| {
-                    self.db()
+                    conn
                         .query_row(
                             "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
                              FROM symbols WHERE qualified_name = ?1 LIMIT 1",
@@ -2211,6 +2462,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                                     docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
+                                    coreness: None,
                                     health: None,
                                     suggested_next: None,
                                 })
@@ -2226,7 +2478,6 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 None
             } else {
                 top.map(|t| {
-                    let conn = self.db();
                     build_file_overview(&conn, &t.path)
                 })
             };
@@ -2245,11 +2496,15 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let sn = if let Some(sym) = top_symbol.as_ref() {
                 if sym.is_hub {
                     suggested_with_args("edit_context", "Hub detected — mandatory pre-edit check", serde_json::json!({"symbol": sym.name, "path": sym.path}))
+                } else if sym.caller_count == 0 {
+                    suggested_with_args("callers", "No callers found — verify dead code before deleting", serde_json::json!({"symbol": sym.name}))
                 } else {
                     suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
                 }
             } else if results.is_empty() {
                 suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
+            } else if results.len() > 1 && results[0].name == results[1].name {
+                suggested_with_args("symbol_info", "Multiple matches for same name — disambiguate", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
             } else {
                 suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
             };
@@ -2278,8 +2533,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let since = p.since.unwrap_or_else(|| hc.default_since.clone());
             let min_churn = p.min_churn.unwrap_or(hc.default_min_churn as i64);
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let result = {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 ci_core::analysis::hotspot::compute_hotspots(
                     &self.project_root,
                     &conn,
@@ -2328,8 +2587,13 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
             let search_result =
-                ci_core::search::search(&self.db(), &p.query, kind, 1, self.embedder().as_deref());
+                ci_core::search::search(&conn, &p.query, kind, 1, self.embedder().as_deref());
 
             let top = search_result
                 .ok()
@@ -2338,7 +2602,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             // Carries `language` alongside `SymbolInfoOutput` (which doesn't have
             // a language field) so `SourceOutput.language` below isn't stubbed.
             let symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
-                self.db()
+                conn
                     .query_row(
                         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language
                          FROM symbols WHERE qualified_name = ?1 LIMIT 1",
@@ -2356,6 +2620,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                                     docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
+                                    coreness: None,
                                     health: None,
                                     suggested_next: None,
                                 },
@@ -2393,8 +2658,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let callers = symbol_info
                 .as_ref()
                 .map(|(info, _)| {
-                    let _conn9 = self.db();
-                    let mut stmt = _conn9
+                    let mut stmt = conn
                         .prepare(
                             "SELECT from_symbol, from_path, edge_confidence
                              FROM call_edges WHERE to_symbol = ?1",
@@ -2601,6 +2865,153 @@ mod tests {
     }
 
     #[test]
+    fn session_context_includes_frontier_field() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_frontier_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v.get("frontier").is_some(), "frontier field must always be present, got: {v}");
+        assert!(v["frontier"].is_array(), "frontier must be an array");
+        assert!(v.get("frontier_degraded").is_some(), "frontier_degraded must always be present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_frontier_degraded_when_edges_not_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_deg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Phase starts at Scanning — edges_ready() returns false
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["frontier_degraded"], true,
+            "frontier_degraded must be true when edges not ready, got: {v}"
+        );
+        assert!(
+            v["frontier"].as_array().unwrap().is_empty(),
+            "frontier must be empty when degraded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_suggests_repo_overview_when_frontier_empty() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_sn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Fresh server: no explored context, empty frontier
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["suggested_next"]["tool"].as_str(),
+            Some("repo_overview"),
+            "With empty frontier, must suggest repo_overview, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_frontier_includes_import_and_call_edge_entries() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_frontier_contract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Advance phase to Ready so edges_ready() returns true and the frontier
+        // computation path is taken (not the degraded/empty fast path).
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        // Insert edge data directly into the DB on the same db_path.
+        {
+            let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+
+            // import_edges: b.rs imports a.rs
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["src/b.rs", "src/a.rs", "a"],
+            ).unwrap();
+
+            // call_edges: c.rs has a caller of fn_a (which lives in a.rs)
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "pkg::c::fn_c", "pkg::a::fn_a", "src/c.rs", "src/a.rs", "formal"
+                ],
+            ).unwrap();
+        }
+
+        // Register src/a.rs as explored so the frontier logic treats it as the
+        // "explored" anchor and looks for files that import it (Set A in
+        // compute_frontier_entries).
+        server.track_file("src/a.rs");
+        // Register pkg::a::fn_a as an explored symbol so the frontier logic finds
+        // files containing callers of that symbol via call_edges (Set B).
+        server.track_symbol("pkg::a::fn_a");
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // frontier_degraded must be false — edges are ready
+        assert_eq!(
+            v["frontier_degraded"], false,
+            "frontier_degraded must be false when edges ready, got: {v}"
+        );
+
+        let frontier = v["frontier"].as_array().expect("frontier must be an array");
+
+        // Both b.rs (imported_by_explored) and c.rs (contains_callers_of_explored)
+        // should appear in the frontier.
+        assert_eq!(
+            frontier.len(), 2,
+            "frontier must have 2 entries (b.rs and c.rs), got: {frontier:?}"
+        );
+
+        let find_entry = |path: &str| {
+            frontier.iter().find(|e| e["path"].as_str() == Some(path))
+        };
+
+        let b_entry = find_entry("src/b.rs")
+            .expect("src/b.rs must appear in frontier");
+        assert_eq!(
+            b_entry["reason"].as_str(),
+            Some("imported_by_explored"),
+            "src/b.rs reason must be imported_by_explored, got: {b_entry}"
+        );
+
+        let c_entry = find_entry("src/c.rs")
+            .expect("src/c.rs must appear in frontier");
+        assert_eq!(
+            c_entry["reason"].as_str(),
+            Some("contains_callers_of_explored"),
+            "src/c.rs reason must be contains_callers_of_explored, got: {c_entry}"
+        );
+
+        // With a non-empty frontier the suggested_next tool must be file_overview
+        assert_eq!(
+            v["suggested_next"]["tool"].as_str(),
+            Some("file_overview"),
+            "With non-empty frontier, must suggest file_overview, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn symbol_info_stays_ambiguous_when_path_does_not_uniquely_resolve() {
         let dir = std::env::temp_dir().join(format!("ci_ambig_path_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2722,7 +3133,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params!["mod.foo", "foo bar baz", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "", "foo bar baz", 0i64, 0i64, 0i64],
+                rusqlite::params!["mod.foo", "foo bar baz", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "foo bar baz description", "foo bar baz", 0i64, 0i64, 0i64],
             )
             .unwrap();
         }
@@ -2825,6 +3236,264 @@ mod tests {
         }
         assert_eq!(final_status, EmbedStatus::Failed);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_includes_coreness_when_edges_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_coreness_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Set edges_ready = true by advancing phase to Ready
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        // Insert symbol WITH coreness value
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point, coreness)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "my_fn", "mod::my_fn", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn my_fn()", "", "my fn",
+                    0i64, 0i64, 0i64, 3i64  // coreness = 3
+                ],
+            ).unwrap();
+        }
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "my_fn".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // coreness must be present and equal to 3
+        assert_eq!(
+            v["coreness"], serde_json::json!(3),
+            "coreness must be 3 when edges_ready and DB value is 3, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_coreness_null_when_edges_not_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_coreness_notready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Phase stays Scanning (not Ready) — edges_ready() returns false
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point, coreness)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "my_fn2", "mod::my_fn2", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn my_fn2()", "", "my fn2",
+                    0i64, 0i64, 0i64, 5i64
+                ],
+            ).unwrap();
+        }
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "my_fn2".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // When edges not ready, coreness must be null (not missing)
+        assert!(
+            v.get("coreness").is_some(),
+            "coreness key must be present even when null, got: {v}"
+        );
+        assert!(
+            v["coreness"].is_null(),
+            "coreness must be null when edges_ready is false, got: {}",
+            v["coreness"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preset_compound_includes_required_tools() {
+        let required = [
+            "repo_overview", "locate", "hotspots", "source", "understand",
+            "edit_context", "diff_impact", "session_context", "indexing_status",
+        ];
+        let tools = preset_tools("compound");
+        let tools = tools.expect("compound must return Some (not all-tools fallback)");
+        for t in &required {
+            assert!(tools.contains(t), "compound preset missing '{t}', got: {tools:?}");
+        }
+        assert_eq!(tools.len(), 9, "compound preset must have exactly 9 tools, got: {tools:?}");
+    }
+
+    #[test]
+    fn preset_compound_excludes_raw_graph_tools() {
+        let excluded = ["callers", "callees", "path", "search", "symbol_info", "dependencies", "file_overview"];
+        let tools = preset_tools("compound").expect("compound must be Some");
+        for t in &excluded {
+            assert!(!tools.contains(t), "compound must NOT include '{t}', got: {tools:?}");
+        }
+    }
+
+    #[test]
+    fn locate_suggests_callers_for_zero_caller_count_symbol() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_dead_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "orphan_fn", "mod::orphan_fn", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn orphan_fn()", "An orphaned function with no callers.", "orphan fn",
+                    0i64, 0i64, 0i64  // caller_count = 0, not a hub, not an entry point
+                ],
+            ).unwrap();
+        }
+
+        let output = server.locate(Parameters(LocateParams {
+            query: "orphan_fn".into(),
+            kind: None,      // symbol kind
+            depth: None,     // defaults to with_symbol
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "callers",
+            "locate should suggest callers for zero-caller symbol, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_suggests_symbol_info_for_ambiguous_name() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_amb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            // Two symbols with the same name "process" in different files
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "process", "a::process", "function", "rust", "src/a.rs",
+                    1i64, 5i64, "fn process()", "", "process",
+                    2i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "process", "b::process", "function", "rust", "src/b.rs",
+                    1i64, 5i64, "fn process()", "", "process",
+                    3i64, 0i64, 0i64
+                ],
+            ).unwrap();
+        }
+
+        // Use depth="search_only" so top_symbol is None and both results are visible
+        let output = server.locate(Parameters(LocateParams {
+            query: "process".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "symbol_info",
+            "locate should suggest symbol_info for ambiguous name, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_includes_session_started_at() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_ts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let ts = v["session_started_at"].as_str().expect("session_started_at must be a string");
+        // Must be ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
+        assert!(ts.ends_with('Z'), "timestamp must end with Z, got: {ts}");
+        assert!(ts.len() >= 20, "timestamp must be at least 20 chars, got: {ts}");
+        assert!(ts.contains('T'), "timestamp must contain T separator, got: {ts}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_started_at_is_stable_across_calls() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_ts2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let out1: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let out2: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+
+        assert_eq!(
+            out1["session_started_at"],
+            out2["session_started_at"],
+            "session_started_at must not change between calls"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn make_read_conn_opens_read_only_connection() {
+        let dir = std::env::temp_dir().join(format!("ci_rw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        // query_only pragma should be ON — attempting a write must fail
+        let result = conn.execute("CREATE TABLE IF NOT EXISTS _test_write (id INTEGER)", []);
+        assert!(result.is_err(), "read-only connection must reject writes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn make_read_conn_can_query_symbols() {
+        let dir = std::env::temp_dir().join(format!("ci_rw2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        // Schema is initialized in new() — symbols table must be queryable
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .expect("read conn must be able to query symbols");
+        assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

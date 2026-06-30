@@ -172,6 +172,22 @@ struct ErrorDetail {
     recoverable: bool,
 }
 
+#[derive(Serialize, JsonSchema, Clone)]
+struct SuggestedNext {
+    tool: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<serde_json::Value>,
+}
+
+fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
+    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: None })
+}
+
+fn suggested_with_args(tool: &str, reason: &str, args: serde_json::Value) -> Option<SuggestedNext> {
+    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: Some(args) })
+}
+
 fn error_json(code: &str, message: &str, recoverable: bool) -> String {
     serde_json::to_string_pretty(&ErrorOutput {
         error: ErrorDetail {
@@ -260,6 +276,7 @@ impl CandidateRow {
             caller_count: self.caller_count,
             is_hub: self.is_hub,
             health: None,
+            suggested_next: None,
         }
     }
 
@@ -383,6 +400,8 @@ struct RepoOverviewOutput {
     total_files: i64,
     truncated: bool,
     workflow_guide: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +448,8 @@ struct SearchOutput {
     degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +478,8 @@ struct FileOverviewOutput {
     language: Option<String>,
     symbols: Vec<FileOverviewSymbol>,
     symbol_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 /// Shared by the `file_overview` tool and `locate` (when the top result is a
@@ -497,6 +520,7 @@ fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewO
         language,
         symbols,
         symbol_count,
+        suggested_next: None,
     }
 }
 
@@ -528,6 +552,8 @@ struct SymbolInfoOutput {
     is_hub: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -673,6 +699,8 @@ struct SourceOutput {
     language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<SourceMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +733,8 @@ struct CallersOutput {
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +767,8 @@ struct CalleesOutput {
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -840,6 +872,8 @@ struct DependenciesOutput {
     path: String,
     imports: Vec<ImportEntry>,
     imported_by: Vec<ImportEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +924,8 @@ struct PathOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     terminated_by: Option<TerminatedByOutput>,
     hops_clamped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +947,8 @@ struct EditContextOutput {
     callees: Vec<CalleeEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     risk_assessment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +961,8 @@ struct SessionContextOutput {
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
     unique_files_explored: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1010,8 @@ struct DiffImpactOutput {
     suggested_reviewers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1033,8 @@ struct IndexingStatusOutput {
     edges_indexed: i64,
     embeddings_status: String,
     edges_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1066,8 @@ struct LocateOutput {
     /// downgraded to `with_file`.
     #[serde(skip_serializing_if = "Option::is_none")]
     depth_adjusted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1134,8 @@ struct HotspotsOutput {
     total_files_analyzed: usize,
     hotspot_method: String,
     note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 impl From<ci_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
@@ -1144,6 +1192,8 @@ struct UnderstandOutput {
     callers_summary: Vec<CallerEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edges_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,16 +1227,27 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let phase = self.phase_str();
+            let embed_status = self.embed_status_str();
+            let sn = if phase != "ready" {
+                suggested("indexing_status", "Monitor until phase=ready before using graph tools")
+            } else if embed_status == "failed" {
+                suggested_with_args("indexing_status", "Recover embeddings", serde_json::json!({"retry_embeddings": true}))
+            } else {
+                suggested("locate", "Start exploration")
+            };
+
             serde_json::to_string_pretty(&RepoOverviewOutput {
                 languages,
-                indexing_phase: self.phase_str(),
-                embeddings_status: self.embed_status_str(),
+                indexing_phase: phase,
+                embeddings_status: embed_status,
                 total_modules: total_files,
                 total_symbols,
                 total_files,
                 truncated: false,
                 workflow_guide:
                     "Use locate to find symbols, then source/callers/callees to explore.".into(),
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1207,6 +1268,7 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            let kind_str = p.kind.as_str();
             match ci_core::search::search(
                 &self.db(),
                 &p.query,
@@ -1214,8 +1276,8 @@ impl CodeIntelligenceServer {
                 p.limit,
                 self.embedder().as_deref(),
             ) {
-                Ok(output) => serde_json::to_string_pretty(&SearchOutput {
-                    results: output
+                Ok(output) => {
+                    let results: Vec<SearchResultItem> = output
                         .results
                         .into_iter()
                         .map(|r| SearchResultItem {
@@ -1227,17 +1289,33 @@ impl CodeIntelligenceServer {
                             score: Some(r.score),
                             match_type: Some(r.match_type),
                         })
-                        .collect(),
-                    truncated: output.truncated,
-                    degraded: output.degraded,
-                    note: output.note,
-                })
-                .unwrap_or_default(),
+                        .collect();
+                    let sn = if !results.is_empty() && kind_str == "symbol" {
+                        suggested_with_args("locate", "Full context in 1 call (replaces symbol_info)", serde_json::json!({"query": results[0].name, "kind": "symbol"}))
+                    } else if results.is_empty() && kind_str != "hybrid" && kind_str != "semantic" {
+                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"kind": "hybrid"}))
+                    } else if results.is_empty() && kind_str == "semantic" {
+                        suggested_with_args("search", "Semantic index may not cover this — try text or hybrid search", serde_json::json!({"kind": "text"}))
+                    } else if results.is_empty() && kind_str == "hybrid" {
+                        suggested_with_args("search", "Embeddings may not cover this query — try exact text search or broaden wording", serde_json::json!({"kind": "text"}))
+                    } else {
+                        None
+                    };
+                    serde_json::to_string_pretty(&SearchOutput {
+                        results,
+                        truncated: output.truncated,
+                        degraded: output.degraded,
+                        note: output.note,
+                        suggested_next: sn,
+                    })
+                    .unwrap_or_default()
+                }
                 Err(e) => serde_json::to_string_pretty(&SearchOutput {
                     results: vec![],
                     truncated: false,
                     degraded: true,
                     note: Some(format!("Search error: {e}")),
+                    suggested_next: None,
                 })
                 .unwrap_or_default(),
             }
@@ -1252,7 +1330,18 @@ impl CodeIntelligenceServer {
         self.timed_tool("file_overview", || {
             self.track_file(&p.path);
             let conn = self.db();
-            serde_json::to_string_pretty(&build_file_overview(&conn, &p.path)).unwrap_or_default()
+            let mut out = build_file_overview(&conn, &p.path);
+
+            let hub_name: Option<String> = conn
+                .prepare("SELECT name FROM symbols WHERE path = ?1 AND is_hub = 1 LIMIT 1")
+                .ok()
+                .and_then(|mut s| s.query_row(rusqlite::params![p.path], |r| r.get(0)).ok());
+            out.suggested_next = if let Some(hub) = hub_name {
+                suggested_with_args("locate", "Inspect hub symbol", serde_json::json!({"query": hub}))
+            } else {
+                suggested("source", "Read a symbol implementation")
+            };
+            serde_json::to_string_pretty(&out).unwrap_or_default()
         })
     }
 
@@ -1274,7 +1363,15 @@ impl CodeIntelligenceServer {
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
                     let conn = self.db();
-                    out.health = Some(build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready()));
+                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready());
+                    out.suggested_next = if c.is_hub {
+                        suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
+                    } else if health.test_files.is_empty() {
+                        suggested_with_args("search", "No tests found — search for coverage", serde_json::json!({"query": format!("{} test", c.name), "kind": "text"}))
+                    } else {
+                        suggested_with_args("source", "Read implementation", serde_json::json!({"target": c.name}))
+                    };
+                    out.health = Some(health);
                     serde_json::to_string_pretty(&out).unwrap_or_default()
                 }
             }
@@ -1318,6 +1415,12 @@ impl CodeIntelligenceServer {
                 is_hub: c.is_hub,
             });
 
+            let sn = if p.include_metadata && c.is_hub {
+                suggested("edit_context", "Hub — mandatory pre-edit context")
+            } else {
+                suggested_with_args("callers", "Check who uses this before modifying", serde_json::json!({"symbol": p.symbol}))
+            };
+
             serde_json::to_string_pretty(&SourceOutput {
                 symbol: p.symbol,
                 path: c.path,
@@ -1326,6 +1429,7 @@ impl CodeIntelligenceServer {
                 source: sanitized,
                 language: c.language,
                 metadata,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1388,11 +1492,20 @@ impl CodeIntelligenceServer {
             };
 
             let count = direct.len();
+            let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
+            let sn = if has_textual || count > 10 {
+                suggested("edit_context", "High blast radius or uncertain edges — verify before modifying")
+            } else if count > 0 {
+                suggested_with_args("source", "Read top caller implementation", serde_json::json!({"target": direct[0].symbol}))
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&CallersOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
                 transitive,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1455,11 +1568,17 @@ impl CodeIntelligenceServer {
             };
 
             let count = direct.len();
+            let sn = if count > 0 {
+                suggested("path", "Trace specific call chain")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&CalleesOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
                 transitive,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1512,10 +1631,16 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let sn = if imported_by.len() > 20 {
+                suggested("callers", "High fan-in — check symbol blast radius")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&DependenciesOutput {
                 path: p.path,
                 imports,
                 imported_by,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1584,6 +1709,17 @@ impl CodeIntelligenceServer {
             };
 
             let count = routes.len();
+            let sn = if matches!(&terminated_by, Some(TerminatedByOutput::Timeout)) {
+                suggested_with_args("path", "Retry with smaller max_hops", serde_json::json!({"max_hops": 4}))
+            } else if matches!(&terminated_by, Some(TerminatedByOutput::MaxHops)) {
+                let new_hops = requested_hops + 4;
+                suggested_with_args("path", "Path may exceed hop limit — retry with larger max_hops, or check the reverse direction",
+                    serde_json::json!({"max_hops": new_hops, "from_symbol": p.to_symbol, "to_symbol": p.from_symbol}))
+            } else if exists == Some(true) {
+                suggested("source", "Read meeting node implementation")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&PathOutput {
                 from_symbol: p.from_symbol,
                 to_symbol: p.to_symbol,
@@ -1592,6 +1728,7 @@ impl CodeIntelligenceServer {
                 exists,
                 terminated_by,
                 hops_clamped,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1668,6 +1805,7 @@ impl CodeIntelligenceServer {
                 callers,
                 callees,
                 risk_assessment: risk,
+                suggested_next: suggested("diff_impact", "MANDATORY after changes — verify blast radius"),
             })
             .unwrap_or_default()
         })
@@ -1686,6 +1824,7 @@ impl CodeIntelligenceServer {
                 explored_symbols: log.explored_symbols.iter().cloned().collect(),
                 unique_files_explored: explored_files.len(),
                 explored_files,
+                suggested_next: suggested("repo_overview", "Refresh map"),
             })
             .unwrap_or_default()
         })
@@ -1857,6 +1996,26 @@ impl CodeIntelligenceServer {
                 }
             }
 
+            let sn = if !unindexed_files.is_empty() {
+                suggested("indexing_status", "Wait for index before treating as safe")
+            } else if aggregate_risk == "critical" || aggregate_risk == "high" {
+                affected_symbols.first().map(|s| SuggestedNext {
+                    tool: "callers".into(),
+                    reason: "Verify high-risk callers manually".into(),
+                    args: Some(serde_json::json!({"symbol": s.name})),
+                })
+            } else if aggregate_risk == "medium" {
+                affected_symbols.first().map(|s| SuggestedNext {
+                    tool: "callers".into(),
+                    reason: "Medium-risk changes — spot-check key callers".into(),
+                    args: Some(serde_json::json!({"symbol": s.name})),
+                })
+            } else if aggregate_risk == "unknown" {
+                suggested("indexing_status", "Risk unknown — check index state")
+            } else {
+                None
+            };
+
             serde_json::to_string_pretty(&DiffImpactOutput {
                 files_changed,
                 affected_symbols,
@@ -1864,6 +2023,7 @@ impl CodeIntelligenceServer {
                 aggregate_risk,
                 suggested_reviewers,
                 note: None,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1892,13 +2052,20 @@ impl CodeIntelligenceServer {
                 self.retry_embeddings_if_failed();
             }
 
+            let phase = self.phase_str();
+            let sn = if phase == "ready" {
+                suggested("locate", "Index ready — begin exploration")
+            } else {
+                suggested("indexing_status", "Still indexing — poll again or use search/source while edges build")
+            };
             serde_json::to_string_pretty(&IndexingStatusOutput {
-                indexing_phase: self.phase_str(),
+                indexing_phase: phase,
                 files_indexed: files,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -1991,6 +2158,7 @@ impl CodeIntelligenceServer {
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     health: None,
+                                    suggested_next: None,
                                 })
                             },
                         )
@@ -2019,12 +2187,26 @@ impl CodeIntelligenceServer {
             }
 
             let truncated = search_output.truncated;
+
+            let sn = if let Some(sym) = top_symbol.as_ref() {
+                if sym.is_hub {
+                    suggested_with_args("edit_context", "Hub detected — mandatory pre-edit check", serde_json::json!({"symbol": sym.name, "path": sym.path}))
+                } else {
+                    suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+                }
+            } else if results.is_empty() {
+                suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
+            } else {
+                suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+            };
+
             serde_json::to_string_pretty(&LocateOutput {
                 results,
                 top_symbol,
                 file_overview,
                 truncated,
                 depth_adjusted,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -2059,6 +2241,12 @@ impl CodeIntelligenceServer {
                 result.hotspots.into_iter().map(HotspotEntryOutput::from).collect();
             let count = hotspots.len();
 
+            let sn = hotspots.first().map(|h| SuggestedNext {
+                tool: "file_overview".into(),
+                reason: "Inspect highest-risk file".into(),
+                args: Some(serde_json::json!({"path": h.path})),
+            });
+
             serde_json::to_string_pretty(&HotspotsOutput {
                 hotspots,
                 count,
@@ -2067,6 +2255,7 @@ impl CodeIntelligenceServer {
                 total_files_analyzed: result.total_files_analyzed,
                 hotspot_method: result.hotspot_method,
                 note: result.note,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -2114,6 +2303,7 @@ impl CodeIntelligenceServer {
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     health: None,
+                                    suggested_next: None,
                                 },
                                 row.get::<_, String>(10).unwrap_or_default(),
                             ))
@@ -2142,6 +2332,7 @@ impl CodeIntelligenceServer {
                     source,
                     language: language.clone(),
                     metadata: None,
+                    suggested_next: None,
                 })
             });
 
@@ -2168,11 +2359,22 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap_or_default();
 
+            let sn = if let Some((ref info, _)) = symbol_info {
+                if info.is_hub {
+                    suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
+                } else {
+                    suggested_with_args("edit_context", "Pre-edit: verify blast radius before modifying", serde_json::json!({"symbol": info.name, "path": info.path}))
+                }
+            } else {
+                None
+            };
+
             serde_json::to_string_pretty(&UnderstandOutput {
                 symbol: symbol_info.map(|(info, _)| info),
                 source: source_output,
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })

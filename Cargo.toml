@@ -22,6 +22,17 @@ tree-sitter-javascript = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-go = "0.23"
+# Tier-0.5 optional language grammars (accurate AST extraction, opt-in via feature flags).
+# Only crates whose tree-sitter version is compatible with "0.24" are included;
+# kotlin (0.3.x) and swift (0.7.x) use incompatible older tree-sitter API versions
+# and fall back to regex extraction regardless of feature flag.
+# Note: optionality is declared in each crate's Cargo.toml, not here.
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-bash = "0.25"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"

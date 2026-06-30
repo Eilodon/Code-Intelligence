@@ -63,6 +63,22 @@ pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
+        // Tier-0.5: optional grammar crates, each gated by a Cargo feature.
+        #[cfg(feature = "lang-ruby")]
+        "ruby" => tree_sitter_ruby::LANGUAGE.into(),
+        #[cfg(feature = "lang-php")]
+        "php" => tree_sitter_php::LANGUAGE_PHP.into(),
+        // kotlin and swift: lang-kotlin / lang-swift are no-op feature stubs;
+        // their tree-sitter crates use incompatible API versions. These languages
+        // always fall back to regex extraction in extract_file_data.
+        #[cfg(feature = "lang-csharp")]
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+        #[cfg(feature = "lang-shell")]
+        "shell" | "bash" => tree_sitter_bash::LANGUAGE.into(),
+        #[cfg(feature = "lang-c")]
+        "c" => tree_sitter_c::LANGUAGE.into(),
+        #[cfg(feature = "lang-cpp")]
+        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
         _ => return None,
     };
     let mut parser = tree_sitter::Parser::new();
@@ -141,6 +157,25 @@ fn resolve_name_node<'a>(
                     None
                 }
             })
+        }
+        // C and C++ function_definition: the function name is not in a direct
+        // "name" field but nested inside a declarator chain:
+        //   function_definition
+        //     declarator: function_declarator | pointer_declarator | ...
+        //       declarator: ... (recursively) → identifier
+        // Walk the chain until we reach an identifier node.
+        "function_definition" => {
+            fn find_ident_in_declarator(n: tree_sitter::Node) -> Option<tree_sitter::Node> {
+                if n.kind() == "identifier" || n.kind() == "field_identifier" {
+                    return Some(n);
+                }
+                if let Some(inner) = n.child_by_field_name("declarator") {
+                    return find_ident_in_declarator(inner);
+                }
+                None
+            }
+            node.child_by_field_name("declarator")
+                .and_then(find_ident_in_declarator)
         }
         _ => None,
     }
@@ -1237,7 +1272,10 @@ public class Main {
         assert!(names.contains(&"Foo"), "should detect class");
         assert!(names.contains(&"Bar"), "should detect struct");
         assert!(names.contains(&"init"), "should detect function");
-        assert!(names.contains(&"compute"), "should detect function with args");
+        assert!(
+            names.contains(&"compute"),
+            "should detect function with args"
+        );
         assert!(!names.contains(&"if"), "should skip control flow");
     }
 
@@ -1288,7 +1326,10 @@ public class Main {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
         let syms = extract_symbols_shallow(code, "shell", "a.sh");
         let names = shallow_names(&syms);
-        assert!(names.contains(&"setup"), "should detect function keyword style");
+        assert!(
+            names.contains(&"setup"),
+            "should detect function keyword style"
+        );
         assert!(names.contains(&"build"), "should detect paren style");
     }
 

@@ -25,6 +25,12 @@ tree-sitter-stack-graphs = { workspace = true }
 tree-sitter-stack-graphs-python = { workspace = true }
 model2vec-rs = { version = "0.2.1", optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
+tree-sitter-c       = { workspace = true, optional = true }
+tree-sitter-cpp     = { workspace = true, optional = true }
+tree-sitter-ruby    = { workspace = true, optional = true }
+tree-sitter-php     = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-bash    = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -33,5 +39,20 @@ tempfile = "3"
 # Semantic embeddings: pure-Rust static code embeddings (model2vec-rs) stored
 # in sqlite-vec. On by default for native builds; musl release builds explicitly
 # opt-out via --no-default-features to keep the static binary lean.
-default = ["embeddings"]
+default = ["embeddings", "tier0-5"]
 embeddings = ["dep:model2vec-rs", "dep:sqlite-vec"]
+# Tier-0.5 upgrade: optional per-language tree-sitter grammars for accurate
+# AST-based extraction (replaces regex fallback when compiled in).
+# Individual flags let users include only the languages they need.
+lang-c      = ["dep:tree-sitter-c"]
+lang-cpp    = ["dep:tree-sitter-cpp"]
+lang-ruby   = ["dep:tree-sitter-ruby"]
+lang-php    = ["dep:tree-sitter-php"]
+lang-csharp = ["dep:tree-sitter-c-sharp"]
+lang-shell  = ["dep:tree-sitter-bash"]
+# kotlin and swift use incompatible tree-sitter versions — regex fallback always active.
+# lang-kotlin and lang-swift are no-op stubs kept for API stability.
+lang-kotlin = []
+lang-swift  = []
+# Bundle: all six tree-sitter-upgraded Tier-0.5 languages at once.
+tier0-5 = ["lang-c", "lang-cpp", "lang-ruby", "lang-php", "lang-csharp", "lang-shell"]

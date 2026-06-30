@@ -17,5 +17,14 @@ rmcp = { workspace = true }
 schemars = { workspace = true }
 
 [features]
-default = ["embeddings"]
+default = ["embeddings", "tier0-5"]
 embeddings = ["ci-core/embeddings"]
+lang-c      = ["ci-core/lang-c"]
+lang-cpp    = ["ci-core/lang-cpp"]
+lang-ruby   = ["ci-core/lang-ruby"]
+lang-kotlin = ["ci-core/lang-kotlin"]
+lang-swift  = ["ci-core/lang-swift"]
+lang-php    = ["ci-core/lang-php"]
+lang-csharp = ["ci-core/lang-csharp"]
+lang-shell  = ["ci-core/lang-shell"]
+tier0-5     = ["ci-core/tier0-5"]

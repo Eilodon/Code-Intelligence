@@ -72,6 +72,131 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             class_node_types: &["class_declaration", "interface_declaration"],
             class_name_field: "name",
         }),
+        // Tier-0.5 — full tree-sitter parsing when the optional grammar feature is enabled.
+        // LangConstants are always present; parse_tree gates the actual grammar behind the flag.
+        "ruby" => Some(LangConstants {
+            function_node_types: &["method", "singleton_method", "class", "module"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["method_call"],
+            call_function_field: "method",
+            class_node_types: &["class", "module"],
+            class_name_field: "name",
+        }),
+        "php" => Some(LangConstants {
+            function_node_types: &[
+                "function_definition",
+                "method_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "trait_declaration",
+            ],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["function_call_expression"],
+            call_function_field: "function",
+            class_node_types: &[
+                "class_declaration",
+                "interface_declaration",
+                "trait_declaration",
+            ],
+            class_name_field: "name",
+        }),
+        "kotlin" => Some(LangConstants {
+            function_node_types: &[
+                "function_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "object_declaration",
+            ],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["call_expression"],
+            call_function_field: "callee", // Kotlin uses "callee", not "function"
+            class_node_types: &[
+                "class_declaration",
+                "interface_declaration",
+                "object_declaration",
+            ],
+            class_name_field: "name",
+        }),
+        "swift" => Some(LangConstants {
+            function_node_types: &[
+                "function_declaration",
+                "class_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "protocol_declaration",
+            ],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["function_call_expression"],
+            call_function_field: "function",
+            class_node_types: &[
+                "class_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "protocol_declaration",
+            ],
+            class_name_field: "name",
+        }),
+        "csharp" => Some(LangConstants {
+            function_node_types: &[
+                "method_declaration",
+                "class_declaration",
+                "struct_declaration",
+                "interface_declaration",
+                "delegate_declaration",
+                "enum_declaration",
+            ],
+            name_field: "name",
+            docstring_type: Some("block_comment"),
+            call_node_types: &["invocation_expression"],
+            call_function_field: "function",
+            class_node_types: &[
+                "class_declaration",
+                "struct_declaration",
+                "interface_declaration",
+                "enum_declaration",
+            ],
+            class_name_field: "name",
+        }),
+        "shell" | "bash" => Some(LangConstants {
+            function_node_types: &["function_definition"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["command"],
+            call_function_field: "name",
+            class_node_types: &[],
+            class_name_field: "name",
+        }),
+        // C: function names live inside a declarator chain (no direct "name" field);
+        // resolve_name_node() has a special case that walks declarator → identifier.
+        "c" => Some(LangConstants {
+            function_node_types: &["function_definition"],
+            name_field: "name", // no-op for function_definition; handled by resolve_name_node
+            docstring_type: Some("comment"),
+            call_node_types: &["call_expression"],
+            call_function_field: "function",
+            class_node_types: &[],
+            class_name_field: "name",
+        }),
+        // C++: same declarator quirk as C for function_definition; class_specifier /
+        // struct_specifier / enum_specifier DO have a direct "name" field.
+        "cpp" => Some(LangConstants {
+            function_node_types: &[
+                "function_definition",
+                "class_specifier",
+                "struct_specifier",
+                "enum_specifier",
+            ],
+            name_field: "name", // works for class/struct/enum; resolve_name_node handles function
+            docstring_type: Some("comment"),
+            call_node_types: &["call_expression"],
+            call_function_field: "function",
+            class_node_types: &["class_specifier", "struct_specifier", "enum_specifier"],
+            class_name_field: "name",
+        }),
         _ => None,
     }
 }

@@ -104,11 +104,12 @@ impl ConservativeResolver {
             "self" | "this" => enclosing_class?.to_string(),
             other => ctx.type_map.get(other)?.clone(),
         };
-        // Reduce `Foo<T>` / `Foo[int]` / `pkg.Foo` to the bare type name.
-        let bare = ty
-            .rsplit(['.', ':'])
-            .next()
-            .unwrap_or(&ty)
+        // Reduce `*Service` / `&Foo` / `pkg.Foo` / `Foo<T>` / `List[int]` to the
+        // bare type name: drop leading ref/pointer sigils, any module qualifier,
+        // and trailing generics.
+        let trimmed = ty.trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+        let seg = trimmed.rsplit(['.', ':']).next().unwrap_or(trimmed);
+        let bare = seg
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect::<String>();

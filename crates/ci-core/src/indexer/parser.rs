@@ -100,6 +100,13 @@ fn walk_symbols(
         let signature = source[node.start_byte()..sig_end].trim().to_string();
         let name_tokens = tokenize_identifier(&name);
 
+        // Go has no class scope: a method's "class" is its receiver type.
+        let class_context = if language == "go" && node.kind() == "method_declaration" {
+            go_receiver_type(node, source)
+        } else {
+            enclosing_class.clone()
+        };
+
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
             name,
@@ -112,7 +119,7 @@ fn walk_symbols(
             docstring,
             name_tokens,
             is_entry_point: false,
-            class_context: enclosing_class.clone(),
+            class_context,
         });
     }
 
@@ -129,6 +136,30 @@ fn walk_symbols(
     for child in node.children(&mut cursor) {
         walk_symbols(child, source, lc, language, path, child_class.clone(), out);
     }
+}
+
+/// The receiver type of a Go `method_declaration` (`func (s *Service) M()` → `Service`).
+fn go_receiver_type(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    for child in receiver.children(&mut cursor) {
+        if child.kind() == "parameter_declaration"
+            && let Some(ty) = child.child_by_field_name("type")
+        {
+            // Strip pointer/qualifier; keep the trailing bare type identifier.
+            let bare: String = source[ty.byte_range()]
+                .rsplit(['.', '*', ' '])
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !bare.is_empty() {
+                return Some(bare);
+            }
+        }
+    }
+    None
 }
 
 /// A raw call site discovered in source, attributed to its enclosing function.

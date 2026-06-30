@@ -790,6 +790,48 @@ mod tests {
     }
 
     #[test]
+    fn test_tier2_go_pointer_receiver() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_go2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.go"),
+            "package p\ntype Service struct{}\nfunc (s *Service) Process() int { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.go"),
+            "package p\nfunc run(s *Service) int { return s.Process() }\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        // Go method is tagged with its receiver type as class_context.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.go::Service::Process'",
+            ),
+            1
+        );
+        // `*Service` receiver ⇒ s.Process() resolves into Service, inferred.
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'b.go::run' AND to_symbol = 'a.go::Service::Process'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "inferred");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_reindex_incremental_add_modify_delete() {
         let dir = std::env::temp_dir().join(format!("ci_idx_inc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

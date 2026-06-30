@@ -1204,7 +1204,7 @@ struct UnderstandOutput {
 impl CodeIntelligenceServer {
     #[tool(
         name = "repo_overview",
-        description = "Overview of the entire repository — languages, stats, indexing status. ALWAYS call first."
+        description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate)."
     )]
     fn repo_overview(&self) -> String {
         self.timed_tool("repo_overview", || {
@@ -1255,7 +1255,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "search",
-        description = "FTS5 dual-column search across symbols, text, files. Supports symbol, text, file, semantic, hybrid kinds."
+        description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
     )]
     fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
         self.timed_tool("search", || {
@@ -1324,7 +1324,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "file_overview",
-        description = "List all symbols in a file — functions, classes, methods with line ranges."
+        description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
     )]
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
         self.timed_tool("file_overview", || {
@@ -1347,7 +1347,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "symbol_info",
-        description = "Detailed info for a single symbol — signature, docstring, hub status, caller count."
+        description = "USE WHEN: you have a symbol name and want metadata + health signals BEFORE reading source. Check is_hub + coreness before deciding whether to modify — hub symbols need edit_context. NOT FOR: reading source (use source), finding symbols (use search/locate). vs source: symbol_info is metadata-only (no code body)."
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
         self.timed_tool("symbol_info", || {
@@ -1380,7 +1380,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "source",
-        description = "Retrieve source code for a symbol. Output is sanitized for credentials."
+        description = "USE THIS INSTEAD OF native Read file tool — reads symbol-precise code, always fresh from disk. USE WHEN: you need to read the actual implementation of a specific function/class/method. NEVER use native Read tool on a full file — it floods context with unrelated code."
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
         self.timed_tool("source", || {
@@ -1437,7 +1437,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "callers",
-        description = "Who calls this symbol? Returns direct callers with edge confidence."
+        description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
         self.timed_tool("callers", || {
@@ -1513,7 +1513,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "callees",
-        description = "What does this symbol call? Returns direct callees with edge confidence."
+        description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
         self.timed_tool("callees", || {
@@ -1586,7 +1586,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "dependencies",
-        description = "Import/export dependencies for a file — what it imports and what imports it."
+        description = "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level."
     )]
     fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
         self.timed_tool("dependencies", || {
@@ -1648,7 +1648,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "path",
-        description = "Find call paths between two symbols using bidirectional BFS."
+        description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result."
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
         self.timed_tool("path", || {
@@ -1736,7 +1736,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "edit_context",
-        description = "Pre-edit blast radius — callers, callees, and risk assessment for a symbol you plan to modify."
+        description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
         self.timed_tool("edit_context", || {
@@ -1813,7 +1813,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "session_context",
-        description = "Session tracking state — explored symbols, files, tool call count."
+        description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count."
     )]
     fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
@@ -1832,7 +1832,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "diff_impact",
-        description = "Post-edit blast radius — analyze a diff for affected symbols and risk level. Provide exactly one of: diff, staged, commits."
+        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Provide exactly one of: diff, staged, commits."
     )]
     fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> String {
         self.timed_tool("diff_impact", || {
@@ -2031,7 +2031,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "indexing_status",
-        description = "Current index status — files, symbols, edges, embedding state. Can retry embeddings."
+        description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
     )]
     fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
         self.timed_tool("indexing_status", || {
@@ -2073,7 +2073,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "locate",
-        description = "Compound: search + file_overview + symbol_info in one call. Default depth: with_symbol."
+        description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
     )]
     fn locate(&self, Parameters(p): Parameters<LocateParams>) -> String {
         self.timed_tool("locate", || {
@@ -2214,7 +2214,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "hotspots",
-        description = "Churn × complexity hotspots — files most likely to cause bugs based on git history."
+        description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
     )]
     fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> String {
         self.timed_tool("hotspots", || {
@@ -2263,7 +2263,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "understand",
-        description = "Compound: locate + source + callers in one call. Deep understanding of a symbol."
+        description = "Compound: locate + source + callers summary in 1 call. USE INSTEAD OF calling locate then source then callers separately. NOT FOR: pre-edit (use edit_context — more complete blast radius). NOT FOR: browsing results list (use locate with depth=search_only)."
     )]
     fn understand(&self, Parameters(p): Parameters<UnderstandParams>) -> String {
         self.timed_tool("understand", || {

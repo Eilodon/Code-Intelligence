@@ -6,6 +6,10 @@ pub struct LangConstants {
     pub call_node_types: &'static [&'static str],
     /// Field name on a call node that holds the callee expression (the called function).
     pub call_function_field: &'static str,
+    /// Node kinds that introduce a class / impl scope (for method `class_context`).
+    pub class_node_types: &'static [&'static str],
+    /// Field on a class node naming the type (Rust `impl` uses `type`, others `name`).
+    pub class_name_field: &'static str,
 }
 
 pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
@@ -16,6 +20,8 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             docstring_type: Some("expression_statement"), // Python docstrings are expression_statements
             call_node_types: &["call"],
             call_function_field: "function",
+            class_node_types: &["class_definition"],
+            class_name_field: "name",
         }),
         "rust" => Some(LangConstants {
             function_node_types: &["function_item", "struct_item", "trait_item", "impl_item"],
@@ -23,6 +29,8 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             docstring_type: Some("line_comment"),
             call_node_types: &["call_expression"],
             call_function_field: "function",
+            class_node_types: &["impl_item"],
+            class_name_field: "type",
         }),
         "go" => Some(LangConstants {
             function_node_types: &[
@@ -34,6 +42,8 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             docstring_type: Some("comment"),
             call_node_types: &["call_expression"],
             call_function_field: "function",
+            class_node_types: &[],
+            class_name_field: "name",
         }),
         "javascript" | "typescript" => Some(LangConstants {
             function_node_types: &[
@@ -46,6 +56,8 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             docstring_type: Some("comment"),
             call_node_types: &["call_expression"],
             call_function_field: "function",
+            class_node_types: &["class_declaration"],
+            class_name_field: "name",
         }),
         "java" => Some(LangConstants {
             function_node_types: &[
@@ -57,6 +69,8 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             docstring_type: Some("block_comment"),
             call_node_types: &["method_invocation"],
             call_function_field: "name",
+            class_node_types: &["class_declaration", "interface_declaration"],
+            class_name_field: "name",
         }),
         _ => None,
     }

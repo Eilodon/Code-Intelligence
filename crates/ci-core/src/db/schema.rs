@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     coreness        INTEGER,
     is_entry_point  INTEGER NOT NULL DEFAULT 0,
     file_hash       TEXT NOT NULL DEFAULT '',
-    indexed_at      REAL NOT NULL DEFAULT 0
+    indexed_at      REAL NOT NULL DEFAULT 0,
+    class_context   TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
@@ -81,7 +82,9 @@ CREATE TABLE IF NOT EXISTS call_sites (
     enclosing_qn TEXT NOT NULL,
     callee_name  TEXT NOT NULL,
     call_line    INTEGER,
-    confidence   TEXT NOT NULL DEFAULT 'textual'
+    confidence   TEXT NOT NULL DEFAULT 'textual',
+    receiver     TEXT,
+    target_class TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -151,7 +154,17 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
+    migrate_add_column(conn, "symbols", "class_context", "TEXT")?;
     migrate_add_column(conn, "file_index", "mtime", "REAL")?;
+    // call_sites columns added after the table first shipped.
+    migrate_add_column(
+        conn,
+        "call_sites",
+        "confidence",
+        "TEXT NOT NULL DEFAULT 'textual'",
+    )?;
+    migrate_add_column(conn, "call_sites", "receiver", "TEXT")?;
+    migrate_add_column(conn, "call_sites", "target_class", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     Ok(())
 }

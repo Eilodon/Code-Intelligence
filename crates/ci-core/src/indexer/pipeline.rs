@@ -24,6 +24,10 @@ const IGNORE_DIRS: &[&str] = &[
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
 
+/// A persisted call site loaded for graph rebuild:
+/// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class).
+type CallSiteRow = (String, String, String, Option<i64>, String, Option<String>);
+
 /// Recursively collect tier-0 source files under `root`, skipping ignored and
 /// dot-prefixed directories. Deterministic order is imposed by the caller.
 fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) {
@@ -136,7 +140,11 @@ fn index_one_file(
     let mut seen: HashSet<String> = HashSet::new();
     for s in &mut syms {
         s.path = rel.to_string();
-        s.qualified_name = format!("{}::{}", rel, s.name);
+        // Methods are qualified by their class so two classes' `run` don't collide.
+        s.qualified_name = match &s.class_context {
+            Some(cls) => format!("{}::{}::{}", rel, cls, s.name),
+            None => format!("{}::{}", rel, s.name),
+        };
         if !seen.insert(s.qualified_name.clone()) {
             s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
             seen.insert(s.qualified_name.clone());
@@ -182,24 +190,39 @@ fn index_one_file(
     let resolver = crate::resolver::conservative::ConservativeResolver::new();
     let aliases = extract_file_aliases(source, lang, &ctx);
 
-    // Calls → call_sites. Confidence comes from the conservative resolver
-    // (file symbol / import / alias → "resolved", otherwise "textual"); the
-    // callee is de-aliased so the graph attributes the call to the real target.
+    // Calls → call_sites. Tier-1 (conservative resolver): file symbol / import /
+    // alias → "resolved", else "textual". Tier-2: a still-textual *method* call
+    // whose receiver type is inferable (self/this → enclosing class, or a typed
+    // variable) becomes "inferred" with a target_class for the rebuild to match.
     let calls = extract_calls(source, lang, rel).unwrap_or_default();
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
-            let confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
+            let mut confidence = resolver
+                .resolve_tier1(&c.callee, &ctx, &aliases)
+                .confidence
+                .to_string();
+            let mut target_class: Option<String> = None;
+            if confidence == "textual"
+                && let Some(receiver) = &c.receiver
+                && let Some(cls) =
+                    resolver.resolve_tier2(receiver, &ctx, c.enclosing_class.as_deref())
+            {
+                confidence = "inferred".to_string();
+                target_class = Some(cls);
+            }
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee);
             stmt.execute(rusqlite::params![
                 rel,
                 enc_qn,
                 callee,
                 c.line as i64,
-                confidence
+                confidence,
+                c.receiver,
+                target_class
             ])?;
         }
     }
@@ -212,27 +235,37 @@ fn index_one_file(
 /// This is pure DB work (no file parsing), so incremental passes only re-parse
 /// the files that actually changed while the graph stays globally consistent.
 fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
-    // name → [(qualified_name, path)]
-    let mut qns_by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // name → [(qn, path)] for tier-1; (name, class) → [(qn, path)] for tier-2.
+    let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut by_name_class: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
     {
-        let mut stmt = tx.prepare("SELECT name, qualified_name, path FROM symbols")?;
+        let mut stmt =
+            tx.prepare("SELECT name, qualified_name, path, class_context FROM symbols")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (name, qn, path) in rows {
-            qns_by_name.entry(name).or_default().push((qn, path));
+        for (name, qn, path, cls) in rows {
+            by_name
+                .entry(name.clone())
+                .or_default()
+                .push((qn.clone(), path.clone()));
+            if let Some(c) = cls {
+                by_name_class.entry((name, c)).or_default().push((qn, path));
+            }
         }
     }
 
-    let sites: Vec<(String, String, String, Option<i64>, String)> = {
+    let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence FROM call_sites",
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class \
+             FROM call_sites",
         )?;
         stmt.query_map([], |r| {
             Ok((
@@ -241,17 +274,23 @@ fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     // One edge per (caller, callee) pair; the first call site supplies the line.
-    // Confidence is the resolver's verdict recorded at extraction time.
+    // Confidence is the resolver's verdict recorded at extraction time. A tier-2
+    // call (target_class set) resolves the method within that class only.
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    for (from_path, enc_qn, callee, line, confidence) in &sites {
-        let Some(targets) = qns_by_name.get(callee) else {
+    for (from_path, enc_qn, callee, line, confidence, target_class) in &sites {
+        let targets = match target_class {
+            Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
+            None => by_name.get(callee),
+        };
+        let Some(targets) = targets else {
             continue;
         };
         if targets.len() > MAX_CALLEE_CANDIDATES {
@@ -697,6 +736,54 @@ mod tests {
         assert_eq!(
             confidence, "resolved",
             "imported call should be resolved, not textual"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tier2_method_resolution() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_tier2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // a.py: a class with a method. b.py: a typed-parameter method call on it.
+        std::fs::write(
+            dir.join("a.py"),
+            "class Service:\n    def process(self):\n        pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.py"),
+            "def run(svc: Service):\n    svc.process()\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        // Method is class-qualified.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::Service::process'",
+            ),
+            1,
+            "method qualified_name should include its class"
+        );
+
+        // Tier-2: svc:Service ⇒ svc.process() resolves into Service, confidence inferred.
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'b.py::run' AND to_symbol = 'a.py::Service::process'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "inferred",
+            "typed-receiver method call is tier-2 inferred"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

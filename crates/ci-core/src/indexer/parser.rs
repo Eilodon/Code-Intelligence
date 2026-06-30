@@ -12,6 +12,9 @@ pub struct ParsedSymbol {
     pub docstring: String,
     pub name_tokens: String,
     pub is_entry_point: bool,
+    /// Enclosing class/impl type name for methods (`None` for free functions).
+    /// Drives tier-2 method resolution.
+    pub class_context: Option<String>,
 }
 
 use crate::graph::tokenize::tokenize_identifier;
@@ -43,86 +46,108 @@ pub fn extract_symbols(
     let lang_consts = get_lang_constants(language).ok_or("No lang constants")?;
     let tree = parse_tree(source, language).ok_or("Failed to parse")?;
     let mut symbols = Vec::new();
+    walk_symbols(
+        tree.root_node(),
+        source,
+        &lang_consts,
+        language,
+        path,
+        None,
+        &mut symbols,
+    );
+    Ok(symbols)
+}
 
-    let root = tree.root_node();
-    let mut stack = vec![root];
+/// Recursive symbol walk tracking the enclosing class/impl so methods record
+/// their `class_context`.
+fn walk_symbols(
+    node: tree_sitter::Node,
+    source: &str,
+    lc: &crate::indexer::lang_constants::LangConstants,
+    language: &str,
+    path: &str,
+    enclosing_class: Option<String>,
+    out: &mut Vec<ParsedSymbol>,
+) {
+    // A symbol defined here belongs to the class we are currently inside.
+    if lc.function_node_types.contains(&node.kind())
+        && let Some(name_node) = node.child_by_field_name(lc.name_field)
+    {
+        let name = source[name_node.byte_range()].to_string();
 
-    while let Some(node) = stack.pop() {
-        let kind = node.kind();
-        if lang_consts.function_node_types.contains(&kind)
-            && let Some(name_node) = node.child_by_field_name(lang_consts.name_field)
-        {
+        let mut docstring = String::new();
+        if language == "python" {
+            if let Some(body) = node.child_by_field_name("body")
+                && body.kind() == "block"
+                && let Some(expr) = body.child(0)
+                && expr.kind() == "expression_statement"
             {
-                let name = source[name_node.byte_range()].to_string();
-
-                let mut docstring = String::new();
-                if language == "python" {
-                    if let Some(body) = node.child_by_field_name("body")
-                        && body.kind() == "block"
-                        && let Some(expr) = body.child(0)
-                        && expr.kind() == "expression_statement"
-                    {
-                        let raw_doc = source[expr.byte_range()].trim();
-                        docstring = raw_doc.trim_matches(|c| c == '"' || c == '\'').to_string();
-                    }
-                } else if let Some(prev) = node.prev_named_sibling()
-                    && let Some(doc_type) = lang_consts.docstring_type
-                    && prev.kind() == doc_type
-                {
-                    docstring = source[prev.byte_range()].trim().to_string();
-                }
-
-                let sig_end = source[node.start_byte()..]
-                    .find('{')
-                    .or_else(|| source[node.start_byte()..].find(':'))
-                    .map(|pos| node.start_byte() + pos + 1)
-                    .unwrap_or(node.end_byte());
-                let signature = source[node.start_byte()..sig_end].trim().to_string();
-
-                let name_tokens = tokenize_identifier(&name);
-
-                symbols.push(ParsedSymbol {
-                    qualified_name: name.clone(),
-                    name,
-                    kind: SymbolKind::Function,
-                    language: language.to_string(),
-                    path: path.to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    docstring,
-                    name_tokens,
-                    is_entry_point: false,
-                });
+                let raw_doc = source[expr.byte_range()].trim();
+                docstring = raw_doc.trim_matches(|c| c == '"' || c == '\'').to_string();
             }
+        } else if let Some(prev) = node.prev_named_sibling()
+            && let Some(doc_type) = lc.docstring_type
+            && prev.kind() == doc_type
+        {
+            docstring = source[prev.byte_range()].trim().to_string();
         }
 
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
+        let sig_end = source[node.start_byte()..]
+            .find('{')
+            .or_else(|| source[node.start_byte()..].find(':'))
+            .map(|pos| node.start_byte() + pos + 1)
+            .unwrap_or(node.end_byte());
+        let signature = source[node.start_byte()..sig_end].trim().to_string();
+        let name_tokens = tokenize_identifier(&name);
+
+        out.push(ParsedSymbol {
+            qualified_name: name.clone(),
+            name,
+            kind: SymbolKind::Function,
+            language: language.to_string(),
+            path: path.to_string(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            signature,
+            docstring,
+            name_tokens,
+            is_entry_point: false,
+            class_context: enclosing_class.clone(),
+        });
     }
 
-    Ok(symbols)
+    // Entering a class/impl sets the context for its descendants.
+    let child_class = if lc.class_node_types.contains(&node.kind()) {
+        node.child_by_field_name(lc.class_name_field)
+            .map(|n| source[n.byte_range()].to_string())
+            .or_else(|| enclosing_class.clone())
+    } else {
+        enclosing_class.clone()
+    };
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_symbols(child, source, lc, language, path, child_class.clone(), out);
+    }
 }
 
 /// A raw call site discovered in source, attributed to its enclosing function.
 ///
-/// `enclosing_name`/`enclosing_line` identify the caller symbol (resolved to a
-/// `qualified_name` later by the pipeline); `callee` is the bare called name.
+/// `enclosing_name`/`enclosing_line` identify the caller symbol; `enclosing_class`
+/// is the class it lives in (for `self`/`this` resolution); `receiver` is the
+/// object of a method call (`recv.method()`), enabling tier-2 type resolution.
 pub struct RawCall {
     pub enclosing_name: String,
     pub enclosing_line: usize,
+    pub enclosing_class: Option<String>,
     pub callee: String,
+    pub receiver: Option<String>,
     pub line: usize,
 }
 
-/// Reduce a callee expression's text to a bare identifier for name-based matching.
-///
-/// `obj.method` → `method`, `mod::func` → `func`, `Type::<T>::new(` → `new`.
-fn callee_bare_name(raw: &str) -> Option<String> {
-    let last = raw.rsplit(['.', ':']).next().unwrap_or(raw);
-    let ident: String = last
+/// Keep the leading identifier of a segment (drop generics/parens/whitespace).
+fn leading_ident(seg: &str) -> Option<String> {
+    let ident: String = seg
         .trim()
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -130,12 +155,31 @@ fn callee_bare_name(raw: &str) -> Option<String> {
     if ident.is_empty() { None } else { Some(ident) }
 }
 
-/// Walk the AST collecting call sites, tracking the nearest enclosing function.
+/// Split a callee expression into (immediate receiver, method/callee name).
+///
+/// `self.method` → (Some("self"), "method"); `a.b.method` → (Some("b"), "method");
+/// `mod::func` / `func` → (None, "func").
+fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String)> {
+    if let Some(dot) = raw.rfind('.') {
+        let (left, right) = raw.split_at(dot);
+        let callee = leading_ident(&right[1..])?;
+        // Immediate receiver = last segment of the left side.
+        let recv = left.rsplit(['.', ':']).next().and_then(leading_ident);
+        Some((recv, callee))
+    } else {
+        let last = raw.rsplit("::").next().unwrap_or(raw);
+        Some((None, leading_ident(last)?))
+    }
+}
+
+/// Walk the AST collecting call sites, tracking the nearest enclosing function
+/// and class.
 fn walk_calls(
     node: tree_sitter::Node,
     source: &str,
     consts: &crate::indexer::lang_constants::LangConstants,
     enclosing: Option<(String, usize)>,
+    enclosing_class: Option<String>,
     out: &mut Vec<RawCall>,
 ) {
     let mut current = enclosing;
@@ -147,23 +191,39 @@ fn walk_calls(
             node.start_position().row + 1,
         ));
     }
+    let child_class = if consts.class_node_types.contains(&node.kind()) {
+        node.child_by_field_name(consts.class_name_field)
+            .map(|n| source[n.byte_range()].to_string())
+            .or_else(|| enclosing_class.clone())
+    } else {
+        enclosing_class.clone()
+    };
 
     if consts.call_node_types.contains(&node.kind())
         && let Some((enc_name, enc_line)) = &current
         && let Some(fn_node) = node.child_by_field_name(consts.call_function_field)
-        && let Some(callee) = callee_bare_name(&source[fn_node.byte_range()])
+        && let Some((receiver, callee)) = split_receiver_callee(&source[fn_node.byte_range()])
     {
         out.push(RawCall {
             enclosing_name: enc_name.clone(),
             enclosing_line: *enc_line,
+            enclosing_class: child_class.clone(),
             callee,
+            receiver,
             line: node.start_position().row + 1,
         });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_calls(child, source, consts, current.clone(), out);
+        walk_calls(
+            child,
+            source,
+            consts,
+            current.clone(),
+            child_class.clone(),
+            out,
+        );
     }
 }
 
@@ -174,7 +234,7 @@ pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<Ra
     let tree = parse_tree(source, language).ok_or("Failed to parse")?;
 
     let mut out = Vec::new();
-    walk_calls(tree.root_node(), source, &consts, None, &mut out);
+    walk_calls(tree.root_node(), source, &consts, None, None, &mut out);
     Ok(out)
 }
 

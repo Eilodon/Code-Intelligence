@@ -86,6 +86,34 @@ impl ConservativeResolver {
             resolved_path: None,
         }
     }
+
+    /// Tier-2: infer the type a method call's receiver resolves to.
+    ///
+    /// `self`/`this` resolve to the enclosing class; any other receiver resolves
+    /// through the `type_map` (explicit annotations). Returns the bare type name
+    /// — the class in which to look the method up — or `None` when the receiver's
+    /// type is unknown (the call then stays `textual`). A hit is `"inferred"`
+    /// confidence: reliable, but not as certain as a direct binding.
+    pub fn resolve_tier2(
+        &self,
+        receiver: &str,
+        ctx: &FileContext,
+        enclosing_class: Option<&str>,
+    ) -> Option<String> {
+        let ty = match receiver {
+            "self" | "this" => enclosing_class?.to_string(),
+            other => ctx.type_map.get(other)?.clone(),
+        };
+        // Reduce `Foo<T>` / `Foo[int]` / `pkg.Foo` to the bare type name.
+        let bare = ty
+            .rsplit(['.', ':'])
+            .next()
+            .unwrap_or(&ty)
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+        if bare.is_empty() { None } else { Some(bare) }
+    }
 }
 
 impl Default for ConservativeResolver {

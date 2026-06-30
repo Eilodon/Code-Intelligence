@@ -551,6 +551,38 @@ fn ambiguous_json(candidates: &[CandidateRow]) -> String {
 // Frontier computation helper (for session_context)
 // ---------------------------------------------------------------------------
 
+/// Runs `{sql_prefix} (?, ?, ...) AND from_path IS NOT NULL` in chunks of ≤999
+/// to stay within SQLite's SQLITE_LIMIT_VARIABLE_NUMBER, accumulating distinct
+/// `from_path` values into `out`.
+fn query_paths_chunked(
+    conn: &rusqlite::Connection,
+    sql_prefix: &str,
+    params: &[String],
+    out: &mut std::collections::HashSet<String>,
+) {
+    const CHUNK: usize = 999;
+    for chunk in params.chunks(CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{sql_prefix} ({placeholders}) AND from_path IS NOT NULL");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        out.insert(r);
+                    }
+                });
+        }
+    }
+}
+
 fn compute_frontier_entries(
     conn: &rusqlite::Connection,
     explored_files: &[String],
@@ -563,53 +595,23 @@ fn compute_frontier_entries(
     // Set A: files that import any explored file
     let mut set_a: HashSet<String> = HashSet::new();
     if !explored_files.is_empty() {
-        let placeholders: String = explored_files
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT DISTINCT from_path FROM import_edges \
-             WHERE to_path IN ({placeholders}) AND from_path IS NOT NULL"
+        query_paths_chunked(
+            conn,
+            "SELECT DISTINCT from_path FROM import_edges WHERE to_path IN",
+            explored_files,
+            &mut set_a,
         );
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            let _ = stmt
-                .query_map(rusqlite::params_from_iter(explored_files.iter()), |row| {
-                    row.get::<_, String>(0)
-                })
-                .map(|rows| {
-                    for r in rows.flatten() {
-                        set_a.insert(r);
-                    }
-                });
-        }
     }
 
     // Set B: files containing callers of explored symbols
     let mut set_b: HashSet<String> = HashSet::new();
     if !explored_symbols.is_empty() {
-        let placeholders: String = explored_symbols
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT DISTINCT from_path FROM call_edges \
-             WHERE to_symbol IN ({placeholders}) AND from_path IS NOT NULL"
+        query_paths_chunked(
+            conn,
+            "SELECT DISTINCT from_path FROM call_edges WHERE to_symbol IN",
+            explored_symbols,
+            &mut set_b,
         );
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            let _ = stmt
-                .query_map(rusqlite::params_from_iter(explored_symbols.iter()), |row| {
-                    row.get::<_, String>(0)
-                })
-                .map(|rows| {
-                    for r in rows.flatten() {
-                        set_b.insert(r);
-                    }
-                });
-        }
     }
 
     // Union minus already-explored; tag each with reason
@@ -3097,6 +3099,46 @@ mod tests {
             v["suggested_next"]["tool"].as_str(),
             Some("file_overview"),
             "With non-empty frontier, must suggest file_overview, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frontier_chunking_handles_over_999_params() {
+        let dir = std::env::temp_dir().join(format!("ci_frontier_chunk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Seed 1001 import_edges rows: result.rs imports 1001 distinct dep files.
+        // Without chunking, querying all 1001 paths as IN-clause params exceeds SQLite's
+        // 999-variable limit and silently returns empty; with chunking the result is non-empty.
+        {
+            let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+            for i in 0..1001usize {
+                conn.execute(
+                    "INSERT INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["src/result.rs", format!("src/dep_{i}.rs"), format!("dep_{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let explored_files: Vec<String> =
+            (0..1001usize).map(|i| format!("src/dep_{i}.rs")).collect();
+        let mut out = std::collections::HashSet::new();
+        let conn = server.make_read_conn().unwrap();
+        query_paths_chunked(
+            &conn,
+            "SELECT DISTINCT from_path FROM import_edges WHERE to_path IN",
+            &explored_files,
+            &mut out,
+        );
+
+        assert!(
+            out.contains("src/result.rs"),
+            "src/result.rs must appear across 999-var chunk boundary, got: {out:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

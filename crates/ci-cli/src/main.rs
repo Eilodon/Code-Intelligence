@@ -27,7 +27,7 @@ enum Commands {
         #[arg(long)]
         preset: Option<String>,
     },
-    /// One-shot index of the project (stub)
+    /// One-shot index of the project
     Index {
         /// Project root directory
         #[arg(long, default_value = ".")]

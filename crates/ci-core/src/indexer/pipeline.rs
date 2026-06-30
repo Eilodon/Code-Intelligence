@@ -1,9 +1,10 @@
-use crate::types::IndexingPhase;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::indexer::edges::{CallEdge, insert_call_edges_batch, insert_symbols_batch};
+use crate::indexer::edges::{
+    CallEdge, insert_call_edges_batch, insert_import_edges_batch, insert_symbols_batch,
+};
 use crate::indexer::lang_constants::language_for_extension;
 use crate::indexer::parser::{
     extract_calls, extract_file_aliases, extract_symbols, extract_type_map,
@@ -204,22 +205,23 @@ fn index_one_file(
     // Imports → import_edges (to_path resolved later, globally) + import_map.
     let imports = crate::indexer::imports::extract_imports(source, lang);
     let mut import_map: HashMap<String, String> = HashMap::new();
-    {
-        let mut istmt = tx.prepare(
-            "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used) \
-             VALUES (?1, NULL, ?2, ?3)",
-        )?;
-        for imp in &imports {
-            let symbols_used =
-                serde_json::to_string(&imp.imported_names).unwrap_or_else(|_| "[]".to_string());
-            istmt.execute(rusqlite::params![rel, imp.module_name, symbols_used])?;
-            for n in &imp.imported_names {
-                import_map
-                    .entry(n.clone())
-                    .or_insert_with(|| imp.module_name.clone());
-            }
+    let mut import_edges = Vec::with_capacity(imports.len());
+    for imp in &imports {
+        let symbols_used =
+            serde_json::to_string(&imp.imported_names).unwrap_or_else(|_| "[]".to_string());
+        import_edges.push(crate::indexer::edges::ImportEdge {
+            from_path: rel.to_string(),
+            to_path: None, // resolved later, globally — see resolve_import_targets
+            module_name: imp.module_name.clone(),
+            symbols_used,
+        });
+        for n in &imp.imported_names {
+            import_map
+                .entry(n.clone())
+                .or_insert_with(|| imp.module_name.clone());
         }
     }
+    insert_import_edges_batch(tx, &import_edges)?;
 
     // Full resolver context: file symbols + imports + type annotations.
     let ctx = crate::resolver::FileContext {
@@ -670,39 +672,11 @@ pub fn reindex_changed(
     Ok(summary)
 }
 
-pub struct IndexStateMachine {
-    phase: IndexingPhase,
-}
-
-impl Default for IndexStateMachine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IndexStateMachine {
-    pub fn new() -> Self {
-        Self {
-            phase: IndexingPhase::Scanning,
-        }
-    }
-    pub fn current(&self) -> IndexingPhase {
-        self.phase
-    }
-    pub fn advance(&mut self) {
-        self.phase = match self.phase {
-            IndexingPhase::Scanning => IndexingPhase::Parsing,
-            IndexingPhase::Parsing => IndexingPhase::BuildingEdges,
-            IndexingPhase::BuildingEdges => IndexingPhase::Ready,
-            IndexingPhase::Ready => IndexingPhase::Ready,
-        };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::schema::init_db;
+    use crate::types::IndexingPhase;
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
@@ -734,14 +708,6 @@ mod tests {
             "Phase must be Ready after pipeline completes"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_phase_transition() {
-        let mut sm = IndexStateMachine::new();
-        assert_eq!(sm.current(), IndexingPhase::Scanning);
-        sm.advance();
-        assert_eq!(sm.current(), IndexingPhase::Parsing);
     }
 
     #[test]

@@ -134,4 +134,35 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    /// Regression for W3: this batch helper existed but `index_one_file()`
+    /// inserted import edges through its own separate inline statement,
+    /// leaving `insert_import_edges_batch` entirely unused — a half-finished
+    /// refactor. Now wired in; this is its first direct test coverage.
+    #[test]
+    fn test_insert_import_edges_transaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let edges = vec![ImportEdge {
+            from_path: "a.py".to_string(),
+            to_path: None,
+            module_name: "os".to_string(),
+            symbols_used: "[\"path\"]".to_string(),
+        }];
+        insert_import_edges_batch(&tx, &edges).unwrap();
+        tx.commit().unwrap();
+
+        let (from_path, module_name, symbols_used): (String, String, String) = conn
+            .query_row(
+                "SELECT from_path, module_name, symbols_used FROM import_edges",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(from_path, "a.py");
+        assert_eq!(module_name, "os");
+        assert_eq!(symbols_used, "[\"path\"]");
+    }
 }

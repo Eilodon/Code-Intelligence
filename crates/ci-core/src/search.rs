@@ -150,7 +150,9 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 }
 
 fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<SearchOutput> {
-    let fts_query = escape_fts5_query(query);
+    let raw_query = escape_fts5_query(query);
+    // FTS5 global column filter: {docstring} restricts ALL tokens to docstring column only
+    let fts_query = format!("{{docstring}} : {raw_query}");
 
     let mut stmt = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
@@ -512,6 +514,44 @@ mod tests {
             output.results.len() >= 2,
             "Should find symbols with 'database' in docstring, got: {:?}",
             output.results.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_text_does_not_match_name_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Symbol: name contains "authorize", docstring is EMPTY
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "authorize_user", "auth::authorize_user", "function",
+                "auth.py", "python", 1, 10, "", "authorize user"
+            ],
+        ).unwrap();
+
+        // Symbol: name does NOT contain "authorize", docstring DOES
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "check_perms", "auth::check_perms", "function",
+                "auth.py", "python", 12, 20, "Checks if user can authorize the given action.", "check perms"
+            ],
+        ).unwrap();
+
+        let output = search(&conn, "authorize", SearchKind::Text, 10, None).unwrap();
+        let names: Vec<&str> = output.results.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"check_perms"),
+            "check_perms (docstring match) must appear, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"authorize_user"),
+            "authorize_user must NOT appear — its docstring is empty, got: {names:?}"
         );
     }
 

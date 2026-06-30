@@ -14,13 +14,67 @@ use ci_core::types::{EmbedStatus, IndexingPhase};
 // Server state
 // ---------------------------------------------------------------------------
 
+fn utc_now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let (y, mo, d) = days_to_ymd(days);
+    (y, mo, d, h, m, s)
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year { break; }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: &[u64] = if leap {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1u64;
+    for &md in month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
 /// In-memory session tracking — tool call count and the set of symbols/files
 /// touched, for the `session_context` tool. Reset only when the server restarts.
-#[derive(Default)]
 struct SessionLog {
     tool_calls: u64,
     explored_symbols: std::collections::HashSet<String>,
     explored_files: std::collections::HashSet<String>,
+    session_started_at: String,
+}
+
+impl Default for SessionLog {
+    fn default() -> Self {
+        Self {
+            tool_calls: 0,
+            explored_symbols: std::collections::HashSet::new(),
+            explored_files: std::collections::HashSet::new(),
+            session_started_at: utc_now_iso8601(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1110,6 +1164,7 @@ struct FrontierEntry {
 
 #[derive(Serialize, JsonSchema)]
 struct SessionContextOutput {
+    session_started_at: String,
     tool_calls: u64,
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
@@ -1975,12 +2030,13 @@ impl CodeIntelligenceServer {
     fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
             // Release the lock before DB queries — avoid deadlock if db() is also contended.
-            let (tool_calls, explored_symbols, explored_files) = {
+            let (tool_calls, explored_symbols, explored_files, session_started_at) = {
                 let log = self.session_log.lock().unwrap();
                 (
                     log.tool_calls,
                     log.explored_symbols.iter().cloned().collect::<Vec<_>>(),
                     log.explored_files.iter().cloned().collect::<Vec<_>>(),
+                    log.session_started_at.clone(),
                 )
             };
 
@@ -2006,6 +2062,7 @@ impl CodeIntelligenceServer {
             };
 
             serde_json::to_string_pretty(&SessionContextOutput {
+                session_started_at,
                 tool_calls,
                 explored_symbols,
                 unique_files_explored: explored_files.len(),
@@ -3305,6 +3362,42 @@ mod tests {
             "locate should suggest symbol_info for ambiguous name, got: {sn}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_includes_session_started_at() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_ts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let ts = v["session_started_at"].as_str().expect("session_started_at must be a string");
+        // Must be ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
+        assert!(ts.ends_with('Z'), "timestamp must end with Z, got: {ts}");
+        assert!(ts.len() >= 20, "timestamp must be at least 20 chars, got: {ts}");
+        assert!(ts.contains('T'), "timestamp must contain T separator, got: {ts}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_started_at_is_stable_across_calls() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_ts2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let out1: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let out2: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+
+        assert_eq!(
+            out1["session_started_at"],
+            out2["session_started_at"],
+            "session_started_at must not change between calls"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -816,7 +816,6 @@ struct LocateOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct HotspotsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_n: Option<usize>,
@@ -829,9 +828,87 @@ struct HotspotsParams {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct HotspotChurnOutput {
+    commit_count: i64,
+    authors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_changed: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HotspotComplexityOutput {
+    symbol_count: i64,
+    hub_count: i64,
+    avg_caller_count: f64,
+    connected_coreness_count: i64,
+    language: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HotspotSymbolOutput {
+    name: String,
+    kind: String,
+    is_hub: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coreness: Option<i64>,
+    caller_count: i64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HotspotEntryOutput {
+    path: String,
+    language: String,
+    churn: HotspotChurnOutput,
+    complexity: HotspotComplexityOutput,
+    hotspot_score: f64,
+    risk_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_symbols: Option<Vec<HotspotSymbolOutput>>,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct HotspotsOutput {
-    hotspots: Vec<serde_json::Value>,
+    hotspots: Vec<HotspotEntryOutput>,
     count: usize,
+    git_available: bool,
+    since: String,
+    total_files_analyzed: usize,
+    hotspot_method: String,
+    note: String,
+}
+
+impl From<ci_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
+    fn from(h: ci_core::analysis::hotspot::HotspotEntry) -> Self {
+        HotspotEntryOutput {
+            path: h.path,
+            language: h.language,
+            churn: HotspotChurnOutput {
+                commit_count: h.churn.commit_count,
+                authors: h.churn.authors.into_iter().collect(),
+                last_changed: h.churn.last_changed,
+            },
+            complexity: HotspotComplexityOutput {
+                symbol_count: h.complexity.symbol_count,
+                hub_count: h.complexity.hub_count,
+                avg_caller_count: h.complexity.avg_caller_count,
+                connected_coreness_count: h.complexity.connected_coreness_count,
+                language: h.complexity.language,
+            },
+            hotspot_score: h.hotspot_score,
+            risk_level: h.risk_level,
+            top_symbols: h.top_symbols.map(|syms| {
+                syms.into_iter()
+                    .map(|s| HotspotSymbolOutput {
+                        name: s.name,
+                        kind: s.kind,
+                        is_hub: s.is_hub,
+                        coreness: s.coreness,
+                        caller_count: s.caller_count,
+                    })
+                    .collect()
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,10 +1623,37 @@ impl CodeIntelligenceServer {
     )]
     fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> String {
         crate::telemetry::timed_tool("hotspots", || {
-            let _ = (p.top_n, p.since, p.min_churn, p.include_symbols);
+            let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+            let hc = &config.hotspots;
+            let top_n = p.top_n.unwrap_or(hc.default_top_n);
+            let since = p.since.unwrap_or_else(|| hc.default_since.clone());
+            let min_churn = p.min_churn.unwrap_or(hc.default_min_churn as i64);
+
+            let result = {
+                let conn = self.db();
+                ci_core::analysis::hotspot::compute_hotspots(
+                    &self.project_root,
+                    &conn,
+                    hc,
+                    top_n,
+                    &since,
+                    min_churn,
+                    p.include_symbols,
+                )
+            };
+
+            let hotspots: Vec<HotspotEntryOutput> =
+                result.hotspots.into_iter().map(HotspotEntryOutput::from).collect();
+            let count = hotspots.len();
+
             serde_json::to_string_pretty(&HotspotsOutput {
-                hotspots: vec![],
-                count: 0,
+                hotspots,
+                count,
+                git_available: result.git_available,
+                since: result.since,
+                total_files_analyzed: result.total_files_analyzed,
+                hotspot_method: result.hotspot_method,
+                note: result.note,
             })
             .unwrap_or_default()
         })

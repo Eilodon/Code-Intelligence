@@ -215,6 +215,10 @@ fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "repo_overview", "search", "locate", "symbol_info", "source", "callers",
             "callees", "edit_context", "diff_impact", "indexing_status",
         ]),
+        "compound" => Some(&[
+            "repo_overview", "locate", "hotspots", "source", "understand",
+            "edit_context", "diff_impact", "session_context", "indexing_status",
+        ]),
         "full" | "" => None, // None = all tools, no filtering
         _ => None,
     }
@@ -2910,5 +2914,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preset_compound_includes_required_tools() {
+        let required = [
+            "repo_overview", "locate", "hotspots", "source", "understand",
+            "edit_context", "diff_impact", "session_context", "indexing_status",
+        ];
+        let tools = preset_tools("compound");
+        let tools = tools.expect("compound must return Some (not all-tools fallback)");
+        for t in &required {
+            assert!(tools.contains(t), "compound preset missing '{t}', got: {tools:?}");
+        }
+        assert_eq!(tools.len(), 9, "compound preset must have exactly 9 tools, got: {tools:?}");
+    }
+
+    #[test]
+    fn preset_compound_excludes_raw_graph_tools() {
+        let excluded = ["callers", "callees", "path", "search", "symbol_info", "dependencies", "file_overview"];
+        let tools = preset_tools("compound").expect("compound must be Some");
+        for t in &excluded {
+            assert!(!tools.contains(t), "compound must NOT include '{t}', got: {tools:?}");
+        }
     }
 }

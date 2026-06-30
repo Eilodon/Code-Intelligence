@@ -1,0 +1,225 @@
+# Code Intelligence MCP — Navigational Workflow v2.7.2
+
+> 16 tools. 8 stages. Every response carries `suggested_next` — follow it.
+
+---
+
+## Core Principles
+
+**Follow `suggested_next`.** Every tool response embeds the next step. You rarely need to decide — just follow the hint. Override only when you have explicit context the hint cannot account for.
+
+**Never use native grep or file-read** when index tools are available. `locate` replaces search + file_overview + symbol_info in one call. `source` reads one symbol precisely instead of flooding context with an entire file.
+
+**`edit_context` is PRE-edit. `diff_impact` is POST-edit.** Never swap them.
+
+---
+
+## Stage 1 — Orient
+
+**Goal**: Map the terrain before touching anything.
+
+**Tools**: `repo_overview` (always first), `hotspots` (find high-risk files)
+
+```
+repo_overview()          # ALWAYS call first at session start — never skip
+hotspots(top_n=10)       # find files that break most often
+```
+
+**Done when**: You know the languages, entry points, module structure, and highest-churn files. `suggested_next` points to `locate`.
+
+**Signals**:
+- `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor
+- `health_summary.undocumented_hubs > 0` → hubs without docs exist; extra caution when editing
+- `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
+
+---
+
+## Stage 2 — Locate
+
+**Goal**: Find the symbol or file you need.
+
+**Tools**: `locate` (preferred — 3-in-1), `search` (result list only), `file_overview` (when you already have a path)
+
+```
+locate("getUserByEmail")                    # search + file_overview + symbol_info in 1 call
+search("auth handler", kind="hybrid")       # broadest recall when embeddings ready
+file_overview("src/auth/login.ts")          # when you already have a path
+```
+
+**Done when**: You have the symbol's file, line range, `is_hub` status, and `dead_code_confidence`. `suggested_next` points to `source` or `edit_context` (if hub detected).
+
+**Signals**:
+- `top_result.symbol.is_hub == true` → mandatory `edit_context` before any modification
+- `top_result.symbol.dead_code_confidence == "high"` → verify with `callers` before deleting
+- `top_result.symbol.ambiguous == true` → call `symbol_info(name, path=candidate.path)` to disambiguate
+- Empty results with `kind="symbol"` → retry with `kind="hybrid"`
+
+---
+
+## Stage 3 — Inspect
+
+**Goal**: Read the implementation and understand health signals.
+
+**Tools**: `source` (read code body), `symbol_info` (metadata only, no code), `understand` (locate + source + callers in 1 call)
+
+```
+source("getUserByEmail")                            # symbol-precise read
+source("getUserByEmail", include_metadata=true)     # skip prior symbol_info call
+understand("getUserByEmail")                        # locate + source + callers summary in 1 call
+```
+
+**Done when**: You have read the implementation and know `caller_count`, `coreness`, and `dead_code_confidence`. `suggested_next` points to `callers`.
+
+**Signals**:
+- `metadata.is_hub == true` (via `source` with `include_metadata=true`) → mandatory `edit_context`
+- `health.dead_code_confidence == "high"` → likely dead; verify with `callers` before deleting
+- `health.test_files == []` → no tests cover this symbol; extra caution when modifying
+
+---
+
+## Stage 4 — Trace
+
+**Goal**: Understand who uses this symbol, what it calls, and how modules connect.
+
+**Tools**: `callers` (who calls this), `callees` (what this calls), `path` (A→B reachability), `dependencies` (file-level imports)
+
+```
+callers("getUserByEmail")               # direct callers
+callers("getUserByEmail", max_depth=3)  # transitive — depth 3
+callees("processRequest")               # what it calls internally
+path("main", "sendEmail")              # does main reach sendEmail?
+dependencies("src/auth/login.ts")      # file import graph
+```
+
+**Done when**: You understand blast radius. `suggested_next` from `callers` points to `edit_context` (high blast radius or textual edges) or `source` (read top caller).
+
+**Signals**:
+- `any edge_confidence == "textual"` → uncertain edges; verify manually before refactoring
+- `total_direct > 10` → high blast radius; `edit_context` is mandatory
+- `transitive_capped: true` → BFS timed out; true blast radius may be larger than reported
+- `path.terminated_by == "max_hops"` → retry with larger `max_hops` or reverse `from`/`to`
+- `dependencies.imported_by_total > 20` → high fan-in file; check symbol blast radius too
+
+---
+
+## Stage 5 — Pre-Edit
+
+**Goal**: Mandatory blast radius check. Call this before ANY code modification.
+
+**Tools**: `edit_context` (always, no exceptions)
+
+```
+edit_context("getUserByEmail")
+```
+
+**Done when**: You have the confidence-ordered callers list, callees list, `risk_assessment`, and `index_freshness`. `suggested_next` always points to `diff_impact`.
+
+**Signals**:
+- `risk_assessment.level == "critical"` or `"high"` → review ALL callers before proceeding
+- `index_freshness.stale_callers: true` → file changed since last index; results may lag
+- `edges_ready: false` → call graph still building; treat results as lower-confidence
+- `callers[].edge_confidence == "textual"` → may be false positives AND missed real callers
+
+**Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol.
+
+---
+
+## Stage 6 — Edit
+
+**Goal**: Make the code change using native tools.
+
+After `edit_context` confirms you understand the blast radius, use native file editing tools to make your changes. When done, proceed immediately to Stage 7.
+
+**Rules**:
+- Update ALL call sites flagged in `edit_context.callers[]` in the same change
+- Update signatures consistently across callers
+- Do not commit until Stage 7 completes
+
+---
+
+## Stage 7 — Verify
+
+**Goal**: Post-edit blast radius verification before commit or push.
+
+**Tools**: `diff_impact` (always, no exceptions)
+
+```
+diff_impact(staged=true)              # verify staged changes via git
+diff_impact(diff="<raw diff text>")   # verify without git
+diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
+```
+
+**Done when**: `aggregate_risk == "low"` and `unindexed_files == []`. Safe to commit.
+
+**Signals**:
+- `aggregate_risk == "critical"` or `"high"` → call `callers` on `affected_symbols[0]` to verify manually
+- `aggregate_risk == "unknown"` → unindexed files present; wait for index to reach `ready`
+- `unindexed_files non-empty` → index incomplete; DO NOT treat diff as safe to push
+- `suggested_reviewers` present → notify these owners before merging
+
+**Rule: Never commit or push** without calling `diff_impact` first.
+
+---
+
+## Stage 8 — Recover
+
+**Goal**: Reorient when lost, session is long, or index state is uncertain.
+
+**Tools**: `session_context` (after 10+ calls without convergence), `indexing_status` (when index state unclear)
+
+```
+session_context()                           # see what you've explored, where frontier is
+indexing_status()                           # check phase, file counts, embedding state
+indexing_status(retry_embeddings=true)      # recover failed embeddings
+```
+
+**When to use**:
+- After 10+ tool calls without finding what you need → `session_context` shows frontier files
+- `suggested_next.tool == "indexing_status"` appears repeatedly → index not ready yet
+- `session_started_at` changed from your saved T₀ → server restarted; begin again at Stage 1
+
+**Signals**:
+- `frontier non-empty` → explore `frontier[0].path` with `file_overview`
+- `frontier empty` → call `repo_overview` to refresh the map
+- `embeddings_status == "failed"` → call `indexing_status(retry_embeddings=true)`
+
+---
+
+## Tool Quick Reference
+
+| Stage | Primary Tools | Replaces Native |
+|-------|--------------|-----------------|
+| 1 Orient | `repo_overview`, `hotspots` | Directory scanning, README reading |
+| 2 Locate | `locate`, `search`, `file_overview` | `grep`, file search |
+| 3 Inspect | `source`, `symbol_info`, `understand` | `cat` / full file read |
+| 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
+| 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
+| 6 Edit | native editor tools | — |
+| 7 Verify | `diff_impact` | *(no native equivalent)* |
+| 8 Recover | `session_context`, `indexing_status` | *(no native equivalent)* |
+
+---
+
+## Mandatory Rules (non-negotiable)
+
+1. **`repo_overview` first** — always at session start, never skip
+2. **`edit_context` before edit** — mandatory, no exceptions, never skip
+3. **`diff_impact` after edit** — mandatory before any commit or push
+4. **Never use native Read/grep on project files** when index tools are available
+5. **Follow `suggested_next`** — it is computed per-response with full context; override only with explicit reason
+6. **Hub symbols need extra caution** — `is_hub: true` + low `caller_count` = bridge hub; editing breaks cross-module integration
+7. **`textual` edges are uncertain** — do not treat absence of textual callers as safe; may be false negatives
+
+---
+
+## Preset Reference
+
+| Preset | Registered Tools | Use when |
+|--------|-----------------|----------|
+| `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `indexing_status` | Exploration only, no edits |
+| `trace` | `repo_overview`, `locate`, `callers`, `callees`, `path`, `session_context` | Call graph traversal |
+| `edit` | `repo_overview`, `locate`, `source`, `edit_context`, `diff_impact`, `indexing_status` | Code modification workflow |
+| `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status` | Full workflow, no raw graph traversal |
+| `full` | All 16 tools | Default; use when workflow spans multiple stages |
+
+`--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.

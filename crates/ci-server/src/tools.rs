@@ -531,9 +531,19 @@ struct SymbolInfoOutput {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct CallerCountByConfidence {
+    resolved: i64,
+    inferred: i64,
+    textual: i64,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct HealthOutput {
     dead_code_confidence: String,
     dead_code_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_count_by_confidence: Option<CallerCountByConfidence>,
+    test_files: Vec<String>,
 }
 
 /// Best-effort "is this symbol private/internal" signal from name + signature
@@ -557,9 +567,11 @@ fn scope_clear_for_language(language: &str) -> bool {
 }
 
 fn build_health(
+    conn: &rusqlite::Connection,
     coverage: &ci_core::analysis::coverage::CoverageData,
     project_root: &std::path::Path,
     c: &CandidateRow,
+    edges_ready: bool,
 ) -> HealthOutput {
     let abs_path = project_root.join(&c.path).to_string_lossy().to_string();
     let is_private = is_private_symbol(&c.language, &c.name, &c.signature);
@@ -574,10 +586,58 @@ fn build_health(
         scope_clear,
         coverage,
     );
+
+    let caller_count_by_confidence = if edges_ready {
+        let mut resolved = 0i64;
+        let mut inferred = 0i64;
+        let mut textual = 0i64;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT edge_confidence, COUNT(*) FROM call_edges \
+             WHERE to_symbol = ?1 GROUP BY edge_confidence",
+        ) {
+            let _ = stmt.query_map([&c.qualified_name], |row| {
+                let conf: String = row.get(0)?;
+                let cnt: i64 = row.get(1)?;
+                match conf.as_str() {
+                    "resolved" => resolved += cnt,
+                    "inferred" => inferred += cnt,
+                    _ => textual += cnt,
+                }
+                Ok(())
+            }).map(|rows| rows.for_each(|_| {}));
+        }
+        Some(CallerCountByConfidence { resolved, inferred, textual })
+    } else {
+        None
+    };
+
+    let mut test_files = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT from_path FROM call_edges WHERE to_symbol = ?1",
+    ) {
+        let _ = stmt.query_map([&c.qualified_name], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                for path in rows.flatten() {
+                    if is_test_file(&path) && !test_files.contains(&path) {
+                        test_files.push(path);
+                    }
+                }
+            });
+    }
+    test_files.sort();
+
     HealthOutput {
         dead_code_confidence: confidence.to_string(),
         dead_code_source: source.to_string(),
+        caller_count_by_confidence,
+        test_files,
     }
+}
+
+fn is_test_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("test") || lower.contains("spec") || lower.starts_with("tests/")
+        || lower.starts_with("test/") || lower.contains("/tests/") || lower.contains("/test/")
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,7 +1273,8 @@ impl CodeIntelligenceServer {
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
-                    out.health = Some(build_health(&self.coverage, &self.project_root, &c));
+                    let conn = self.db();
+                    out.health = Some(build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready()));
                     serde_json::to_string_pretty(&out).unwrap_or_default()
                 }
             }

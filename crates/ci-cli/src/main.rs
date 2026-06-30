@@ -79,8 +79,11 @@ async fn main() -> Result<()> {
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db = db_path.unwrap_or_else(|| ci_server::default_db_path(&root));
-            // CLI flag takes precedence; fall back to config.json value (default: "full")
-            let config = ci_core::config::load_config(&root).unwrap_or_default();
+            // CLI flag takes precedence; fall back to config.json value (default: "full").
+            // Propagate (not swallow) load errors here — an invalid config.json (bad
+            // JSON, or an unrecognized preset) should fail server startup loudly
+            // rather than silently degrade to defaults.
+            let config = ci_core::config::load_config(&root)?;
             let effective_preset = preset.unwrap_or_else(|| config.preset.clone());
             tracing::info!(
                 "Starting MCP server for {} (preset={})",

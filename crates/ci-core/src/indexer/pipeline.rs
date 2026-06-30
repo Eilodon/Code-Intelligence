@@ -44,7 +44,7 @@ type CallSiteRow = (String, String, String, Option<i64>, String, Option<String>)
 /// Recursively collect tier-0 source files under `root`, skipping built-in
 /// ignored directories, dot-prefixed directories, and any user-configured
 /// `ignore` patterns. Deterministic order is imposed by the caller.
-fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) {
+pub fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(_) => return,
@@ -75,11 +75,21 @@ fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) 
     }
 }
 
+/// Portable FNV-1a 64-bit hash. `DefaultHasher` is explicitly *not* stable
+/// across Rust versions/platforms per the std docs — using it for the
+/// persisted `file_index.hash` column meant a toolchain upgrade could
+/// invalidate every cached hash and force a full re-parse. FNV-1a has a
+/// fixed, documented algorithm so the same content always hashes the same
+/// way regardless of toolchain.
 fn hash_content(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET_BASIS;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("{h:016x}")
 }
 
 fn mtime_secs(path: &Path) -> f64 {
@@ -777,6 +787,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for B4: known FNV-1a 64-bit test vectors (from the FNV
+    /// reference test suite), independent of this codebase's own algorithm —
+    /// confirms `hash_content` is a real, portable FNV-1a and not just
+    /// internally self-consistent.
+    #[test]
+    fn test_hash_content_matches_fnv1a_64_test_vectors() {
+        assert_eq!(hash_content(""), "cbf29ce484222325");
+        assert_eq!(hash_content("a"), "af63dc4c8601ec8c");
+        assert_eq!(hash_content("foobar"), "85944171f73967e8");
+    }
+
+    #[test]
+    fn test_hash_content_deterministic_across_calls() {
+        let s = "def hello():\n    pass\n";
+        assert_eq!(hash_content(s), hash_content(s));
+        assert_ne!(hash_content(s), hash_content("different content"));
     }
 
     #[test]

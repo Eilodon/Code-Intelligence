@@ -25,6 +25,11 @@ fn utc_now_iso8601() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+fn epoch_to_iso8601(secs: f64) -> String {
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs.max(0.0) as u64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
 fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let s = secs % 60;
     let m = (secs / 60) % 60;
@@ -753,6 +758,9 @@ struct FileOverviewSymbol {
     kind: String,
     line_start: i64,
     line_end: i64,
+    caller_count: i64,
+    is_hub: bool,
+    signature: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -772,7 +780,8 @@ fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewO
     let symbols: Vec<FileOverviewSymbol> = {
         let mut stmt = conn
             .prepare(
-                "SELECT name, qualified_name, kind, line_start, line_end
+                "SELECT name, qualified_name, kind, line_start, line_end, \
+                 COALESCE(caller_count, 0), is_hub, signature
                  FROM symbols WHERE path = ?1 ORDER BY line_start",
             )
             .unwrap();
@@ -783,6 +792,9 @@ fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewO
                 kind: row.get(2)?,
                 line_start: row.get(3)?,
                 line_end: row.get(4)?,
+                caller_count: row.get(5)?,
+                is_hub: row.get::<_, i64>(6)? != 0,
+                signature: row.get(7)?,
             })
         })
         .unwrap()
@@ -973,10 +985,22 @@ struct SourceOutput {
     line_end: i64,
     source: String,
     language: String,
+    /// Rough token count estimate (chars/4) — a cheap heuristic to help
+    /// callers budget context before pulling in a large symbol's source.
+    token_estimate: i64,
+    /// "disk" when the file was read live from `project_root`, or
+    /// "unavailable" when the file couldn't be read (deleted/moved/permission).
+    data_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<SourceMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
+}
+
+/// Rough token estimate from a chars/4 heuristic — cheap and good enough for
+/// context-budgeting hints; not a real tokenizer.
+fn estimate_tokens(s: &str) -> i64 {
+    (s.chars().count() as i64 / 4).max(if s.is_empty() { 0 } else { 1 })
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,13 +1219,20 @@ struct ImportEntry {
     from_path: String,
     to_path: String,
     module_name: String,
+    symbols_used: Vec<String>,
+}
+
+fn parse_symbols_used(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 #[derive(Serialize, JsonSchema)]
 struct DependenciesOutput {
     path: String,
     imports: Vec<ImportEntry>,
+    imports_truncated: bool,
     imported_by: Vec<ImportEntry>,
+    imported_by_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1306,7 +1337,13 @@ struct SessionContextOutput {
     tool_calls: u64,
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
+    /// True total before any `config.session.max_fetched` truncation of
+    /// `explored_symbols`/`explored_files` below.
     unique_files_explored: usize,
+    /// True when `explored_symbols`/`explored_files` were capped at
+    /// `config.session.max_fetched` — a long session can otherwise dump an
+    /// unbounded list into every `session_context` call.
+    truncated: bool,
     frontier: Vec<FrontierEntry>,
     frontier_degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1377,10 +1414,16 @@ struct IndexingStatusParams {
 struct IndexingStatusOutput {
     indexing_phase: String,
     files_indexed: i64,
+    /// Tier-0 source files currently discoverable on disk (respects
+    /// `config.ignore`) — compare against `files_indexed` to see whether the
+    /// index is behind what's actually in the project tree.
+    files_total: i64,
     symbols_indexed: i64,
     edges_indexed: i64,
     embeddings_status: String,
     edges_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_updated: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1849,14 +1892,14 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             self.track_file(&c.path);
 
             let full_path = self.project_root.join(&c.path);
-            let source = match std::fs::read_to_string(&full_path) {
+            let (source, data_source) = match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let start = (c.line_start as usize).saturating_sub(1);
                     let end = (c.line_end as usize).min(lines.len());
-                    lines[start..end].join("\n")
+                    (lines[start..end].join("\n"), "disk")
                 }
-                Err(_) => "(source file not readable)".into(),
+                Err(_) => ("(source file not readable)".into(), "unavailable"),
             };
             let sanitized = sanitize_source_output(&source);
 
@@ -1877,6 +1920,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 )
             };
 
+            let token_estimate = estimate_tokens(&sanitized);
             serde_json::to_string_pretty(&SourceOutput {
                 symbol: p.symbol,
                 path: c.path,
@@ -1884,6 +1928,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 line_end: c.line_end,
                 source: sanitized,
                 language: c.language,
+                token_estimate,
+                data_source: data_source.to_string(),
                 metadata,
                 suggested_next: self.filter_sn(sn),
             })
@@ -2079,45 +2125,64 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let dep_config = ci_core::config::load_config(&self.project_root)
+                .map(|c| c.dependencies)
+                .unwrap_or_default();
+
             let mut stmt_imports = conn
                 .prepare(
-                    "SELECT from_path, COALESCE(to_path, ''), module_name
-                     FROM import_edges WHERE from_path = ?1",
+                    "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
+                     FROM import_edges WHERE from_path = ?1 LIMIT ?2",
                 )
                 .unwrap();
 
             let imports: Vec<ImportEntry> = stmt_imports
-                .query_map(rusqlite::params![p.path], |row| {
-                    Ok(ImportEntry {
-                        from_path: row.get(0)?,
-                        to_path: row.get(1)?,
-                        module_name: row.get(2)?,
-                    })
-                })
+                .query_map(
+                    rusqlite::params![p.path, dep_config.max_imports as i64 + 1],
+                    |row| {
+                        Ok(ImportEntry {
+                            from_path: row.get(0)?,
+                            to_path: row.get(1)?,
+                            module_name: row.get(2)?,
+                            symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
+                        })
+                    },
+                )
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect();
+            let imports_truncated = imports.len() > dep_config.max_imports;
+            let imports = imports.into_iter().take(dep_config.max_imports).collect();
 
             // Drop the first statement before preparing the second on the same conn
             drop(stmt_imports);
             let mut stmt_imported_by = conn
                 .prepare(
-                    "SELECT from_path, COALESCE(to_path, ''), module_name
-                     FROM import_edges WHERE to_path = ?1",
+                    "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
+                     FROM import_edges WHERE to_path = ?1 LIMIT ?2",
                 )
                 .unwrap();
 
             let imported_by: Vec<ImportEntry> = stmt_imported_by
-                .query_map(rusqlite::params![p.path], |row| {
-                    Ok(ImportEntry {
-                        from_path: row.get(0)?,
-                        to_path: row.get(1)?,
-                        module_name: row.get(2)?,
-                    })
-                })
+                .query_map(
+                    rusqlite::params![p.path, dep_config.max_imported_by as i64 + 1],
+                    |row| {
+                        Ok(ImportEntry {
+                            from_path: row.get(0)?,
+                            to_path: row.get(1)?,
+                            module_name: row.get(2)?,
+                            symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
+                        })
+                    },
+                )
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect();
+            let imported_by_truncated = imported_by.len() > dep_config.max_imported_by;
+            let imported_by = imported_by
+                .into_iter()
+                .take(dep_config.max_imported_by)
+                .collect::<Vec<_>>();
 
             let sn = if imported_by.len() > 20 {
                 suggested("callers", "High fan-in — check symbol blast radius")
@@ -2127,7 +2192,9 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             serde_json::to_string_pretty(&DependenciesOutput {
                 path: p.path,
                 imports,
+                imports_truncated,
                 imported_by,
+                imported_by_truncated,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -2378,11 +2445,21 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 ))
             };
 
+            let max_fetched = ci_core::config::load_config(&self.project_root)
+                .map(|c| c.session.max_fetched)
+                .unwrap_or_default();
+            let unique_files_explored = explored_files.len();
+            let truncated =
+                explored_symbols.len() > max_fetched || explored_files.len() > max_fetched;
+            let explored_symbols = explored_symbols.into_iter().take(max_fetched).collect();
+            let explored_files = explored_files.into_iter().take(max_fetched).collect();
+
             serde_json::to_string_pretty(&SessionContextOutput {
                 session_started_at,
                 tool_calls,
                 explored_symbols,
-                unique_files_explored: explored_files.len(),
+                unique_files_explored,
+                truncated,
                 explored_files,
                 frontier,
                 frontier_degraded,
@@ -2613,10 +2690,25 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let edges: i64 = conn
                 .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap_or(0);
+            let last_updated: Option<f64> = conn
+                .query_row("SELECT MAX(last_indexed) FROM file_index", [], |r| r.get(0))
+                .ok()
+                .flatten();
 
             if p.retry_embeddings {
                 self.retry_embeddings_if_failed();
             }
+
+            let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+            let files_total: i64 = {
+                let mut discovered = Vec::new();
+                ci_core::indexer::pipeline::collect_source_files(
+                    &self.project_root,
+                    &config.ignore,
+                    &mut discovered,
+                );
+                discovered.len() as i64
+            };
 
             let phase = self.phase_str();
             let sn = if phase == "ready" {
@@ -2630,10 +2722,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             serde_json::to_string_pretty(&IndexingStatusOutput {
                 indexing_phase: phase,
                 files_indexed: files,
+                files_total,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
+                last_updated: last_updated.map(epoch_to_iso8601),
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -2925,6 +3019,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 let start = (info.line_start as usize).saturating_sub(1);
                 let end = (info.line_end as usize).min(lines.len());
                 let source = sanitize_source_output(&lines[start..end].join("\n"));
+                let token_estimate = estimate_tokens(&source);
                 Some(SourceOutput {
                     symbol: info.name.clone(),
                     path: info.path.clone(),
@@ -2932,6 +3027,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     line_end: info.line_end,
                     source,
                     language: language.clone(),
+                    token_estimate,
+                    data_source: "disk".to_string(),
                     metadata: None,
                     suggested_next: None,
                 })
@@ -3721,6 +3818,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for Task 14 (schema drift): `file_overview` used to omit
+    /// `caller_count`/`is_hub`/`signature` per symbol entirely.
+    #[test]
+    fn file_overview_includes_caller_count_is_hub_and_signature() {
+        let dir = std::env::temp_dir().join(format!("ci_fileov_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::hub_fn', 'hub_fn', 'function', 'python', 'a.py', 1, 2, 'def hub_fn():', '', 'hub fn', 7, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.file_overview(Parameters(FileOverviewParams {
+            path: "a.py".into(),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["symbols"][0]["caller_count"], 7);
+        assert_eq!(v["symbols"][0]["is_hub"], true);
+        assert_eq!(v["symbols"][0]["signature"], "def hub_fn():");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 14 (schema drift): `source` used to omit
+    /// `token_estimate`/`data_source` entirely.
+    #[test]
+    fn source_includes_token_estimate_and_data_source() {
+        let dir = std::env::temp_dir().join(format!("ci_source_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n").unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.source(Parameters(SourceParams {
+            symbol: "foo".into(),
+            path: None,
+            include_metadata: false,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["data_source"], "disk");
+        assert!(
+            v["token_estimate"].as_i64().unwrap() > 0,
+            "token_estimate should be positive for non-empty source, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 14 (schema drift): `dependencies` used to drop
+    /// `symbols_used` even though `import_edges.symbols_used` already existed.
+    #[test]
+    fn dependencies_includes_symbols_used() {
+        let dir = std::env::temp_dir().join(format!("ci_deps_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used) \
+                 VALUES ('a.py', 'b.py', 'b', '[\"helper\", \"util\"]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.dependencies(Parameters(DependenciesParams {
+            path: "a.py".into(),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["imports"][0]["symbols_used"],
+            serde_json::json!(["helper", "util"])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 15: `dependencies` had no config knob bounding
+    /// `imports`/`imported_by` size — a hub file's fan-in list was unbounded.
+    #[test]
+    fn dependencies_truncates_to_max_imports_config() {
+        let dir = std::env::temp_dir().join(format!("ci_deps_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"dependencies": {"max_imports": 1, "max_imported_by": 200}}"#,
+        )
+        .unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.py', 'b.py', 'b')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.py', 'c.py', 'c')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.dependencies(Parameters(DependenciesParams {
+            path: "a.py".into(),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["imports"].as_array().unwrap().len(), 1);
+        assert_eq!(v["imports_truncated"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 14 (schema drift): `indexing_status` used to omit
+    /// `files_total`/`last_updated` entirely.
+    #[test]
+    fn indexing_status_includes_files_total_and_last_updated() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        std::fs::write(dir.join("b.py"), "y = 2\n").unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            // Only one of the two files on disk has been indexed so far —
+            // files_total should still report both.
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+                 VALUES ('a.py', 'h1', 'python', 0, 1700000000.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.indexing_status(Parameters(IndexingStatusParams {
+            retry_embeddings: false,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["files_indexed"], 1);
+        assert_eq!(v["files_total"], 2, "both a.py and b.py exist on disk");
+        assert_eq!(v["last_updated"], "2023-11-14T22:13:20Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test: `retry_embeddings` used to be a no-op (logged "not yet
     /// implemented" and did nothing). It must now reclaim a `Failed` status and
     /// re-run `bootstrap_embeddings` in the background, while leaving any other
@@ -4009,6 +4279,37 @@ mod tests {
             sn["tool"], "symbol_info",
             "locate should suggest symbol_info for ambiguous name, got: {sn}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 15: `session_context` had no config knob bounding
+    /// `explored_symbols`/`explored_files` — a long session dumped an
+    /// unbounded list into every call.
+    #[test]
+    fn session_context_truncates_explored_to_max_fetched_config() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"session": {"max_fetched": 1}}"#,
+        )
+        .unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        server.track_file("a.py");
+        server.track_file("b.py");
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["explored_files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["unique_files_explored"], 2,
+            "unique_files_explored must reflect the true total, not the truncated list"
+        );
+        assert_eq!(v["truncated"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

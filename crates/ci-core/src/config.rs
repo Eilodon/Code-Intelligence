@@ -15,6 +15,8 @@ pub struct Config {
     pub callers: DepthConfig,
     pub callees: DepthConfig,
     pub hotspots: HotspotsConfig,
+    pub dependencies: DependenciesConfig,
+    pub session: SessionConfig,
 }
 
 impl Default for Config {
@@ -46,6 +48,8 @@ impl Default for Config {
             callers: DepthConfig::default(),
             callees: DepthConfig::default(),
             hotspots: HotspotsConfig::default(),
+            dependencies: DependenciesConfig::default(),
+            session: SessionConfig::default(),
         }
     }
 }
@@ -168,6 +172,46 @@ impl Default for HotspotsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DependenciesConfig {
+    /// Cap on `imports` entries returned by the `dependencies` tool — a
+    /// generous default since per-file import counts are normally small.
+    pub max_imports: usize,
+    /// Cap on `imported_by` entries — fan-in can be large for hub files, so
+    /// this is the one more likely to actually bite.
+    pub max_imported_by: usize,
+}
+
+impl Default for DependenciesConfig {
+    fn default() -> Self {
+        Self {
+            max_imports: 200,
+            max_imported_by: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Cap on `explored_symbols`/`explored_files` returned by
+    /// `session_context` — without this, a very long session dumps an
+    /// unbounded list into every `session_context` call.
+    pub max_fetched: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { max_fetched: 200 }
+    }
+}
+
+/// Preset names recognized by the MCP tool router (`preset_tools` in
+/// ci-server). Kept here so `load_config` can validate `Config.preset`
+/// without ci-core depending on ci-server.
+pub const VALID_PRESETS: &[&str] = &["full", "orient", "trace", "edit", "compound"];
+
 pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
     for candidate in [
         project_root.join("config.json"),
@@ -175,7 +219,16 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
     ] {
         if candidate.exists() {
             let text = std::fs::read_to_string(&candidate)?;
-            return Ok(serde_json::from_str(&text)?);
+            let config: Config = serde_json::from_str(&text)?;
+            if !config.preset.is_empty() && !VALID_PRESETS.contains(&config.preset.as_str()) {
+                anyhow::bail!(
+                    "Unknown preset {:?} in {}. Valid presets: {}",
+                    config.preset,
+                    candidate.display(),
+                    VALID_PRESETS.join(", ")
+                );
+            }
+            return Ok(config);
         }
     }
     Ok(Config::default())
@@ -208,5 +261,66 @@ mod tests {
             "config.json preset must be loaded, got: {}",
             config.preset
         );
+    }
+
+    /// Regression for Task 15: an unrecognized preset in config.json used to
+    /// be silently accepted (no validation existed at all) and would only
+    /// surface much later as "no tools filtered" behavior in ci-server's
+    /// `preset_tools`, with no indication the value was a typo.
+    #[test]
+    fn config_load_rejects_unknown_preset() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_badpreset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"preset": "yolo"}"#).unwrap();
+
+        let result = crate::config::load_config(&tmp);
+        assert!(
+            result.is_err(),
+            "unknown preset should fail to load, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_accepts_every_valid_preset() {
+        for preset in VALID_PRESETS {
+            let tmp = std::env::temp_dir().join(format!(
+                "ci_cfg_validpreset_{preset}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(
+                tmp.join("config.json"),
+                format!(r#"{{"preset": "{preset}"}}"#),
+            )
+            .unwrap();
+
+            let result = crate::config::load_config(&tmp);
+            assert!(
+                result.is_ok(),
+                "preset {preset:?} should be valid: {result:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    #[test]
+    fn config_load_accepts_empty_preset() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_emptypreset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"preset": ""}"#).unwrap();
+
+        let result = crate::config::load_config(&tmp);
+        assert!(
+            result.is_ok(),
+            "empty preset means 'full', should be valid: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

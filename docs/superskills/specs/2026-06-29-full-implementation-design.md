@@ -243,10 +243,6 @@ class HubThresholdConfig(BaseModel):
     min_callers_bridge: int = 2
     coreness_pct: float = 75.0
 
-class CallGraphConfig(BaseModel):
-    resolver: str = "conservative"
-    confidence_tracking: bool = True
-
 class SemanticSearchConfig(BaseModel):
     enabled: bool = False
     model: str = "BAAI/bge-base-en-v1.5"
@@ -283,7 +279,6 @@ class Config(BaseModel):
                          "*.min.js", "dist", "build", ".venv"]
     entry_points: list[str] = []
     hub_threshold: HubThresholdConfig = Field(default_factory=HubThresholdConfig)
-    call_graph: CallGraphConfig = Field(default_factory=CallGraphConfig)
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
     search: SearchConfig = Field(default_factory=SearchConfig)
     path: PathConfig = Field(default_factory=PathConfig)

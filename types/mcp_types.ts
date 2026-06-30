@@ -470,10 +470,6 @@ export interface ConfigJson {
     min_callers_bridge: number;
     coreness_pct: number;
   };
-  call_graph: {
-    resolver: string;
-    confidence_tracking: boolean;
-  };
   semantic_search: {
     enabled: boolean;
     model: string;

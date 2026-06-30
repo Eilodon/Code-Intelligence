@@ -884,7 +884,6 @@ Config :: {
   ignore          :: List<string> = ["node_modules", ".git", "__pycache__", "*.min.js", "dist", "build", ".venv"]
   entry_points    :: List<string> = []
   hub_threshold   :: Ref<HubThresholdConfig>
-  call_graph      :: Ref<CallGraphConfig>
   semantic_search :: Ref<SemanticSearchConfig>
   search          :: Ref<SearchConfig>
   path            :: Ref<PathConfig>
@@ -902,15 +901,6 @@ HubThresholdConfig :: {
   min_callers         :: int = 5           // = HUB_MIN_CALLERS
   min_callers_bridge  :: int = 2           // = HUB_MIN_CALLERS_BRIDGE [F12]
   coreness_pct        :: float = 75.0      // = HUB_CORENESS_PCT
-}
-```
-
-### CallGraphConfig
-
-```
-CallGraphConfig :: {
-  resolver              :: string = "conservative"
-  confidence_tracking   :: bool = true
 }
 ```
 

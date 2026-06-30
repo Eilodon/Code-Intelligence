@@ -23,6 +23,9 @@ enum Commands {
         /// Database file path
         #[arg(long)]
         db_path: Option<PathBuf>,
+        /// Tool preset: full (all 16 tools), orient, trace, edit
+        #[arg(long, default_value = "full")]
+        preset: String,
     },
     /// One-shot index of the project (stub)
     Index {
@@ -72,11 +75,12 @@ async fn main() -> Result<()> {
         Commands::Serve {
             project_root,
             db_path,
+            preset,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db = db_path.unwrap_or_else(|| ci_server::default_db_path(&root));
-            tracing::info!("Starting MCP server for {}", root.display());
-            ci_server::serve_stdio(root, db).await?;
+            tracing::info!("Starting MCP server for {} (preset={})", root.display(), preset);
+            ci_server::serve_stdio_with_preset(root, db, preset).await?;
         }
         Commands::Index { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;

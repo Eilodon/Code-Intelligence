@@ -9,7 +9,6 @@ pub struct Config {
     pub ignore: Vec<String>,
     pub entry_points: Vec<String>,
     pub hub_threshold: HubThresholdConfig,
-    pub call_graph: CallGraphConfig,
     pub semantic_search: SemanticSearchConfig,
     pub search: SearchConfig,
     pub path: PathConfig,
@@ -41,7 +40,6 @@ impl Default for Config {
             ],
             entry_points: Vec::new(),
             hub_threshold: HubThresholdConfig::default(),
-            call_graph: CallGraphConfig::default(),
             semantic_search: SemanticSearchConfig::default(),
             search: SearchConfig::default(),
             path: PathConfig::default(),
@@ -68,22 +66,6 @@ impl Default for HubThresholdConfig {
             min_callers: 5,
             min_callers_bridge: 2,
             coreness_pct: 75.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct CallGraphConfig {
-    pub resolver: String,
-    pub confidence_tracking: bool,
-}
-
-impl Default for CallGraphConfig {
-    fn default() -> Self {
-        Self {
-            resolver: "conservative".into(),
-            confidence_tracking: true,
         }
     }
 }

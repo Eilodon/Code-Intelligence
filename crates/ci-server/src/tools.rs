@@ -40,10 +40,15 @@ pub struct CodeIntelligenceServer {
     /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
     coverage: Arc<ci_core::analysis::coverage::CoverageData>,
     session_log: Arc<Mutex<SessionLog>>,
+    preset: String,
 }
 
 impl CodeIntelligenceServer {
     pub fn new(project_root: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_with_preset(project_root, db_path, "full".into())
+    }
+
+    pub fn new_with_preset(project_root: PathBuf, db_path: PathBuf, preset: String) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -59,6 +64,7 @@ impl CodeIntelligenceServer {
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             coverage: Arc::new(coverage),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
+            preset,
         })
     }
 
@@ -104,6 +110,10 @@ impl CodeIntelligenceServer {
     /// The loaded embedder, if semantic search is ready.
     fn embedder(&self) -> Option<Arc<Embedder>> {
         self.embedder.read().unwrap().clone()
+    }
+
+    fn filter_sn(&self, sn: Option<SuggestedNext>) -> Option<SuggestedNext> {
+        filter_suggested_next(sn, &self.preset)
     }
 
     fn embed_status_str(&self) -> String {
@@ -170,6 +180,58 @@ struct ErrorDetail {
     code: String,
     message: String,
     recoverable: bool,
+}
+
+#[derive(Serialize, JsonSchema, Clone)]
+struct SuggestedNext {
+    tool: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<serde_json::Value>,
+}
+
+fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
+    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: None })
+}
+
+fn suggested_with_args(tool: &str, reason: &str, args: serde_json::Value) -> Option<SuggestedNext> {
+    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: Some(args) })
+}
+
+// ---------------------------------------------------------------------------
+// Tool Presets — selective tool set definitions
+// ---------------------------------------------------------------------------
+
+fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
+    match preset {
+        "orient" => Some(&[
+            "repo_overview", "locate", "dependencies", "hotspots", "indexing_status",
+        ]),
+        "trace" => Some(&[
+            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
+            "callees", "path", "dependencies", "indexing_status",
+        ]),
+        "edit" => Some(&[
+            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
+            "callees", "edit_context", "diff_impact", "indexing_status",
+        ]),
+        "full" | "" => None, // None = all tools, no filtering
+        _ => None,
+    }
+}
+
+fn is_tool_available(preset: &str, tool: &str) -> bool {
+    match preset_tools(preset) {
+        None => true,
+        Some(tools) => tools.contains(&tool),
+    }
+}
+
+fn filter_suggested_next(sn: Option<SuggestedNext>, preset: &str) -> Option<SuggestedNext> {
+    match &sn {
+        Some(s) if !is_tool_available(preset, &s.tool) => None,
+        _ => sn,
+    }
 }
 
 fn error_json(code: &str, message: &str, recoverable: bool) -> String {
@@ -260,6 +322,7 @@ impl CandidateRow {
             caller_count: self.caller_count,
             is_hub: self.is_hub,
             health: None,
+            suggested_next: None,
         }
     }
 
@@ -383,6 +446,8 @@ struct RepoOverviewOutput {
     total_files: i64,
     truncated: bool,
     workflow_guide: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +494,8 @@ struct SearchOutput {
     degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +524,8 @@ struct FileOverviewOutput {
     language: Option<String>,
     symbols: Vec<FileOverviewSymbol>,
     symbol_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 /// Shared by the `file_overview` tool and `locate` (when the top result is a
@@ -497,6 +566,7 @@ fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewO
         language,
         symbols,
         symbol_count,
+        suggested_next: None,
     }
 }
 
@@ -528,12 +598,24 @@ struct SymbolInfoOutput {
     is_hub: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct CallerCountByConfidence {
+    resolved: i64,
+    inferred: i64,
+    textual: i64,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct HealthOutput {
     dead_code_confidence: String,
     dead_code_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_count_by_confidence: Option<CallerCountByConfidence>,
+    test_files: Vec<String>,
 }
 
 /// Best-effort "is this symbol private/internal" signal from name + signature
@@ -557,9 +639,11 @@ fn scope_clear_for_language(language: &str) -> bool {
 }
 
 fn build_health(
+    conn: &rusqlite::Connection,
     coverage: &ci_core::analysis::coverage::CoverageData,
     project_root: &std::path::Path,
     c: &CandidateRow,
+    edges_ready: bool,
 ) -> HealthOutput {
     let abs_path = project_root.join(&c.path).to_string_lossy().to_string();
     let is_private = is_private_symbol(&c.language, &c.name, &c.signature);
@@ -574,10 +658,58 @@ fn build_health(
         scope_clear,
         coverage,
     );
+
+    let caller_count_by_confidence = if edges_ready {
+        let mut resolved = 0i64;
+        let mut inferred = 0i64;
+        let mut textual = 0i64;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT edge_confidence, COUNT(*) FROM call_edges \
+             WHERE to_symbol = ?1 GROUP BY edge_confidence",
+        ) {
+            let _ = stmt.query_map([&c.qualified_name], |row| {
+                let conf: String = row.get(0)?;
+                let cnt: i64 = row.get(1)?;
+                match conf.as_str() {
+                    "resolved" => resolved += cnt,
+                    "inferred" => inferred += cnt,
+                    _ => textual += cnt,
+                }
+                Ok(())
+            }).map(|rows| rows.for_each(|_| {}));
+        }
+        Some(CallerCountByConfidence { resolved, inferred, textual })
+    } else {
+        None
+    };
+
+    let mut test_files = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT from_path FROM call_edges WHERE to_symbol = ?1",
+    ) {
+        let _ = stmt.query_map([&c.qualified_name], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                for path in rows.flatten() {
+                    if is_test_file(&path) && !test_files.contains(&path) {
+                        test_files.push(path);
+                    }
+                }
+            });
+    }
+    test_files.sort();
+
     HealthOutput {
         dead_code_confidence: confidence.to_string(),
         dead_code_source: source.to_string(),
+        caller_count_by_confidence,
+        test_files,
     }
+}
+
+fn is_test_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("test") || lower.contains("spec") || lower.starts_with("tests/")
+        || lower.starts_with("test/") || lower.contains("/tests/") || lower.contains("/test/")
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +745,8 @@ struct SourceOutput {
     language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<SourceMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +779,8 @@ struct CallersOutput {
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +813,8 @@ struct CalleesOutput {
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -780,6 +918,8 @@ struct DependenciesOutput {
     path: String,
     imports: Vec<ImportEntry>,
     imported_by: Vec<ImportEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +970,8 @@ struct PathOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     terminated_by: Option<TerminatedByOutput>,
     hops_clamped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +993,8 @@ struct EditContextOutput {
     callees: Vec<CalleeEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     risk_assessment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +1007,8 @@ struct SessionContextOutput {
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
     unique_files_explored: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1056,8 @@ struct DiffImpactOutput {
     suggested_reviewers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +1079,8 @@ struct IndexingStatusOutput {
     edges_indexed: i64,
     embeddings_status: String,
     edges_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -962,6 +1112,8 @@ struct LocateOutput {
     /// downgraded to `with_file`.
     #[serde(skip_serializing_if = "Option::is_none")]
     depth_adjusted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1180,8 @@ struct HotspotsOutput {
     total_files_analyzed: usize,
     hotspot_method: String,
     note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 impl From<ci_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
@@ -1084,6 +1238,8 @@ struct UnderstandOutput {
     callers_summary: Vec<CallerEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edges_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1250,7 @@ struct UnderstandOutput {
 impl CodeIntelligenceServer {
     #[tool(
         name = "repo_overview",
-        description = "Overview of the entire repository — languages, stats, indexing status. ALWAYS call first."
+        description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate)."
     )]
     fn repo_overview(&self) -> String {
         self.timed_tool("repo_overview", || {
@@ -1117,16 +1273,27 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let phase = self.phase_str();
+            let embed_status = self.embed_status_str();
+            let sn = if phase != "ready" {
+                suggested("indexing_status", "Monitor until phase=ready before using graph tools")
+            } else if embed_status == "failed" {
+                suggested_with_args("indexing_status", "Recover embeddings", serde_json::json!({"retry_embeddings": true}))
+            } else {
+                suggested("locate", "Start exploration")
+            };
+
             serde_json::to_string_pretty(&RepoOverviewOutput {
                 languages,
-                indexing_phase: self.phase_str(),
-                embeddings_status: self.embed_status_str(),
+                indexing_phase: phase,
+                embeddings_status: embed_status,
                 total_modules: total_files,
                 total_symbols,
                 total_files,
                 truncated: false,
                 workflow_guide:
                     "Use locate to find symbols, then source/callers/callees to explore.".into(),
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1134,7 +1301,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "search",
-        description = "FTS5 dual-column search across symbols, text, files. Supports symbol, text, file, semantic, hybrid kinds."
+        description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
     )]
     fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
         self.timed_tool("search", || {
@@ -1147,6 +1314,7 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
+            let kind_str = p.kind.as_str();
             match ci_core::search::search(
                 &self.db(),
                 &p.query,
@@ -1154,8 +1322,8 @@ impl CodeIntelligenceServer {
                 p.limit,
                 self.embedder().as_deref(),
             ) {
-                Ok(output) => serde_json::to_string_pretty(&SearchOutput {
-                    results: output
+                Ok(output) => {
+                    let results: Vec<SearchResultItem> = output
                         .results
                         .into_iter()
                         .map(|r| SearchResultItem {
@@ -1167,17 +1335,33 @@ impl CodeIntelligenceServer {
                             score: Some(r.score),
                             match_type: Some(r.match_type),
                         })
-                        .collect(),
-                    truncated: output.truncated,
-                    degraded: output.degraded,
-                    note: output.note,
-                })
-                .unwrap_or_default(),
+                        .collect();
+                    let sn = if !results.is_empty() && kind_str == "symbol" {
+                        suggested_with_args("locate", "Full context in 1 call (replaces symbol_info)", serde_json::json!({"query": results[0].name, "kind": "symbol"}))
+                    } else if results.is_empty() && kind_str != "hybrid" && kind_str != "semantic" {
+                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"kind": "hybrid"}))
+                    } else if results.is_empty() && kind_str == "semantic" {
+                        suggested_with_args("search", "Semantic index may not cover this — try text or hybrid search", serde_json::json!({"kind": "text"}))
+                    } else if results.is_empty() && kind_str == "hybrid" {
+                        suggested_with_args("search", "Embeddings may not cover this query — try exact text search or broaden wording", serde_json::json!({"kind": "text"}))
+                    } else {
+                        None
+                    };
+                    serde_json::to_string_pretty(&SearchOutput {
+                        results,
+                        truncated: output.truncated,
+                        degraded: output.degraded,
+                        note: output.note,
+                        suggested_next: self.filter_sn(sn),
+                    })
+                    .unwrap_or_default()
+                }
                 Err(e) => serde_json::to_string_pretty(&SearchOutput {
                     results: vec![],
                     truncated: false,
                     degraded: true,
                     note: Some(format!("Search error: {e}")),
+                    suggested_next: None,
                 })
                 .unwrap_or_default(),
             }
@@ -1186,19 +1370,30 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "file_overview",
-        description = "List all symbols in a file — functions, classes, methods with line ranges."
+        description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
     )]
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
         self.timed_tool("file_overview", || {
             self.track_file(&p.path);
             let conn = self.db();
-            serde_json::to_string_pretty(&build_file_overview(&conn, &p.path)).unwrap_or_default()
+            let mut out = build_file_overview(&conn, &p.path);
+
+            let hub_name: Option<String> = conn
+                .prepare("SELECT name FROM symbols WHERE path = ?1 AND is_hub = 1 LIMIT 1")
+                .ok()
+                .and_then(|mut s| s.query_row(rusqlite::params![p.path], |r| r.get(0)).ok());
+            out.suggested_next = if let Some(hub) = hub_name {
+                suggested_with_args("locate", "Inspect hub symbol", serde_json::json!({"query": hub}))
+            } else {
+                suggested("source", "Read a symbol implementation")
+            };
+            serde_json::to_string_pretty(&out).unwrap_or_default()
         })
     }
 
     #[tool(
         name = "symbol_info",
-        description = "Detailed info for a single symbol — signature, docstring, hub status, caller count."
+        description = "USE WHEN: you have a symbol name and want metadata + health signals BEFORE reading source. Check is_hub + coreness before deciding whether to modify — hub symbols need edit_context. NOT FOR: reading source (use source), finding symbols (use search/locate). vs source: symbol_info is metadata-only (no code body)."
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
         self.timed_tool("symbol_info", || {
@@ -1213,7 +1408,16 @@ impl CodeIntelligenceServer {
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
-                    out.health = Some(build_health(&self.coverage, &self.project_root, &c));
+                    let conn = self.db();
+                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready());
+                    out.suggested_next = if c.is_hub {
+                        suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
+                    } else if health.test_files.is_empty() {
+                        suggested_with_args("search", "No tests found — search for coverage", serde_json::json!({"query": format!("{} test", c.name), "kind": "text"}))
+                    } else {
+                        suggested_with_args("source", "Read implementation", serde_json::json!({"target": c.name}))
+                    };
+                    out.health = Some(health);
                     serde_json::to_string_pretty(&out).unwrap_or_default()
                 }
             }
@@ -1222,7 +1426,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "source",
-        description = "Retrieve source code for a symbol. Output is sanitized for credentials."
+        description = "USE THIS INSTEAD OF native Read file tool — reads symbol-precise code, always fresh from disk. USE WHEN: you need to read the actual implementation of a specific function/class/method. NEVER use native Read tool on a full file — it floods context with unrelated code."
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
         self.timed_tool("source", || {
@@ -1257,6 +1461,12 @@ impl CodeIntelligenceServer {
                 is_hub: c.is_hub,
             });
 
+            let sn = if p.include_metadata && c.is_hub {
+                suggested("edit_context", "Hub — mandatory pre-edit context")
+            } else {
+                suggested_with_args("callers", "Check who uses this before modifying", serde_json::json!({"symbol": p.symbol}))
+            };
+
             serde_json::to_string_pretty(&SourceOutput {
                 symbol: p.symbol,
                 path: c.path,
@@ -1265,6 +1475,7 @@ impl CodeIntelligenceServer {
                 source: sanitized,
                 language: c.language,
                 metadata,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1272,7 +1483,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "callers",
-        description = "Who calls this symbol? Returns direct callers with edge confidence."
+        description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
         self.timed_tool("callers", || {
@@ -1327,11 +1538,20 @@ impl CodeIntelligenceServer {
             };
 
             let count = direct.len();
+            let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
+            let sn = if has_textual || count > 10 {
+                suggested("edit_context", "High blast radius or uncertain edges — verify before modifying")
+            } else if count > 0 {
+                suggested_with_args("source", "Read top caller implementation", serde_json::json!({"target": direct[0].symbol}))
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&CallersOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
                 transitive,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1339,7 +1559,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "callees",
-        description = "What does this symbol call? Returns direct callees with edge confidence."
+        description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
         self.timed_tool("callees", || {
@@ -1394,11 +1614,17 @@ impl CodeIntelligenceServer {
             };
 
             let count = direct.len();
+            let sn = if count > 0 {
+                suggested("path", "Trace specific call chain")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&CalleesOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
                 transitive,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1406,7 +1632,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "dependencies",
-        description = "Import/export dependencies for a file — what it imports and what imports it."
+        description = "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level."
     )]
     fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
         self.timed_tool("dependencies", || {
@@ -1451,10 +1677,16 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let sn = if imported_by.len() > 20 {
+                suggested("callers", "High fan-in — check symbol blast radius")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&DependenciesOutput {
                 path: p.path,
                 imports,
                 imported_by,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1462,7 +1694,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "path",
-        description = "Find call paths between two symbols using bidirectional BFS."
+        description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result."
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
         self.timed_tool("path", || {
@@ -1523,6 +1755,17 @@ impl CodeIntelligenceServer {
             };
 
             let count = routes.len();
+            let sn = if matches!(&terminated_by, Some(TerminatedByOutput::Timeout)) {
+                suggested_with_args("path", "Retry with smaller max_hops", serde_json::json!({"max_hops": 4}))
+            } else if matches!(&terminated_by, Some(TerminatedByOutput::MaxHops)) {
+                let new_hops = requested_hops + 4;
+                suggested_with_args("path", "Path may exceed hop limit — retry with larger max_hops, or check the reverse direction",
+                    serde_json::json!({"max_hops": new_hops, "from_symbol": p.to_symbol, "to_symbol": p.from_symbol}))
+            } else if exists == Some(true) {
+                suggested("source", "Read meeting node implementation")
+            } else {
+                None
+            };
             serde_json::to_string_pretty(&PathOutput {
                 from_symbol: p.from_symbol,
                 to_symbol: p.to_symbol,
@@ -1531,6 +1774,7 @@ impl CodeIntelligenceServer {
                 exists,
                 terminated_by,
                 hops_clamped,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1538,7 +1782,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "edit_context",
-        description = "Pre-edit blast radius — callers, callees, and risk assessment for a symbol you plan to modify."
+        description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
         self.timed_tool("edit_context", || {
@@ -1607,6 +1851,7 @@ impl CodeIntelligenceServer {
                 callers,
                 callees,
                 risk_assessment: risk,
+                suggested_next: self.filter_sn(suggested("diff_impact", "MANDATORY after changes — verify blast radius")),
             })
             .unwrap_or_default()
         })
@@ -1614,7 +1859,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "session_context",
-        description = "Session tracking state — explored symbols, files, tool call count."
+        description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count."
     )]
     fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
@@ -1625,6 +1870,7 @@ impl CodeIntelligenceServer {
                 explored_symbols: log.explored_symbols.iter().cloned().collect(),
                 unique_files_explored: explored_files.len(),
                 explored_files,
+                suggested_next: self.filter_sn(suggested("repo_overview", "Refresh map")),
             })
             .unwrap_or_default()
         })
@@ -1632,7 +1878,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "diff_impact",
-        description = "Post-edit blast radius — analyze a diff for affected symbols and risk level. Provide exactly one of: diff, staged, commits."
+        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Provide exactly one of: diff, staged, commits."
     )]
     fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> String {
         self.timed_tool("diff_impact", || {
@@ -1796,6 +2042,26 @@ impl CodeIntelligenceServer {
                 }
             }
 
+            let sn = if !unindexed_files.is_empty() {
+                suggested("indexing_status", "Wait for index before treating as safe")
+            } else if aggregate_risk == "critical" || aggregate_risk == "high" {
+                affected_symbols.first().map(|s| SuggestedNext {
+                    tool: "callers".into(),
+                    reason: "Verify high-risk callers manually".into(),
+                    args: Some(serde_json::json!({"symbol": s.name})),
+                })
+            } else if aggregate_risk == "medium" {
+                affected_symbols.first().map(|s| SuggestedNext {
+                    tool: "callers".into(),
+                    reason: "Medium-risk changes — spot-check key callers".into(),
+                    args: Some(serde_json::json!({"symbol": s.name})),
+                })
+            } else if aggregate_risk == "unknown" {
+                suggested("indexing_status", "Risk unknown — check index state")
+            } else {
+                None
+            };
+
             serde_json::to_string_pretty(&DiffImpactOutput {
                 files_changed,
                 affected_symbols,
@@ -1803,6 +2069,7 @@ impl CodeIntelligenceServer {
                 aggregate_risk,
                 suggested_reviewers,
                 note: None,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1810,7 +2077,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "indexing_status",
-        description = "Current index status — files, symbols, edges, embedding state. Can retry embeddings."
+        description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
     )]
     fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
         self.timed_tool("indexing_status", || {
@@ -1831,13 +2098,20 @@ impl CodeIntelligenceServer {
                 self.retry_embeddings_if_failed();
             }
 
+            let phase = self.phase_str();
+            let sn = if phase == "ready" {
+                suggested("locate", "Index ready — begin exploration")
+            } else {
+                suggested("indexing_status", "Still indexing — poll again or use search/source while edges build")
+            };
             serde_json::to_string_pretty(&IndexingStatusOutput {
-                indexing_phase: self.phase_str(),
+                indexing_phase: phase,
                 files_indexed: files,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1845,7 +2119,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "locate",
-        description = "Compound: search + file_overview + symbol_info in one call. Default depth: with_symbol."
+        description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
     )]
     fn locate(&self, Parameters(p): Parameters<LocateParams>) -> String {
         self.timed_tool("locate", || {
@@ -1930,6 +2204,7 @@ impl CodeIntelligenceServer {
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     health: None,
+                                    suggested_next: None,
                                 })
                             },
                         )
@@ -1958,12 +2233,26 @@ impl CodeIntelligenceServer {
             }
 
             let truncated = search_output.truncated;
+
+            let sn = if let Some(sym) = top_symbol.as_ref() {
+                if sym.is_hub {
+                    suggested_with_args("edit_context", "Hub detected — mandatory pre-edit check", serde_json::json!({"symbol": sym.name, "path": sym.path}))
+                } else {
+                    suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+                }
+            } else if results.is_empty() {
+                suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
+            } else {
+                suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+            };
+
             serde_json::to_string_pretty(&LocateOutput {
                 results,
                 top_symbol,
                 file_overview,
                 truncated,
                 depth_adjusted,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -1971,7 +2260,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "hotspots",
-        description = "Churn × complexity hotspots — files most likely to cause bugs based on git history."
+        description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
     )]
     fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> String {
         self.timed_tool("hotspots", || {
@@ -1998,6 +2287,12 @@ impl CodeIntelligenceServer {
                 result.hotspots.into_iter().map(HotspotEntryOutput::from).collect();
             let count = hotspots.len();
 
+            let sn = hotspots.first().map(|h| SuggestedNext {
+                tool: "file_overview".into(),
+                reason: "Inspect highest-risk file".into(),
+                args: Some(serde_json::json!({"path": h.path})),
+            });
+
             serde_json::to_string_pretty(&HotspotsOutput {
                 hotspots,
                 count,
@@ -2006,6 +2301,7 @@ impl CodeIntelligenceServer {
                 total_files_analyzed: result.total_files_analyzed,
                 hotspot_method: result.hotspot_method,
                 note: result.note,
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
@@ -2013,7 +2309,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "understand",
-        description = "Compound: locate + source + callers in one call. Deep understanding of a symbol."
+        description = "Compound: locate + source + callers summary in 1 call. USE INSTEAD OF calling locate then source then callers separately. NOT FOR: pre-edit (use edit_context — more complete blast radius). NOT FOR: browsing results list (use locate with depth=search_only)."
     )]
     fn understand(&self, Parameters(p): Parameters<UnderstandParams>) -> String {
         self.timed_tool("understand", || {
@@ -2053,6 +2349,7 @@ impl CodeIntelligenceServer {
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     health: None,
+                                    suggested_next: None,
                                 },
                                 row.get::<_, String>(10).unwrap_or_default(),
                             ))
@@ -2081,6 +2378,7 @@ impl CodeIntelligenceServer {
                     source,
                     language: language.clone(),
                     metadata: None,
+                    suggested_next: None,
                 })
             });
 
@@ -2107,11 +2405,22 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap_or_default();
 
+            let sn = if let Some((ref info, _)) = symbol_info {
+                if info.is_hub {
+                    suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
+                } else {
+                    suggested_with_args("edit_context", "Pre-edit: verify blast radius before modifying", serde_json::json!({"symbol": info.name, "path": info.path}))
+                }
+            } else {
+                None
+            };
+
             serde_json::to_string_pretty(&UnderstandOutput {
                 symbol: symbol_info.map(|(info, _)| info),
                 source: source_output,
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
+                suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })

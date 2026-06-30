@@ -18,11 +18,15 @@ use tools::CodeIntelligenceServer;
 pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
 
 pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> {
+    serve_stdio_with_preset(project_root, db_path, "full".into()).await
+}
+
+pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, preset: String) -> Result<()> {
     // Register the sqlite-vec extension before any connection is opened (no-op
     // unless built with the `embeddings` feature).
     ci_core::embedding::register_extension();
 
-    let server = CodeIntelligenceServer::new(project_root.clone(), db_path.clone())?;
+    let server = CodeIntelligenceServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();
 

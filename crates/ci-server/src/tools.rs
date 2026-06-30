@@ -86,7 +86,6 @@ impl Default for SessionLog {
 pub struct CodeIntelligenceServer {
     project_root: PathBuf,
     db_path: PathBuf,
-    conn: Arc<Mutex<rusqlite::Connection>>,
     /// Current indexing phase, shared with the background indexer thread.
     /// Tools read it to report `indexing_phase` / `edges_ready` honestly instead
     /// of assuming the graph is built.
@@ -117,11 +116,11 @@ impl CodeIntelligenceServer {
         }
         let conn = rusqlite::Connection::open(&db_path)?;
         ci_core::db::schema::init_db(&conn)?;
+        drop(conn);
         let coverage = ci_core::analysis::coverage::load_coverage(&project_root);
         Ok(Self {
             project_root,
             db_path,
-            conn: Arc::new(Mutex::new(conn)),
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
@@ -131,22 +130,23 @@ impl CodeIntelligenceServer {
         })
     }
 
-    fn db(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn.lock().unwrap()
-    }
-
     /// Opens a new dedicated read-only connection to the same DB file.
     /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
-    /// tool handler is rejected at the SQLite level rather than silently
-    /// contending with the shared write connection.
+    /// tool handler is rejected at the SQLite level.
     ///
-    /// SINGLE_WRITER enforcement: all tool READ handlers must use this instead
-    /// of `self.db()`. Only schema init and the indexer pipeline may use the
-    /// shared `Arc<Mutex<Connection>>` via `self.db()`.
+    /// SINGLE_WRITER enforcement: all tool handlers must use this for reads.
+    /// Schema init uses a short-lived local connection in `new_with_preset`.
     pub(crate) fn make_read_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
         let conn = rusqlite::Connection::open(&self.db_path)?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
         Ok(conn)
+    }
+
+    /// Test-only write connection for seeding fixture data.
+    /// Production tool handlers must use `make_read_conn()` instead.
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.db_path).unwrap()
     }
 
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
@@ -2165,16 +2165,15 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             };
 
             let edges_ready = self.edges_ready();
-            // TODO(SINGLE_WRITER): convert this to make_read_conn() — deferred because
-            // compute_frontier_entries takes &Connection and passing a read conn here
-            // requires plumbing it through the conditional (frontier_degraded) path.
-            // For now this uses the shared write connection, which is safe but sub-optimal.
             let (frontier, frontier_degraded) = if !edges_ready
                 || (explored_files.is_empty() && explored_symbols.is_empty())
             {
                 (vec![], !edges_ready)
             } else {
-                let conn = self.db();
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                };
                 let frontier = compute_frontier_entries(&conn, &explored_files, &explored_symbols);
                 (frontier, false)
             };

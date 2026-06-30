@@ -242,8 +242,12 @@ fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, Churn
             current_author = parts.get(1).map(|s| s.trim().to_string());
             current_date = parts.get(2).map(|s| s.trim().to_string());
         } else if !line.trim().is_empty() {
-            let abs_path = project_root.join(line.trim()).to_string_lossy().to_string();
-            let entry = churn_map.entry(abs_path).or_insert_with(|| ChurnInfo {
+            // Git already reports paths relative to `current_dir` (project_root) using
+            // forward slashes — this must match `symbols.path`'s format exactly (see
+            // `pipeline::rel_path`), or the churn/complexity merge below silently drops
+            // every candidate.
+            let rel_path = line.trim().to_string();
+            let entry = churn_map.entry(rel_path).or_insert_with(|| ChurnInfo {
                 commit_count: 0,
                 authors: HashSet::new(),
                 // H-1 fix: last_changed is Option<String>, None instead of ""
@@ -382,5 +386,44 @@ mod tests {
         let syms = output.hotspots[0].top_symbols.as_ref().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "m.foo"); // higher caller_count first
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Regression test for the path-format mismatch between `collect_git_churn`
+    /// (which used to absolutize paths) and `symbols.path` (always project-root-
+    /// relative): with a real git repo present, churn-ranked hotspots must
+    /// actually surface indexed files, not silently merge to an empty result.
+    #[test]
+    fn test_git_churn_merges_with_relative_symbol_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("hot.py"), "def foo():\n    pass\n").unwrap();
+        run_git(dir.path(), &["add", "hot.py"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+        // A second commit so commit_count >= min_churn=2.
+        std::fs::write(dir.path().join("hot.py"), "def foo():\n    return 1\n").unwrap();
+        run_git(dir.path(), &["commit", "-q", "-am", "update"]);
+
+        let conn = setup_db();
+        insert_symbol(&conn, "hot.foo", "hot.py", 3, true, 1);
+
+        let config = HotspotsConfig::default();
+        let output = compute_hotspots(dir.path(), &conn, &config, 10, "1 year", 2, false);
+
+        assert!(output.git_available);
+        assert_eq!(output.hotspot_method, "git+index");
+        assert_eq!(output.hotspots.len(), 1);
+        assert_eq!(output.hotspots[0].path, "hot.py");
+        assert_eq!(output.hotspots[0].churn.commit_count, 2);
     }
 }

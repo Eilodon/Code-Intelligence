@@ -487,13 +487,21 @@ fn normalize_rel(base_dir: &str, rel: &str) -> String {
 /// Scan → extract symbols + call sites (tree-sitter) → rebuild graph
 /// (caller_count, coreness, is_hub). Everything is one transaction so the graph
 /// is never observed half-built.
-pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusqlite::Result<()> {
+pub fn run_indexing_pipeline(
+    conn: &mut Connection,
+    project_root: &Path,
+    phase: std::sync::Arc<std::sync::RwLock<crate::types::IndexingPhase>>,
+) -> rusqlite::Result<()> {
+    use crate::types::IndexingPhase;
+
     let config = crate::config::load_config(project_root).unwrap_or_default();
     let entry_point_patterns = config.entry_points;
 
     let mut files = Vec::new();
     collect_source_files(project_root, &mut files);
     files.sort();
+
+    *phase.write().unwrap() = IndexingPhase::Parsing;
 
     let now = now_secs();
     let tx = conn.transaction()?;
@@ -525,8 +533,13 @@ pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusq
         )?;
     }
 
+    *phase.write().unwrap() = IndexingPhase::BuildingEdges;
+
     rebuild_graph(&tx, &config.hub_threshold)?;
     tx.commit()?;
+
+    *phase.write().unwrap() = IndexingPhase::Ready;
+
     Ok(())
 }
 
@@ -629,6 +642,34 @@ mod tests {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
+    fn dummy_phase() -> std::sync::Arc<std::sync::RwLock<IndexingPhase>> {
+        std::sync::Arc::new(std::sync::RwLock::new(IndexingPhase::Scanning))
+    }
+
+    #[test]
+    fn test_phase_advances_to_ready_after_pipeline() {
+        use std::sync::{Arc, RwLock};
+        use crate::types::IndexingPhase;
+
+        let dir = std::env::temp_dir().join(format!("ci_idx_phase_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def hello():\n    pass\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let phase = Arc::new(RwLock::new(IndexingPhase::Scanning));
+        run_indexing_pipeline(&mut conn, &dir, phase.clone()).unwrap();
+
+        assert_eq!(
+            *phase.read().unwrap(),
+            IndexingPhase::Ready,
+            "Phase must be Ready after pipeline completes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_phase_transition() {
         let mut sm = IndexStateMachine::new();
@@ -643,7 +684,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        assert!(run_indexing_pipeline(&mut conn, &dir).is_ok());
+        assert!(run_indexing_pipeline(&mut conn, &dir, dummy_phase()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -660,7 +701,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 1);
@@ -700,7 +741,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         assert_eq!(
             count(
@@ -739,7 +780,7 @@ mod tests {
 
         let mut conn_default = Connection::open_in_memory().unwrap();
         init_db(&conn_default).unwrap();
-        run_indexing_pipeline(&mut conn_default, &dir).unwrap();
+        run_indexing_pipeline(&mut conn_default, &dir, dummy_phase()).unwrap();
         assert_eq!(
             count(
                 &conn_default,
@@ -756,7 +797,7 @@ mod tests {
         .unwrap();
         let mut conn_custom = Connection::open_in_memory().unwrap();
         init_db(&conn_custom).unwrap();
-        run_indexing_pipeline(&mut conn_custom, &dir).unwrap();
+        run_indexing_pipeline(&mut conn_custom, &dir, dummy_phase()).unwrap();
         assert_eq!(
             count(
                 &conn_custom,
@@ -783,7 +824,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         // The alias is de-referenced, so the edge points at helper.
         assert_eq!(
@@ -811,7 +852,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         // import_edges populated and to_path resolved to the in-project file.
         let (to_path, module): (String, String) = conn
@@ -863,7 +904,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         // Method is class-qualified.
         assert_eq!(
@@ -910,7 +951,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         // Go method is tagged with its receiver type as class_context.
         assert_eq!(
@@ -943,7 +984,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
 
         // No change → no-op.

@@ -52,12 +52,11 @@ pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, pr
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
             let _ = ci_core::db::schema::init_db(&conn);
             if let Err(e) =
-                ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &indexer_root)
+                ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &indexer_root, phase.clone())
             {
                 tracing::error!("Background indexer failed: {}", e);
             } else {
-                // Graph is fully built — tools may now report edges_ready.
-                *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
+                // Ready is now set inside run_indexing_pipeline (after tx.commit)
                 tracing::info!("Background indexing completed");
             }
             // Opt-in semantic embeddings, after the graph is built.

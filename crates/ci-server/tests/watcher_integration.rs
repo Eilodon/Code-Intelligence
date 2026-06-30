@@ -43,7 +43,11 @@ fn watcher_reindexes_add_and_delete() {
     {
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         ci_core::db::schema::init_db(&conn).unwrap();
-        ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &dir).unwrap();
+        ci_core::indexer::pipeline::run_indexing_pipeline(
+            &mut conn,
+            &dir,
+            std::sync::Arc::new(std::sync::RwLock::new(ci_core::types::IndexingPhase::Scanning)),
+        ).unwrap();
     }
     assert_eq!(symbol_count(&db_path), 1, "initial index");
 

@@ -203,7 +203,10 @@ mod tests {
         std::fs::write(tmp.join("config.json"), r#"{"preset": "orient"}"#).unwrap();
 
         let config = crate::config::load_config(&tmp).unwrap();
-        assert_eq!(config.preset, "orient",
-            "config.json preset must be loaded, got: {}", config.preset);
+        assert_eq!(
+            config.preset, "orient",
+            "config.json preset must be loaded, got: {}",
+            config.preset
+        );
     }
 }

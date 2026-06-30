@@ -203,7 +203,13 @@ fn detect_entry_point(
     match language {
         "python" => {
             const HOOKS: &[&str] = &[
-                ".route(", ".command(", ".get(", ".post(", ".put(", ".delete(", ".patch(",
+                ".route(",
+                ".command(",
+                ".get(",
+                ".post(",
+                ".put(",
+                ".delete(",
+                ".patch(",
             ];
             decorators
                 .iter()
@@ -225,7 +231,9 @@ fn detect_entry_point(
                     .parent()
                     .map(|p| {
                         p.kind() == "export_statement"
-                            && source[p.byte_range()].trim_start().starts_with("export default")
+                            && source[p.byte_range()]
+                                .trim_start()
+                                .starts_with("export default")
                     })
                     .unwrap_or(false)
         }

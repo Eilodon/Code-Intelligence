@@ -648,8 +648,8 @@ mod tests {
 
     #[test]
     fn test_phase_advances_to_ready_after_pipeline() {
-        use std::sync::{Arc, RwLock};
         use crate::types::IndexingPhase;
+        use std::sync::{Arc, RwLock};
 
         let dir = std::env::temp_dir().join(format!("ci_idx_phase_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

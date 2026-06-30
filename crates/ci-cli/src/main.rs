@@ -82,7 +82,11 @@ async fn main() -> Result<()> {
             // CLI flag takes precedence; fall back to config.json value (default: "full")
             let config = ci_core::config::load_config(&root).unwrap_or_default();
             let effective_preset = preset.unwrap_or_else(|| config.preset.clone());
-            tracing::info!("Starting MCP server for {} (preset={})", root.display(), effective_preset);
+            tracing::info!(
+                "Starting MCP server for {} (preset={})",
+                root.display(),
+                effective_preset
+            );
             ci_server::serve_stdio_with_preset(root, db, effective_preset).await?;
         }
         Commands::Index { project_root } => {
@@ -97,7 +101,9 @@ async fn main() -> Result<()> {
             }
             let mut conn = rusqlite::Connection::open(&db_path)?;
             ci_core::db::schema::init_db(&conn)?;
-            let phase = std::sync::Arc::new(std::sync::RwLock::new(ci_core::types::IndexingPhase::Scanning));
+            let phase = std::sync::Arc::new(std::sync::RwLock::new(
+                ci_core::types::IndexingPhase::Scanning,
+            ));
             ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &root, phase)?;
             let symbol_count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;

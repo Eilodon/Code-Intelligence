@@ -46,8 +46,11 @@ fn watcher_reindexes_add_and_delete() {
         ci_core::indexer::pipeline::run_indexing_pipeline(
             &mut conn,
             &dir,
-            std::sync::Arc::new(std::sync::RwLock::new(ci_core::types::IndexingPhase::Scanning)),
-        ).unwrap();
+            std::sync::Arc::new(std::sync::RwLock::new(
+                ci_core::types::IndexingPhase::Scanning,
+            )),
+        )
+        .unwrap();
     }
     assert_eq!(symbol_count(&db_path), 1, "initial index");
 

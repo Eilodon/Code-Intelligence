@@ -38,7 +38,9 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     loop {
         let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
         let days_in_year = if leap { 366 } else { 365 };
-        if days < days_in_year { break; }
+        if days < days_in_year {
+            break;
+        }
         days -= days_in_year;
         year += 1;
     }
@@ -50,7 +52,9 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     };
     let mut month = 1u64;
     for &md in month_days {
-        if days < md { break; }
+        if days < md {
+            break;
+        }
         days -= md;
         month += 1;
     }
@@ -102,7 +106,11 @@ impl CodeIntelligenceServer {
         Self::new_with_preset(project_root, db_path, "full".into())
     }
 
-    pub fn new_with_preset(project_root: PathBuf, db_path: PathBuf, preset: String) -> anyhow::Result<Self> {
+    pub fn new_with_preset(
+        project_root: PathBuf,
+        db_path: PathBuf,
+        preset: String,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -259,11 +267,19 @@ struct SuggestedNext {
 }
 
 fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
-    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: None })
+    Some(SuggestedNext {
+        tool: tool.into(),
+        reason: reason.into(),
+        args: None,
+    })
 }
 
 fn suggested_with_args(tool: &str, reason: &str, args: serde_json::Value) -> Option<SuggestedNext> {
-    Some(SuggestedNext { tool: tool.into(), reason: reason.into(), args: Some(args) })
+    Some(SuggestedNext {
+        tool: tool.into(),
+        reason: reason.into(),
+        args: Some(args),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -273,19 +289,46 @@ fn suggested_with_args(tool: &str, reason: &str, args: serde_json::Value) -> Opt
 fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
     match preset {
         "orient" => Some(&[
-            "repo_overview", "locate", "dependencies", "hotspots", "indexing_status",
+            "repo_overview",
+            "locate",
+            "dependencies",
+            "hotspots",
+            "indexing_status",
         ]),
         "trace" => Some(&[
-            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
-            "callees", "path", "dependencies", "indexing_status",
+            "repo_overview",
+            "search",
+            "locate",
+            "symbol_info",
+            "source",
+            "callers",
+            "callees",
+            "path",
+            "dependencies",
+            "indexing_status",
         ]),
         "edit" => Some(&[
-            "repo_overview", "search", "locate", "symbol_info", "source", "callers",
-            "callees", "edit_context", "diff_impact", "indexing_status",
+            "repo_overview",
+            "search",
+            "locate",
+            "symbol_info",
+            "source",
+            "callers",
+            "callees",
+            "edit_context",
+            "diff_impact",
+            "indexing_status",
         ]),
         "compound" => Some(&[
-            "repo_overview", "locate", "hotspots", "source", "understand",
-            "edit_context", "diff_impact", "session_context", "indexing_status",
+            "repo_overview",
+            "locate",
+            "hotspots",
+            "source",
+            "understand",
+            "edit_context",
+            "diff_impact",
+            "session_context",
+            "indexing_status",
         ]),
         "full" | "" => None, // None = all tools, no filtering
         _ => None,
@@ -378,7 +421,7 @@ struct CandidateRow {
     language: String,
     class_context: Option<String>,
     is_entry_point: bool,
-    coreness: Option<i64>,  // from symbols.coreness column
+    coreness: Option<i64>, // from symbols.coreness column
 }
 
 impl CandidateRow {
@@ -394,7 +437,7 @@ impl CandidateRow {
             docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
             caller_count: self.caller_count,
             is_hub: self.is_hub,
-            coreness: None,  // set by handler based on edges_ready
+            coreness: None, // set by handler based on edges_ready
             health: None,
             suggested_next: None,
         }
@@ -479,11 +522,7 @@ enum SymbolResolution {
 /// match — `name` + `path` is not a DB-enforced unique key (only
 /// `qualified_name` is), so e.g. two same-named methods on different classes
 /// in the same file still resolve as ambiguous even with `path` set.
-fn resolve_symbol(
-    conn: &rusqlite::Connection,
-    name: &str,
-    path: Option<&str>,
-) -> SymbolResolution {
+fn resolve_symbol(conn: &rusqlite::Connection, name: &str, path: Option<&str>) -> SymbolResolution {
     let mut candidates = resolve_symbol_candidates(conn, name, path);
     if candidates.is_empty() {
         SymbolResolution::NotFound
@@ -584,7 +623,10 @@ fn compute_frontier_entries(
                 (true, false) => "imported_by_explored",
                 _ => "contains_callers_of_explored",
             };
-            FrontierEntry { path: p.clone(), reason: reason.to_string() }
+            FrontierEntry {
+                path: p.clone(),
+                reason: reason.to_string(),
+            }
         })
         .collect();
 
@@ -595,7 +637,9 @@ fn compute_frontier_entries(
             "imported_by_explored" => 1,
             _ => 2,
         };
-        rank(&a.reason).cmp(&rank(&b.reason)).then(a.path.cmp(&b.path))
+        rank(&a.reason)
+            .cmp(&rank(&b.reason))
+            .then(a.path.cmp(&b.path))
     });
     result
 }
@@ -764,7 +808,7 @@ struct SymbolInfoOutput {
     docstring: Option<String>,
     caller_count: i64,
     is_hub: bool,
-    coreness: Option<i64>,  // null when edges not yet built; 0 = isolated; >0 = k-core depth
+    coreness: Option<i64>, // null when edges not yet built; 0 = isolated; >0 = k-core depth
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -794,7 +838,11 @@ fn is_private_symbol(language: &str, name: &str, signature: &str) -> bool {
     match language {
         "python" => name.starts_with('_'),
         "rust" => !signature.contains("pub "),
-        "go" => name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false),
+        "go" => name
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false),
         "java" => signature.contains("private "),
         "javascript" | "typescript" => !signature.contains("export"),
         _ => false,
@@ -836,27 +884,34 @@ fn build_health(
             "SELECT edge_confidence, COUNT(*) FROM call_edges \
              WHERE to_symbol = ?1 GROUP BY edge_confidence",
         ) {
-            let _ = stmt.query_map([&c.qualified_name], |row| {
-                let conf: String = row.get(0)?;
-                let cnt: i64 = row.get(1)?;
-                match conf.as_str() {
-                    "resolved" => resolved += cnt,
-                    "inferred" => inferred += cnt,
-                    _ => textual += cnt,
-                }
-                Ok(())
-            }).map(|rows| rows.for_each(|_| {}));
+            let _ = stmt
+                .query_map([&c.qualified_name], |row| {
+                    let conf: String = row.get(0)?;
+                    let cnt: i64 = row.get(1)?;
+                    match conf.as_str() {
+                        "resolved" => resolved += cnt,
+                        "inferred" => inferred += cnt,
+                        _ => textual += cnt,
+                    }
+                    Ok(())
+                })
+                .map(|rows| rows.for_each(|_| {}));
         }
-        Some(CallerCountByConfidence { resolved, inferred, textual })
+        Some(CallerCountByConfidence {
+            resolved,
+            inferred,
+            textual,
+        })
     } else {
         None
     };
 
     let mut test_files = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT from_path FROM call_edges WHERE to_symbol = ?1",
-    ) {
-        let _ = stmt.query_map([&c.qualified_name], |row| row.get::<_, String>(0))
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT from_path FROM call_edges WHERE to_symbol = ?1")
+    {
+        let _ = stmt
+            .query_map([&c.qualified_name], |row| row.get::<_, String>(0))
             .map(|rows| {
                 for path in rows.flatten() {
                     if is_test_file(&path) && !test_files.contains(&path) {
@@ -877,8 +932,12 @@ fn build_health(
 
 fn is_test_file(path: &str) -> bool {
     let lower = path.to_lowercase();
-    lower.contains("test") || lower.contains("spec") || lower.starts_with("tests/")
-        || lower.starts_with("test/") || lower.contains("/tests/") || lower.contains("/test/")
+    lower.contains("test")
+        || lower.contains("spec")
+        || lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        || lower.contains("/tests/")
+        || lower.contains("/test/")
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,7 +1639,11 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .ok()
                 .and_then(|mut s| s.query_row(rusqlite::params![p.path], |r| r.get(0)).ok());
             out.suggested_next = if let Some(hub) = hub_name {
-                suggested_with_args("locate", "Inspect hub symbol", serde_json::json!({"query": hub}))
+                suggested_with_args(
+                    "locate",
+                    "Inspect hub symbol",
+                    serde_json::json!({"query": hub}),
+                )
             } else {
                 suggested("source", "Read a symbol implementation")
             };
@@ -1668,7 +1731,11 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let sn = if p.include_metadata && c.is_hub {
                 suggested("edit_context", "Hub — mandatory pre-edit context")
             } else {
-                suggested_with_args("callers", "Check who uses this before modifying", serde_json::json!({"symbol": p.symbol}))
+                suggested_with_args(
+                    "callers",
+                    "Check who uses this before modifying",
+                    serde_json::json!({"symbol": p.symbol}),
+                )
             };
 
             serde_json::to_string_pretty(&SourceOutput {
@@ -1744,9 +1811,16 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let count = direct.len();
             let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
             let sn = if has_textual || count > 10 {
-                suggested("edit_context", "High blast radius or uncertain edges — verify before modifying")
+                suggested(
+                    "edit_context",
+                    "High blast radius or uncertain edges — verify before modifying",
+                )
             } else if count > 0 {
-                suggested_with_args("source", "Read top caller implementation", serde_json::json!({"target": direct[0].symbol}))
+                suggested_with_args(
+                    "source",
+                    "Read top caller implementation",
+                    serde_json::json!({"target": direct[0].symbol}),
+                )
             } else {
                 None
             };
@@ -2062,7 +2136,10 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 callers,
                 callees,
                 risk_assessment: risk,
-                suggested_next: self.filter_sn(suggested("diff_impact", "MANDATORY after changes — verify blast radius")),
+                suggested_next: self.filter_sn(suggested(
+                    "diff_impact",
+                    "MANDATORY after changes — verify blast radius",
+                )),
             })
             .unwrap_or_default()
         })
@@ -2090,15 +2167,15 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             // compute_frontier_entries takes &Connection and passing a read conn here
             // requires plumbing it through the conditional (frontier_degraded) path.
             // For now this uses the shared write connection, which is safe but sub-optimal.
-            let (frontier, frontier_degraded) =
-                if !edges_ready || (explored_files.is_empty() && explored_symbols.is_empty()) {
-                    (vec![], !edges_ready)
-                } else {
-                    let conn = self.db();
-                    let frontier =
-                        compute_frontier_entries(&conn, &explored_files, &explored_symbols);
-                    (frontier, false)
-                };
+            let (frontier, frontier_degraded) = if !edges_ready
+                || (explored_files.is_empty() && explored_symbols.is_empty())
+            {
+                (vec![], !edges_ready)
+            } else {
+                let conn = self.db();
+                let frontier = compute_frontier_entries(&conn, &explored_files, &explored_symbols);
+                (frontier, false)
+            };
 
             let sn = if !frontier.is_empty() {
                 self.filter_sn(suggested_with_args(
@@ -2107,7 +2184,10 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     serde_json::json!({"path": frontier[0].path}),
                 ))
             } else {
-                self.filter_sn(suggested("repo_overview", "Frontier exhausted — refresh map"))
+                self.filter_sn(suggested(
+                    "repo_overview",
+                    "Frontier exhausted — refresh map",
+                ))
             };
 
             serde_json::to_string_pretty(&SessionContextOutput {
@@ -2264,10 +2344,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 }
             }
 
-            let aggregate_risk = ci_core::analysis::diff_impact::compute_aggregate_risk(
-                &affected,
-                &unindexed_files,
-            );
+            let aggregate_risk =
+                ci_core::analysis::diff_impact::compute_aggregate_risk(&affected, &unindexed_files);
             const MAX_AFFECTED_SYMBOLS: usize = 20;
             ci_core::analysis::diff_impact::sort_affected_symbols(
                 &mut affected,
@@ -2356,7 +2434,10 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let sn = if phase == "ready" {
                 suggested("locate", "Index ready — begin exploration")
             } else {
-                suggested("indexing_status", "Still indexing — poll again or use search/source while edges build")
+                suggested(
+                    "indexing_status",
+                    "Still indexing — poll again or use search/source while edges build",
+                )
             };
             serde_json::to_string_pretty(&IndexingStatusOutput {
                 indexing_phase: phase,
@@ -2550,8 +2631,11 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 )
             };
 
-            let hotspots: Vec<HotspotEntryOutput> =
-                result.hotspots.into_iter().map(HotspotEntryOutput::from).collect();
+            let hotspots: Vec<HotspotEntryOutput> = result
+                .hotspots
+                .into_iter()
+                .map(HotspotEntryOutput::from)
+                .collect();
             let count = hotspots.len();
 
             let sn = hotspots.first().map(|h| SuggestedNext {
@@ -2782,7 +2866,8 @@ mod tests {
 
     #[test]
     fn diff_impact_unindexed_file_yields_unknown_risk() {
-        let dir = std::env::temp_dir().join(format!("ci_diff_impact_unindexed_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_unindexed_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
@@ -2874,9 +2959,15 @@ mod tests {
         let output = server.session_context();
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
-        assert!(v.get("frontier").is_some(), "frontier field must always be present, got: {v}");
+        assert!(
+            v.get("frontier").is_some(),
+            "frontier field must always be present, got: {v}"
+        );
         assert!(v["frontier"].is_array(), "frontier must be an array");
-        assert!(v.get("frontier_degraded").is_some(), "frontier_degraded must always be present");
+        assert!(
+            v.get("frontier_degraded").is_some(),
+            "frontier_degraded must always be present"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2926,7 +3017,8 @@ mod tests {
 
     #[test]
     fn session_context_frontier_includes_import_and_call_edge_entries() {
-        let dir = std::env::temp_dir().join(format!("ci_sc_frontier_contract_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_sc_frontier_contract_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
@@ -2943,7 +3035,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, ?3)",
                 rusqlite::params!["src/b.rs", "src/a.rs", "a"],
-            ).unwrap();
+            )
+            .unwrap();
 
             // call_edges: c.rs has a caller of fn_a (which lives in a.rs)
             conn.execute(
@@ -2977,24 +3070,21 @@ mod tests {
         // Both b.rs (imported_by_explored) and c.rs (contains_callers_of_explored)
         // should appear in the frontier.
         assert_eq!(
-            frontier.len(), 2,
+            frontier.len(),
+            2,
             "frontier must have 2 entries (b.rs and c.rs), got: {frontier:?}"
         );
 
-        let find_entry = |path: &str| {
-            frontier.iter().find(|e| e["path"].as_str() == Some(path))
-        };
+        let find_entry = |path: &str| frontier.iter().find(|e| e["path"].as_str() == Some(path));
 
-        let b_entry = find_entry("src/b.rs")
-            .expect("src/b.rs must appear in frontier");
+        let b_entry = find_entry("src/b.rs").expect("src/b.rs must appear in frontier");
         assert_eq!(
             b_entry["reason"].as_str(),
             Some("imported_by_explored"),
             "src/b.rs reason must be imported_by_explored, got: {b_entry}"
         );
 
-        let c_entry = find_entry("src/c.rs")
-            .expect("src/c.rs must appear in frontier");
+        let c_entry = find_entry("src/c.rs").expect("src/c.rs must appear in frontier");
         assert_eq!(
             c_entry["reason"].as_str(),
             Some("contains_callers_of_explored"),
@@ -3053,7 +3143,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ci_path_config_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), r#"{"path": {"max_allowed_hops": 5}}"#).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"path": {"max_allowed_hops": 5}}"#,
+        )
+        .unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
         {
@@ -3258,11 +3352,23 @@ mod tests {
                  caller_count, is_hub, is_entry_point, coreness)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
-                    "my_fn", "mod::my_fn", "function", "rust", "src/lib.rs",
-                    1i64, 5i64, "fn my_fn()", "", "my fn",
-                    0i64, 0i64, 0i64, 3i64  // coreness = 3
+                    "my_fn",
+                    "mod::my_fn",
+                    "function",
+                    "rust",
+                    "src/lib.rs",
+                    1i64,
+                    5i64,
+                    "fn my_fn()",
+                    "",
+                    "my fn",
+                    0i64,
+                    0i64,
+                    0i64,
+                    3i64 // coreness = 3
                 ],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let output = server.symbol_info(Parameters(SymbolInfoParams {
@@ -3273,7 +3379,8 @@ mod tests {
 
         // coreness must be present and equal to 3
         assert_eq!(
-            v["coreness"], serde_json::json!(3),
+            v["coreness"],
+            serde_json::json!(3),
             "coreness must be 3 when edges_ready and DB value is 3, got: {v}"
         );
 
@@ -3296,11 +3403,23 @@ mod tests {
                  caller_count, is_hub, is_entry_point, coreness)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
-                    "my_fn2", "mod::my_fn2", "function", "rust", "src/lib.rs",
-                    1i64, 5i64, "fn my_fn2()", "", "my fn2",
-                    0i64, 0i64, 0i64, 5i64
+                    "my_fn2",
+                    "mod::my_fn2",
+                    "function",
+                    "rust",
+                    "src/lib.rs",
+                    1i64,
+                    5i64,
+                    "fn my_fn2()",
+                    "",
+                    "my fn2",
+                    0i64,
+                    0i64,
+                    0i64,
+                    5i64
                 ],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let output = server.symbol_info(Parameters(SymbolInfoParams {
@@ -3326,23 +3445,48 @@ mod tests {
     #[test]
     fn preset_compound_includes_required_tools() {
         let required = [
-            "repo_overview", "locate", "hotspots", "source", "understand",
-            "edit_context", "diff_impact", "session_context", "indexing_status",
+            "repo_overview",
+            "locate",
+            "hotspots",
+            "source",
+            "understand",
+            "edit_context",
+            "diff_impact",
+            "session_context",
+            "indexing_status",
         ];
         let tools = preset_tools("compound");
         let tools = tools.expect("compound must return Some (not all-tools fallback)");
         for t in &required {
-            assert!(tools.contains(t), "compound preset missing '{t}', got: {tools:?}");
+            assert!(
+                tools.contains(t),
+                "compound preset missing '{t}', got: {tools:?}"
+            );
         }
-        assert_eq!(tools.len(), 9, "compound preset must have exactly 9 tools, got: {tools:?}");
+        assert_eq!(
+            tools.len(),
+            9,
+            "compound preset must have exactly 9 tools, got: {tools:?}"
+        );
     }
 
     #[test]
     fn preset_compound_excludes_raw_graph_tools() {
-        let excluded = ["callers", "callees", "path", "search", "symbol_info", "dependencies", "file_overview"];
+        let excluded = [
+            "callers",
+            "callees",
+            "path",
+            "search",
+            "symbol_info",
+            "dependencies",
+            "file_overview",
+        ];
         let tools = preset_tools("compound").expect("compound must be Some");
         for t in &excluded {
-            assert!(!tools.contains(t), "compound must NOT include '{t}', got: {tools:?}");
+            assert!(
+                !tools.contains(t),
+                "compound must NOT include '{t}', got: {tools:?}"
+            );
         }
     }
 
@@ -3369,8 +3513,8 @@ mod tests {
 
         let output = server.locate(Parameters(LocateParams {
             query: "orphan_fn".into(),
-            kind: None,      // symbol kind
-            depth: None,     // defaults to with_symbol
+            kind: None,  // symbol kind
+            depth: None, // defaults to with_symbol
             limit: None,
         }));
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -3442,11 +3586,19 @@ mod tests {
         let output = server.session_context();
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
-        let ts = v["session_started_at"].as_str().expect("session_started_at must be a string");
+        let ts = v["session_started_at"]
+            .as_str()
+            .expect("session_started_at must be a string");
         // Must be ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
         assert!(ts.ends_with('Z'), "timestamp must end with Z, got: {ts}");
-        assert!(ts.len() >= 20, "timestamp must be at least 20 chars, got: {ts}");
-        assert!(ts.contains('T'), "timestamp must contain T separator, got: {ts}");
+        assert!(
+            ts.len() >= 20,
+            "timestamp must be at least 20 chars, got: {ts}"
+        );
+        assert!(
+            ts.contains('T'),
+            "timestamp must contain T separator, got: {ts}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3461,8 +3613,7 @@ mod tests {
         let out2: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
 
         assert_eq!(
-            out1["session_started_at"],
-            out2["session_started_at"],
+            out1["session_started_at"], out2["session_started_at"],
             "session_started_at must not change between calls"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3475,7 +3626,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        let conn = server
+            .make_read_conn()
+            .expect("make_read_conn must succeed");
         // query_only pragma should be ON — attempting a write must fail
         let result = conn.execute("CREATE TABLE IF NOT EXISTS _test_write (id INTEGER)", []);
         assert!(result.is_err(), "read-only connection must reject writes");
@@ -3489,9 +3642,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let conn = server.make_read_conn().expect("make_read_conn must succeed");
+        let conn = server
+            .make_read_conn()
+            .expect("make_read_conn must succeed");
         // Schema is initialized in new() — symbols table must be queryable
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .expect("read conn must be able to query symbols");
         assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);

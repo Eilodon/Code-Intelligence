@@ -21,14 +21,19 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
     serve_stdio_with_preset(project_root, db_path, "full".into()).await
 }
 
-pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, preset: String) -> Result<()> {
+pub async fn serve_stdio_with_preset(
+    project_root: PathBuf,
+    db_path: PathBuf,
+    preset: String,
+) -> Result<()> {
     // Register the sqlite-vec extension before any connection is opened (no-op
     // unless built with the `embeddings` feature).
     ci_core::embedding::register_extension();
 
     ci_core::gitignore::ensure_gitignore(&project_root)?;
 
-    let server = CodeIntelligenceServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
+    let server =
+        CodeIntelligenceServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();
 
@@ -53,9 +58,11 @@ pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, pr
         tracing::info!("Background indexer thread started");
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
             let _ = ci_core::db::schema::init_db(&conn);
-            if let Err(e) =
-                ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &indexer_root, phase.clone())
-            {
+            if let Err(e) = ci_core::indexer::pipeline::run_indexing_pipeline(
+                &mut conn,
+                &indexer_root,
+                phase.clone(),
+            ) {
                 tracing::error!("Background indexer failed: {}", e);
                 // Reset to Scanning so callers don't see BuildingEdges forever on failure.
                 *phase.write().unwrap() = ci_core::types::IndexingPhase::Scanning;

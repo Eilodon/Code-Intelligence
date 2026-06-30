@@ -306,9 +306,11 @@ enum SymbolResolution {
 }
 
 /// Resolve a bare symbol name (+ optional path) to exactly one row.
-/// Ambiguity is only reported when `path` is absent — a `path` is treated as
-/// an explicit disambiguation choice from the caller, so it always commits
-/// to the (sole) row that matches both `name` and `path`.
+/// `path`, when given, narrows the candidate set (see
+/// `resolve_symbol_candidates`), but does not by itself guarantee a unique
+/// match — `name` + `path` is not a DB-enforced unique key (only
+/// `qualified_name` is), so e.g. two same-named methods on different classes
+/// in the same file still resolve as ambiguous even with `path` set.
 fn resolve_symbol(
     conn: &rusqlite::Connection,
     name: &str,
@@ -317,7 +319,7 @@ fn resolve_symbol(
     let mut candidates = resolve_symbol_candidates(conn, name, path);
     if candidates.is_empty() {
         SymbolResolution::NotFound
-    } else if candidates.len() == 1 || path.is_some() {
+    } else if candidates.len() == 1 {
         SymbolResolution::Found(candidates.remove(0))
     } else {
         SymbolResolution::Ambiguous(candidates)
@@ -906,7 +908,6 @@ struct IndexingStatusOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct LocateParams {
     query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -925,6 +926,12 @@ struct LocateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     file_overview: Option<FileOverviewOutput>,
     truncated: bool,
+    /// Set when the requested `depth` was auto-downgraded — see
+    /// `CONTRACTS.md`'s `LocateDepth` invariant: `kind ∈ {text, file}` +
+    /// `depth = with_symbol` has no meaningful symbol to enrich, so it's
+    /// downgraded to `with_file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_adjusted: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,9 +1460,13 @@ impl CodeIntelligenceServer {
             self.track_symbol(&to.qualified_name);
             self.track_file(&to.path);
 
-            let requested_hops = p.max_hops.unwrap_or(8);
-            let hops_clamped = !(0..=20).contains(&requested_hops);
-            let max_hops = requested_hops.clamp(0, 20) as usize;
+            let path_config = ci_core::config::load_config(&self.project_root)
+                .unwrap_or_default()
+                .path;
+
+            let requested_hops = p.max_hops.unwrap_or(path_config.default_max_hops as i64);
+            let hops_clamped = !(0..=path_config.max_allowed_hops as i64).contains(&requested_hops);
+            let max_hops = requested_hops.clamp(0, path_config.max_allowed_hops as i64) as usize;
 
             let result = {
                 let conn = self.db();
@@ -1465,7 +1476,7 @@ impl CodeIntelligenceServer {
                     &to.qualified_name,
                     max_hops,
                     5,
-                    5000,
+                    path_config.timeout_ms,
                 )
             };
 
@@ -1854,43 +1865,62 @@ impl CodeIntelligenceServer {
 
             let top = search_output.results.first();
 
-            let top_symbol = top.and_then(|t| {
-                self.db()
-                    .query_row(
-                        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
-                         FROM symbols WHERE qualified_name = ?1 LIMIT 1",
-                        rusqlite::params![t.qualified_name],
-                        |row| {
-                            Ok(SymbolInfoOutput {
-                                name: row.get(0)?,
-                                qualified_name: row.get(1)?,
-                                kind: row.get(2)?,
-                                path: row.get(3)?,
-                                line_start: row.get(4)?,
-                                line_end: row.get(5)?,
-                                signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                                docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
-                                caller_count: row.get(8)?,
-                                is_hub: row.get::<_, i64>(9)? != 0,
-                                health: None,
-                            })
-                        },
-                    )
-                    .ok()
-            });
+            // INVARIANT (CONTRACTS.md): kind ∈ {text, file} + depth = with_symbol
+            // → auto-downgrade to with_file (a text/file match has no symbol to
+            // enrich), and report the adjustment in `depth_adjusted`.
+            let requested_depth = p.depth.as_deref().unwrap_or("with_symbol");
+            let mut effective_depth = match requested_depth {
+                "search_only" => "search_only",
+                "with_file" => "with_file",
+                _ => "with_symbol",
+            };
+            let mut depth_adjusted: Option<String> = None;
+            if matches!(kind_str, "text" | "file") && effective_depth == "with_symbol" {
+                effective_depth = "with_file";
+                depth_adjusted = Some("with_file".to_string());
+            }
 
-            let is_file_match =
-                kind_str == "file" || top.map(|t| t.match_type == "file").unwrap_or(false);
-            let file_overview = if is_file_match {
-                top.map(|t| {
-                    let conn = self.db();
-                    build_file_overview(&conn, &t.path)
+            let top_symbol = if effective_depth == "with_symbol" {
+                top.and_then(|t| {
+                    self.db()
+                        .query_row(
+                            "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
+                             FROM symbols WHERE qualified_name = ?1 LIMIT 1",
+                            rusqlite::params![t.qualified_name],
+                            |row| {
+                                Ok(SymbolInfoOutput {
+                                    name: row.get(0)?,
+                                    qualified_name: row.get(1)?,
+                                    kind: row.get(2)?,
+                                    path: row.get(3)?,
+                                    line_start: row.get(4)?,
+                                    line_end: row.get(5)?,
+                                    signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
+                                    docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
+                                    caller_count: row.get(8)?,
+                                    is_hub: row.get::<_, i64>(9)? != 0,
+                                    health: None,
+                                })
+                            },
+                        )
+                        .ok()
                 })
             } else {
                 None
             };
 
-            if let Some(t) = top {
+            let file_overview = if effective_depth == "search_only" {
+                None
+            } else {
+                top.map(|t| {
+                    let conn = self.db();
+                    build_file_overview(&conn, &t.path)
+                })
+            };
+
+            if effective_depth != "search_only"
+                && let Some(t) = top
+            {
                 self.track_file(&t.path);
                 if t.match_type != "file" {
                     self.track_symbol(&t.qualified_name);
@@ -1903,6 +1933,7 @@ impl CodeIntelligenceServer {
                 top_symbol,
                 file_overview,
                 truncated,
+                depth_adjusted,
             })
             .unwrap_or_default()
         })
@@ -2213,6 +2244,150 @@ mod tests {
         assert_eq!(v["explored_symbols"], serde_json::json!(["mod.foo"]));
         assert_eq!(v["explored_files"], serde_json::json!(["src/foo.rs"]));
         assert_eq!(v["unique_files_explored"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_stays_ambiguous_when_path_does_not_uniquely_resolve() {
+        let dir = std::env::temp_dir().join(format!("ci_ambig_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for qname in ["ClassA.method", "ClassB.method"] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        qname, "method", "function", "python", "src/multi.py", 1i64, 5i64, "def method()",
+                        "", "method", 0i64, 0i64, 0i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // Same `name` + `path`, but two distinct `qualified_name`s — path alone
+        // does not disambiguate, so this must stay ambiguous rather than
+        // silently picking the first row.
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "method".into(),
+            path: Some("src/multi.py".into()),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["ambiguous"], true);
+        assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_tool_honors_configured_max_allowed_hops() {
+        let dir = std::env::temp_dir().join(format!("ci_path_config_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"path": {"max_allowed_hops": 5}}"#).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qname, name, path) in [("mod.a", "a", "src/a.rs"), ("mod.b", "b", "src/b.rs")] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![qname, name, "function", "rust", path, 1i64, 2i64, "fn x()", "", name, 0i64, 0i64, 0i64],
+                )
+                .unwrap();
+            }
+        }
+
+        // Requested 10 hops exceeds the configured max_allowed_hops=5 — with the
+        // old hardcoded literal (20) this would NOT have been clamped.
+        let output = server.path(Parameters(PathParams {
+            from_symbol: "a".into(),
+            to_symbol: "b".into(),
+            from_path: None,
+            to_path: None,
+            max_hops: Some(10),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["hops_clamped"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_search_only_depth_skips_enrichment_and_tracking() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_depth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params!["mod.foo", "foo", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "", "foo", 0i64, 0i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        let output = server.locate(Parameters(LocateParams {
+            query: "foo".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v["top_symbol"].is_null());
+        assert!(v["file_overview"].is_null());
+        assert!(v["depth_adjusted"].is_null());
+
+        let session = server.session_context();
+        let sv: serde_json::Value = serde_json::from_str(&session).unwrap();
+        assert_eq!(sv["explored_symbols"], serde_json::json!([]));
+        assert_eq!(sv["explored_files"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_text_kind_downgrades_default_depth_to_with_file() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_downgrade_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params!["mod.foo", "foo bar baz", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()", "", "foo bar baz", 0i64, 0i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        // kind="text" + default depth ("with_symbol") must auto-downgrade per
+        // the LocateDepth invariant, since a text match has no symbol to enrich.
+        let output = server.locate(Parameters(LocateParams {
+            query: "bar".into(),
+            kind: Some("text".into()),
+            depth: None,
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["depth_adjusted"], "with_file");
+        assert!(v["top_symbol"].is_null());
+        assert!(!v["file_overview"].is_null());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -135,6 +135,7 @@ fn index_one_file(
     rel: &str,
     lang: &str,
     source: &str,
+    entry_point_patterns: &[String],
 ) -> rusqlite::Result<usize> {
     let mut syms = extract_symbols(source, lang, rel).unwrap_or_default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -148,6 +149,13 @@ fn index_one_file(
         if !seen.insert(s.qualified_name.clone()) {
             s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
             seen.insert(s.qualified_name.clone());
+        }
+        if !s.is_entry_point
+            && entry_point_patterns
+                .iter()
+                .any(|p| s.qualified_name.contains(p.as_str()))
+        {
+            s.is_entry_point = true;
         }
     }
 
@@ -234,7 +242,10 @@ fn index_one_file(
 ///
 /// This is pure DB work (no file parsing), so incremental passes only re-parse
 /// the files that actually changed while the graph stays globally consistent.
-fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+fn rebuild_graph(
+    tx: &rusqlite::Transaction,
+    hub_config: &crate::config::HubThresholdConfig,
+) -> rusqlite::Result<()> {
     // name → [(qn, path)] for tier-1; (name, class) → [(qn, path)] for tier-2.
     let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut by_name_class: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
@@ -320,8 +331,7 @@ fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     )?;
     resolve_import_targets(tx)?;
     crate::graph::coreness::compute_coreness(tx)?;
-    let hub_config = crate::config::HubThresholdConfig::default();
-    crate::graph::hub::update_is_hub_flags(tx, &hub_config)?;
+    crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     Ok(())
 }
 
@@ -478,6 +488,9 @@ fn normalize_rel(base_dir: &str, rel: &str) -> String {
 /// (caller_count, coreness, is_hub). Everything is one transaction so the graph
 /// is never observed half-built.
 pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusqlite::Result<()> {
+    let config = crate::config::load_config(project_root).unwrap_or_default();
+    let entry_point_patterns = config.entry_points;
+
     let mut files = Vec::new();
     collect_source_files(project_root, &mut files);
     files.sort();
@@ -500,7 +513,7 @@ pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusq
             continue;
         };
         let rel = rel_path(project_root, file);
-        let count = index_one_file(&tx, &rel, lang, &source)?;
+        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns)?;
         upsert_file_index(
             &tx,
             &rel,
@@ -512,7 +525,7 @@ pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusq
         )?;
     }
 
-    rebuild_graph(&tx)?;
+    rebuild_graph(&tx, &config.hub_threshold)?;
     tx.commit()?;
     Ok(())
 }
@@ -524,6 +537,9 @@ pub fn reindex_changed(
     conn: &mut Connection,
     project_root: &Path,
 ) -> rusqlite::Result<ReindexSummary> {
+    let config = crate::config::load_config(project_root).unwrap_or_default();
+    let entry_point_patterns = config.entry_points;
+
     let existing: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM file_index")?;
         stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -556,7 +572,7 @@ pub fn reindex_changed(
             continue; // unchanged — skip the parse
         }
         remove_file_rows(&tx, &rel)?;
-        let count = index_one_file(&tx, &rel, lang, &source)?;
+        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns)?;
         upsert_file_index(&tx, &rel, lang, &hash, mtime_secs(file), count, now)?;
         summary.changed += 1;
     }
@@ -569,7 +585,7 @@ pub fn reindex_changed(
     }
 
     if !summary.is_noop() {
-        rebuild_graph(&tx)?;
+        rebuild_graph(&tx, &config.hub_threshold)?;
     }
     tx.commit()?;
     Ok(summary)
@@ -661,6 +677,93 @@ mod tests {
                 "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
             ),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_entry_points_config_escape_hatch() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_entrycfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def custom_entry():\n    pass\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"entry_points": ["a.py::custom_entry"]}"#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT is_entry_point FROM symbols WHERE qualified_name = 'a.py::custom_entry'",
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT is_entry_point FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: `rebuild_graph` used to hardcode `HubThresholdConfig::default()`
+    /// instead of loading the project's `config.json`, so a custom `hub_threshold`
+    /// (like `entry_points`'s config escape hatch above) was silently ignored.
+    #[test]
+    fn test_hub_threshold_config_escape_hatch() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_hubcfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def helper():\n    pass\n\n\
+             def caller_a():\n    helper()\n\n\
+             def caller_b():\n    helper()\n\n\
+             def caller_c():\n    helper()\n",
+        )
+        .unwrap();
+
+        let mut conn_default = Connection::open_in_memory().unwrap();
+        init_db(&conn_default).unwrap();
+        run_indexing_pipeline(&mut conn_default, &dir).unwrap();
+        assert_eq!(
+            count(
+                &conn_default,
+                "SELECT is_hub FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            0,
+            "default min_callers=5 should not flag a 3-caller symbol as hub"
+        );
+
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"hub_threshold": {"min_callers": 1, "top_pct": 100, "min_callers_bridge": 1, "coreness_pct": 100}}"#,
+        )
+        .unwrap();
+        let mut conn_custom = Connection::open_in_memory().unwrap();
+        init_db(&conn_custom).unwrap();
+        run_indexing_pipeline(&mut conn_custom, &dir).unwrap();
+        assert_eq!(
+            count(
+                &conn_custom,
+                "SELECT is_hub FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            1,
+            "custom min_callers=1/top_pct=100 should flag the same symbol as hub"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

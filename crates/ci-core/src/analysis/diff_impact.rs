@@ -75,6 +75,88 @@ pub fn get_git_diff(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    /// (new_start, new_end) inclusive, 1-indexed line ranges touched in the new file.
+    pub hunks: Vec<(i64, i64)>,
+    pub is_new_file: bool,
+    pub is_deleted_file: bool,
+}
+
+/// Minimal unified-diff parser: extracts per-file changed line ranges (new-file side)
+/// from `diff --git` / `@@ ... @@` headers. Not a full diff/patch implementation —
+/// just enough to overlap against indexed symbol line ranges.
+pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut current: Option<FileDiff> = None;
+
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(f) = current.take() {
+                files.push(f);
+            }
+            current = Some(FileDiff {
+                path: parse_diff_git_header(rest),
+                hunks: Vec::new(),
+                is_new_file: false,
+                is_deleted_file: false,
+            });
+        } else if line.starts_with("new file mode") {
+            if let Some(f) = current.as_mut() {
+                f.is_new_file = true;
+            }
+        } else if line.starts_with("deleted file mode") {
+            if let Some(f) = current.as_mut() {
+                f.is_deleted_file = true;
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if let Some(f) = current.as_mut() {
+                let rest = rest.trim();
+                if rest != "/dev/null" {
+                    f.path = rest.strip_prefix("b/").unwrap_or(rest).to_string();
+                }
+            }
+        } else if let Some(range) = line.strip_prefix("@@ ").and_then(parse_hunk_header)
+            && let Some(f) = current.as_mut()
+        {
+            f.hunks.push(range);
+        }
+    }
+    if let Some(f) = current.take() {
+        files.push(f);
+    }
+    files
+}
+
+fn parse_diff_git_header(rest: &str) -> String {
+    if let Some(idx) = rest.find(" b/") {
+        rest[idx + 3..].trim().to_string()
+    } else {
+        rest.split_whitespace()
+            .last()
+            .map(|s| s.strip_prefix("b/").unwrap_or(s).to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Parses the new-file `+start,len` range out of a hunk header tail (the part
+/// after the leading `"@@ "` has already been stripped by the caller).
+fn parse_hunk_header(rest: &str) -> Option<(i64, i64)> {
+    let close = rest.find(" @@")?;
+    let ranges = &rest[..close];
+    let new_part = ranges.split(' ').find(|s| s.starts_with('+'))?;
+    let new_part = &new_part[1..];
+    let mut parts = new_part.splitn(2, ',');
+    let start: i64 = parts.next()?.parse().ok()?;
+    let len: i64 = parts
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1);
+    let end = if len <= 0 { start } else { start + len - 1 };
+    Some((start, end))
+}
+
 pub fn is_signature_changed(signature_range: (i64, i64), hunk_ranges: &[(i64, i64)]) -> bool {
     let (sig_start, sig_end) = signature_range;
     hunk_ranges
@@ -226,5 +308,92 @@ mod tests {
         let (diff, err) = get_git_diff(dir.path(), false, None, 10);
         assert!(diff.is_none());
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_parse_unified_diff_single_hunk() {
+        let diff = "diff --git a/src/foo.rs b/src/foo.rs\n\
+                     index abc..def 100644\n\
+                     --- a/src/foo.rs\n\
+                     +++ b/src/foo.rs\n\
+                     @@ -10,3 +10,4 @@ fn foo() {\n\
+                      context\n\
+                     +new line\n\
+                      context\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/foo.rs");
+        assert_eq!(files[0].hunks, vec![(10, 13)]);
+        assert!(!files[0].is_new_file);
+        assert!(!files[0].is_deleted_file);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_new_file() {
+        let diff = "diff --git a/src/new.rs b/src/new.rs\n\
+                     new file mode 100644\n\
+                     index 000..abc\n\
+                     --- /dev/null\n\
+                     +++ b/src/new.rs\n\
+                     @@ -0,0 +1,5 @@\n\
+                     +fn new_fn() {}\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/new.rs");
+        assert!(files[0].is_new_file);
+        assert_eq!(files[0].hunks, vec![(1, 5)]);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_deleted_file() {
+        let diff = "diff --git a/src/old.rs b/src/old.rs\n\
+                     deleted file mode 100644\n\
+                     index abc..000\n\
+                     --- a/src/old.rs\n\
+                     +++ /dev/null\n\
+                     @@ -1,5 +0,0 @@\n\
+                     -fn old_fn() {}\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/old.rs");
+        assert!(files[0].is_deleted_file);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_rename() {
+        let diff = "diff --git a/src/old.rs b/src/renamed.rs\n\
+                     similarity index 95%\n\
+                     rename from src/old.rs\n\
+                     rename to src/renamed.rs\n\
+                     --- a/src/old.rs\n\
+                     +++ b/src/renamed.rs\n\
+                     @@ -1,2 +1,3 @@\n\
+                      context\n\
+                     +added\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/renamed.rs");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_multiple_files_and_hunks() {
+        let diff = "diff --git a/a.rs b/a.rs\n\
+                     --- a/a.rs\n\
+                     +++ b/a.rs\n\
+                     @@ -1,2 +1,2 @@\n\
+                      x\n\
+                     @@ -20,1 +20,1 @@\n\
+                      y\n\
+                     diff --git a/b.rs b/b.rs\n\
+                     --- a/b.rs\n\
+                     +++ b/b.rs\n\
+                     @@ -5 +5 @@\n\
+                      z\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.rs");
+        assert_eq!(files[0].hunks, vec![(1, 2), (20, 20)]);
+        assert_eq!(files[1].path, "b.rs");
+        assert_eq!(files[1].hunks, vec![(5, 5)]);
     }
 }

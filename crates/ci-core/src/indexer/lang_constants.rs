@@ -76,15 +76,30 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
     }
 }
 
-/// Map a file extension to a tier-0 language id, or `None` if unsupported.
+/// Map a file extension to a language id.
+/// Returns a tier-0 language (full parse + call-graph) for the six main
+/// languages, and a tier-0.5 language id (shallow symbol-only extraction)
+/// for additional common languages. Returns `None` for unknown extensions.
 pub fn language_for_extension(ext: &str) -> Option<&'static str> {
     match ext {
+        // Tier-0: full parse + resolver + call-graph
         "py" => Some("python"),
         "rs" => Some("rust"),
         "go" => Some("go"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
         "ts" | "tsx" => Some("typescript"),
         "java" => Some("java"),
+
+        // Tier-0.5: lightweight line-scan symbol extraction only
+        "c" => Some("c"),
+        "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" => Some("cpp"),
+        "cs" => Some("csharp"),
+        "rb" => Some("ruby"),
+        "sh" | "bash" => Some("shell"),
+        "kt" | "kts" => Some("kotlin"),
+        "swift" => Some("swift"),
+        "php" => Some("php"),
+
         _ => None,
     }
 }

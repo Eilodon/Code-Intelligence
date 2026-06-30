@@ -9,7 +9,7 @@ use crate::indexer::edges::{
 use crate::indexer::lang_constants::language_for_extension;
 use crate::indexer::parser::{
     ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
-    extract_symbols_from_tree, extract_type_map_from_tree, parse_tree,
+    extract_symbols_from_tree, extract_symbols_shallow, extract_type_map_from_tree, parse_tree,
 };
 
 /// Built-in directories never descended into during a project scan.
@@ -198,11 +198,15 @@ fn extract_file_data(
     formal: &crate::resolver::formal::FormalResolver,
 ) -> ExtractedFile {
     let Some(tree) = parse_tree(source, lang) else {
+        // Tier-0.5: no tree-sitter grammar for this language — extract symbols
+        // via lightweight line-scan (no calls, no imports, no resolver tiers).
+        let symbols = extract_symbols_shallow(source, lang, rel);
+        let symbol_count = symbols.len();
         return ExtractedFile {
-            symbols: Vec::new(),
+            symbols,
             import_edges: Vec::new(),
             call_sites: Vec::new(),
-            symbol_count: 0,
+            symbol_count,
         };
     };
 

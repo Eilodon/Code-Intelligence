@@ -576,6 +576,420 @@ fn binding_names_and_type(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Tier-0.5: lightweight regex/heuristic symbol extraction for languages that
+// have no tree-sitter grammar registered in this build. Returns function and
+// class-like names from a line-by-line scan. No call-site or import extraction
+// — callers supply empty Vecs for those and skip resolver tiers entirely.
+// ---------------------------------------------------------------------------
+
+/// Leading identifier in `s` (alpha or `_` start, alphanumeric + `_` body).
+fn ident_at_start(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Identifier immediately before the first `(` on a line.
+fn ident_before_paren(s: &str) -> Option<String> {
+    let before = s.split('(').next()?.trim_end();
+    let start = before
+        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let name = &before[start..];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Strip common visibility / storage modifier prefixes so the structural
+/// keyword (`class`, `func`, `def`, …) appears at position 0.
+fn strip_modifiers<'a>(s: &'a str, language: &str) -> &'a str {
+    let modifiers: &[&str] = match language {
+        "csharp" => &[
+            "public ",
+            "private ",
+            "protected ",
+            "internal ",
+            "static ",
+            "abstract ",
+            "virtual ",
+            "override ",
+            "sealed ",
+            "async ",
+            "partial ",
+            "readonly ",
+            "new ",
+            "extern ",
+            "unsafe ",
+            "volatile ",
+        ],
+        "kotlin" => &[
+            "public ",
+            "private ",
+            "protected ",
+            "internal ",
+            "open ",
+            "abstract ",
+            "final ",
+            "override ",
+            "data ",
+            "inline ",
+            "suspend ",
+            "companion ",
+            "tailrec ",
+            "operator ",
+            "infix ",
+            "external ",
+        ],
+        "swift" => &[
+            "public ",
+            "private ",
+            "internal ",
+            "fileprivate ",
+            "open ",
+            "static ",
+            "override ",
+            "mutating ",
+            "nonmutating ",
+            "lazy ",
+            "final ",
+            "required ",
+            "convenience ",
+            "dynamic ",
+            "optional ",
+        ],
+        "php" => &[
+            "public ",
+            "private ",
+            "protected ",
+            "static ",
+            "abstract ",
+            "final ",
+        ],
+        "cpp" | "c" => &[
+            "static ",
+            "inline ",
+            "virtual ",
+            "explicit ",
+            "constexpr ",
+            "const ",
+            "extern ",
+            "volatile ",
+            "friend ",
+            "override ",
+            "final ",
+            "noexcept ",
+        ],
+        _ => &[],
+    };
+    let mut s = s;
+    loop {
+        let prev = s;
+        for &m in modifiers {
+            s = s.strip_prefix(m).unwrap_or(s);
+        }
+        if s == prev {
+            break;
+        }
+    }
+    s.trim_start()
+}
+
+const C_SKIP: &[&str] = &[
+    "if",
+    "while",
+    "for",
+    "switch",
+    "return",
+    "else",
+    "do",
+    "assert",
+    "static_assert",
+    "sizeof",
+    "decltype",
+    "typeof",
+    "alignof",
+    "new",
+    "delete",
+    "throw",
+    "catch",
+    "using",
+    "typedef",
+    "case",
+    "default",
+];
+
+fn detect_c_cpp(s: &str) -> Option<(String, SymbolKind)> {
+    // Struct/class/namespace/union/enum
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("struct ", SymbolKind::Struct),
+        ("namespace ", SymbolKind::Type),
+        ("union ", SymbolKind::Struct),
+        ("enum class ", SymbolKind::Enum),
+        ("enum ", SymbolKind::Enum),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    // Function: has `(`, first word is not a control-flow keyword,
+    // no `=` / `<<` to the left of `(` (would be a call in an expression).
+    if !s.contains('(') {
+        return None;
+    }
+    let first_word = s
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    if C_SKIP.contains(&first_word) {
+        return None;
+    }
+    let before_paren = s.split('(').next().unwrap_or("");
+    if before_paren.contains('=') || before_paren.contains('<') {
+        return None;
+    }
+    let name = ident_before_paren(s)?;
+    if C_SKIP.contains(&name.as_str()) {
+        return None;
+    }
+    Some((name, SymbolKind::Function))
+}
+
+fn detect_csharp(s: &str) -> Option<(String, SymbolKind)> {
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("interface ", SymbolKind::Interface),
+        ("struct ", SymbolKind::Struct),
+        ("enum ", SymbolKind::Enum),
+        ("record class ", SymbolKind::Class),
+        ("record struct ", SymbolKind::Struct),
+        ("record ", SymbolKind::Class),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    // Method: `ReturnType Name(` — must have a type then an ident before `(`
+    if s.contains('(') {
+        let before = s.split('(').next().unwrap_or("").trim_end();
+        // There must be a space (separating return type from name)
+        if before.contains(' ') {
+            let name = ident_before_paren(s)?;
+            // Skip known non-method keywords
+            if !matches!(
+                name.as_str(),
+                "if" | "while"
+                    | "for"
+                    | "switch"
+                    | "foreach"
+                    | "using"
+                    | "return"
+                    | "catch"
+                    | "throw"
+                    | "new"
+                    | "base"
+                    | "this"
+            ) {
+                return Some((name, SymbolKind::Function));
+            }
+        }
+    }
+    None
+}
+
+fn detect_ruby(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("def ") {
+        // `def name` or `def self.name` or `def ClassName.name`
+        let name_part = rest.trim_start();
+        let name = if let Some(after_dot) = name_part.find('.') {
+            ident_at_start(&name_part[after_dot + 1..])
+        } else {
+            ident_at_start(name_part)
+        }?;
+        return Some((name, SymbolKind::Function));
+    }
+    for kw in &["class ", "module "] {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, SymbolKind::Class));
+        }
+    }
+    None
+}
+
+fn detect_shell(s: &str) -> Option<(String, SymbolKind)> {
+    // `function name` or `function name()` or `name()` at line start
+    if let Some(rest) = s.strip_prefix("function ") {
+        let name = ident_at_start(rest.trim_start())?;
+        return Some((name, SymbolKind::Function));
+    }
+    // `name() {` or `name () {`
+    if let Some(paren_pos) = s.find('(') {
+        let before = s[..paren_pos].trim_end();
+        if !before.contains(' ') && !before.is_empty() {
+            let name = ident_at_start(before)?;
+            return Some((name, SymbolKind::Function));
+        }
+    }
+    None
+}
+
+fn detect_kotlin(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("fun ") {
+        let name = ident_at_start(rest.trim_start())?;
+        return Some((name, SymbolKind::Function));
+    }
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("object ", SymbolKind::Class),
+        ("interface ", SymbolKind::Interface),
+        ("enum class ", SymbolKind::Enum),
+        ("sealed class ", SymbolKind::Class),
+        ("sealed interface ", SymbolKind::Interface),
+        ("annotation class ", SymbolKind::Class),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
+
+fn detect_swift(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("func ") {
+        let name = ident_at_start(rest.trim_start())?;
+        return Some((name, SymbolKind::Function));
+    }
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("struct ", SymbolKind::Struct),
+        ("enum ", SymbolKind::Enum),
+        ("protocol ", SymbolKind::Interface),
+        ("extension ", SymbolKind::Impl),
+        ("actor ", SymbolKind::Class),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
+
+fn detect_php(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("function ") {
+        // `function &name(` — strip leading `&`
+        let rest = rest.trim_start().trim_start_matches('&');
+        let name = ident_at_start(rest)?;
+        return Some((name, SymbolKind::Function));
+    }
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("interface ", SymbolKind::Interface),
+        ("trait ", SymbolKind::Trait),
+        ("enum ", SymbolKind::Enum),
+        ("abstract class ", SymbolKind::Class),
+        ("final class ", SymbolKind::Class),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
+
+fn is_comment_line(trimmed: &str, language: &str) -> bool {
+    match language {
+        "ruby" | "shell" | "bash" | "php" => {
+            trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with('*')
+        }
+        _ => {
+            trimmed.starts_with("//")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('#')
+        }
+    }
+}
+
+fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
+    let s = strip_modifiers(trimmed, language);
+    match language {
+        "c" | "cpp" => detect_c_cpp(s),
+        "csharp" => detect_csharp(s),
+        "ruby" => detect_ruby(s),
+        "shell" | "bash" => detect_shell(s),
+        "kotlin" => detect_kotlin(s),
+        "swift" => detect_swift(s),
+        "php" => detect_php(s),
+        _ => None,
+    }
+}
+
+/// Lightweight line-scan symbol extraction for Tier-0.5 languages (those
+/// without a tree-sitter grammar registered in `parse_tree`). Returns function
+/// and class-like names with path-qualified names and FTS-ready tokens.
+/// No call-site or import extraction — callers skip resolver tiers entirely.
+pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<ParsedSymbol> {
+    let mut out: Vec<ParsedSymbol> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_comment_line(trimmed, language) {
+            continue;
+        }
+        let Some((name, kind)) = detect_shallow(trimmed, language) else {
+            continue;
+        };
+        let mut qn = format!("{}::{}", path, name);
+        if !seen.insert(qn.clone()) {
+            qn = format!("{}#{}", qn, idx + 1);
+            seen.insert(qn.clone());
+        }
+        out.push(ParsedSymbol {
+            qualified_name: qn,
+            name: name.clone(),
+            kind,
+            language: language.to_string(),
+            path: path.to_string(),
+            line_start: idx + 1,
+            line_end: idx + 1,
+            signature: trimmed.chars().take(120).collect(),
+            docstring: String::new(),
+            name_tokens: tokenize_identifier(&name),
+            is_entry_point: false,
+            class_context: None,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +1219,97 @@ public class Main {
         let code = "function main() {}\n";
         let symbols = extract_symbols(code, "typescript", "index.ts").unwrap();
         assert!(find(&symbols, "main").is_entry_point);
+    }
+
+    // ---------------------------------------------------------------
+    // Tier-0.5 shallow extraction tests
+    // ---------------------------------------------------------------
+
+    fn shallow_names(syms: &[ParsedSymbol]) -> Vec<&str> {
+        syms.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_shallow_cpp() {
+        let code = "class Foo {\nstruct Bar {};\nvoid init() {}\nint compute(int x) { return x; }\nif (true) {}\n";
+        let syms = extract_symbols_shallow(code, "cpp", "a.cpp");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Foo"), "should detect class");
+        assert!(names.contains(&"Bar"), "should detect struct");
+        assert!(names.contains(&"init"), "should detect function");
+        assert!(names.contains(&"compute"), "should detect function with args");
+        assert!(!names.contains(&"if"), "should skip control flow");
+    }
+
+    #[test]
+    fn test_shallow_csharp() {
+        let code = "public class MyService {\npublic async Task<string> GetData(int id) {}\nenum Status { Active }\npublic interface IRepo {}\n";
+        let syms = extract_symbols_shallow(code, "csharp", "a.cs");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"MyService"), "should detect class");
+        assert!(names.contains(&"GetData"), "should detect method");
+        assert!(names.contains(&"Status"), "should detect enum");
+        assert!(names.contains(&"IRepo"), "should detect interface");
+    }
+
+    #[test]
+    fn test_shallow_ruby() {
+        let code = "class Animal\ndef speak\nend\nmodule Concerns\n";
+        let syms = extract_symbols_shallow(code, "ruby", "a.rb");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Animal"), "should detect class");
+        assert!(names.contains(&"speak"), "should detect def");
+        assert!(names.contains(&"Concerns"), "should detect module");
+    }
+
+    #[test]
+    fn test_shallow_kotlin() {
+        let code = "data class User(val name: String)\nfun greet(user: User) {}\ninterface Repository {}\n";
+        let syms = extract_symbols_shallow(code, "kotlin", "a.kt");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"User"), "should detect data class");
+        assert!(names.contains(&"greet"), "should detect fun");
+        assert!(names.contains(&"Repository"), "should detect interface");
+    }
+
+    #[test]
+    fn test_shallow_swift() {
+        let code = "public class ViewModel {}\nfunc fetchData() {}\nstruct Config {}\nprotocol Updatable {}\n";
+        let syms = extract_symbols_shallow(code, "swift", "a.swift");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"ViewModel"), "should detect class");
+        assert!(names.contains(&"fetchData"), "should detect func");
+        assert!(names.contains(&"Config"), "should detect struct");
+        assert!(names.contains(&"Updatable"), "should detect protocol");
+    }
+
+    #[test]
+    fn test_shallow_shell() {
+        let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
+        let syms = extract_symbols_shallow(code, "shell", "a.sh");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"setup"), "should detect function keyword style");
+        assert!(names.contains(&"build"), "should detect paren style");
+    }
+
+    #[test]
+    fn test_shallow_php() {
+        let code = "<?php\nclass Controller {}\nfunction handle($req) {}\ninterface Handler {}\ntrait Logging {}\n";
+        let syms = extract_symbols_shallow(code, "php", "a.php");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Controller"), "should detect class");
+        assert!(names.contains(&"handle"), "should detect function");
+        assert!(names.contains(&"Handler"), "should detect interface");
+        assert!(names.contains(&"Logging"), "should detect trait");
+    }
+
+    #[test]
+    fn test_shallow_qualified_name_dedup() {
+        // Two Ruby methods with the same name: second gets line suffix.
+        let code = "def run\ndef run\n";
+        let syms = extract_symbols_shallow(code, "ruby", "a.rb");
+        assert_eq!(syms.len(), 2);
+        assert!(syms[0].qualified_name.starts_with("a.rb::run"));
+        assert_ne!(syms[0].qualified_name, syms[1].qualified_name);
     }
 }

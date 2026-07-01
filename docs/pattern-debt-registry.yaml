@@ -52,3 +52,52 @@ items:
     current_control: "Explicit regression test"
     remaining: []
     owner_hint: testing
+
+  DEBT-005-formal-python-builtins-unresolved:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-01"
+    description: >
+      FormalResolver (formal.rs) không resolve được Python builtins (len, print,
+      range...). Root cause: src/builtins.py bundled trong
+      tree-sitter-stack-graphs-python 0.3.0 rỗng, và stack-graphs.tsg push symbol
+      "<builtins>" mà không có source builtins nào tận dụng đúng cơ chế per-file
+      module-path để pop lại nó. Fix: build_python_builtins_graph() tự build
+      StackGraph cho một PYTHON_BUILTINS_STUB (~70 builtin phổ biến) bằng đúng
+      `sgl` upstream, với FILE_PATH="<builtins>.py" — path này khớp regex
+      "([^/]+)\.py$" của chính stack-graphs.tsg, tự nhiên tạo ra node
+      pop_symbol="<builtins>" gắn thẳng vào ROOT_NODE. KHÔNG cần vá/fork TSG rule
+      nào — chỉ cần gọi đúng API public (build_stack_graph_into) với nội dung và
+      FILE_PATH phù hợp. Verified bằng test thật (test_resolve_file_resolves_
+      python_builtins) + smoke test CLI thật (index file dùng len/print/enumerate/
+      isinstance/sorted → call_sites.confidence='formal' cho cả 5).
+    current_control: "build_python_builtins_graph() trong formal.rs; 2 regression test (resolves builtins + vẫn từ chối tên thật sự undefined)"
+    remaining:
+      - "GIỚI HẠN ĐÃ BIẾT: call_sites.confidence='formal' cho builtin KHÔNG tạo ra call_edges row — rebuild_graph() (pipeline.rs) lọc theo tên khớp symbols đã index trong project, độc lập với confidence, nên builtin (không phải project symbol) không bao giờ có call_edges dù tier nào. Nghĩa là callers/path/CallerCountByConfidence chưa thấy được thay đổi này — chỉ đúng ở tầng lưu trữ call_sites, sẵn sàng cho consumer tương lai."
+      - "Nếu muốn builtin hiển thị qua tool: cần thiết kế riêng (builtin thành pseudo-symbol?) — rủi ro thật: len/print sẽ có caller_count khổng lồ khắp mọi codebase Python, có thể làm lệch hub_count/coreness. Cố ý chưa làm, cần bàn kỹ trước khi động vào."
+    owner_hint: ci-core/resolver
+
+  DEBT-006-ty-subprocess-premise-invalid:
+    status: open
+    urgency: low
+    description: >
+      B3 (nhóm B, static-fidelity) đề xuất resolver/ty_bridge.rs spawn `ty check
+      --output-format json` để thêm tier EdgeConfidence::TypeChecked xếp trên
+      Formal. POC thực tế 2026-07-01 (cài ty 0.0.55 thật, chạy trực tiếp — không
+      đoán từ doc) phát hiện premise sai ở 2 điểm: (1) `--output-format json`
+      không tồn tại, chỉ có full/concise/gitlab/github/junit — gitlab là JSON
+      dùng được nhưng là schema GitLab Code Quality, không phải ty-native; (2)
+      quan trọng hơn — ty CHỈ xuất diagnostic khi KHÔNG resolve được
+      (`unresolved-reference`/`unresolved-import`), hoàn toàn im lặng với call
+      resolve được. Không giống stack-graphs (FormalEdge{reference_symbol,
+      definition_symbol} — xác nhận DƯƠNG TÍNH). Không có dữ liệu "resolved to
+      X" để nâng tier trên Formal. Thêm nữa: thiếu pyproject.toml/project
+      context khiến ty báo unresolved-import sai cho import nội bộ hợp lệ cùng
+      thư mục — nếu wire naive sẽ hạ sai edge resolved/formal đang đúng thành
+      nghi ngờ.
+    current_control: "Không code gì thêm cho B3 dạng subprocess-tier; giữ nguyên 4 tier hiện có"
+    remaining:
+      - "Đánh giá lại: ty (hoặc pyright/jedi) dùng làm health signal riêng (has_type_error trên symbol) thay vì EdgeConfidence tier — tận dụng đúng loại dữ liệu (âm tính) ty thật sự cung cấp"
+      - "Nếu muốn dữ liệu dương tính thật (goto-definition) phải qua LSP (ty server/pyright-langserver), không phải subprocess một lần — chi phí kỹ thuật khác hẳn, cần đánh giá riêng"
+      - "So sánh giá trị/chi phí với DEBT-005 (fix builtins pop rule) — cùng ngân sách kỹ thuật, builtins fix cải thiện tier formal đã có sẵn, phủ mọi file Python (len/print/range dùng khắp nơi)"
+    owner_hint: ci-core/resolver

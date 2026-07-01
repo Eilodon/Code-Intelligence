@@ -13,6 +13,7 @@ use crate::indexer::parser::{
     ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
     extract_symbols_from_tree, extract_symbols_shallow, extract_type_map_from_tree, parse_tree,
 };
+use crate::types::EdgeConfidence;
 
 /// Built-in directories never descended into during a project scan.
 /// These are always ignored regardless of user config.
@@ -306,30 +307,28 @@ fn extract_file_data(
     let mut call_sites = Vec::with_capacity(calls.len());
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
-            let mut confidence = resolver
-                .resolve_tier1(&c.callee, &ctx, &aliases)
-                .confidence
-                .to_string();
+            let mut confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
             let mut target_class: Option<String> = None;
-            if confidence == "textual"
+            if confidence == EdgeConfidence::Textual
                 && let Some(receiver) = &c.receiver
                 && let Some(cls) =
                     resolver.resolve_tier2(receiver, &ctx, c.enclosing_class.as_deref())
             {
-                confidence = "inferred".to_string();
+                confidence = EdgeConfidence::Inferred;
                 target_class = Some(cls);
             }
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
             // Tier-3: StackGraph confirmed this callee has a definition in scope.
             // Upgrades "textual" and "inferred" but not "resolved" (already correct).
-            if confidence != "resolved" && formally_resolved.contains(callee.as_str()) {
-                confidence = "formal".to_string();
+            if confidence != EdgeConfidence::Resolved && formally_resolved.contains(callee.as_str())
+            {
+                confidence = EdgeConfidence::Formal;
             }
             call_sites.push(CallSiteData {
                 enclosing_qn: enc_qn.clone(),
                 callee,
                 line: c.line as i64,
-                confidence,
+                confidence: confidence.as_str().to_string(),
                 receiver: c.receiver.clone(),
                 target_class,
             });

@@ -47,6 +47,20 @@ impl EdgeConfidence {
             Self::Textual => 0,
         }
     }
+
+    /// Inverse of `as_str` — parses a DB-stored `edge_confidence` value back
+    /// into the typed enum. `None` on an unrecognized string (defensive;
+    /// every writer goes through `as_str`, so this should never happen on
+    /// data this codebase produced itself).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "formal" => Some(Self::Formal),
+            "resolved" => Some(Self::Resolved),
+            "inferred" => Some(Self::Inferred),
+            "textual" => Some(Self::Textual),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,5 +161,35 @@ impl SymbolKind {
             Self::Trait => "trait",
             Self::Impl => "impl",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_edge_confidence_parse_roundtrips_with_as_str() {
+        for ec in [
+            EdgeConfidence::Formal,
+            EdgeConfidence::Resolved,
+            EdgeConfidence::Inferred,
+            EdgeConfidence::Textual,
+        ] {
+            assert_eq!(EdgeConfidence::parse(ec.as_str()), Some(ec));
+        }
+    }
+
+    #[test]
+    fn test_edge_confidence_parse_rejects_unknown() {
+        assert_eq!(EdgeConfidence::parse("bogus"), None);
+        assert_eq!(EdgeConfidence::parse(""), None);
+    }
+
+    #[test]
+    fn test_edge_confidence_rank_orders_formal_highest() {
+        assert!(EdgeConfidence::Formal.rank() > EdgeConfidence::Resolved.rank());
+        assert!(EdgeConfidence::Resolved.rank() > EdgeConfidence::Inferred.rank());
+        assert!(EdgeConfidence::Inferred.rank() > EdgeConfidence::Textual.rank());
     }
 }

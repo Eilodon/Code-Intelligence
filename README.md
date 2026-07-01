@@ -20,7 +20,11 @@ tính graph metrics (coreness/hubs), và phục vụ qua SQLite FTS5 + semantic 
 2. **Call graph phân cấp** — mỗi edge mang một mức tin cậy:
    - `resolved` — khớp file symbol / import / alias (tier-1, conservative resolver).
    - `inferred` — method call phân giải theo kiểu của receiver (tier-2: `self`/`this` → class bao quanh; biến typed → `type_map`).
-   - `formal` — phân giải phạm vi tĩnh qua `stack-graphs` (tier-3, hiện hỗ trợ Python). Được bảo vệ bởi **hai deadline độc lập**: một cho bước build stack-graph (TSG) và một cho bước path-stitching, cộng thêm cap `MAX_WORK_PER_PHASE = 4096` để chống DoS.
+   - `formal` — phân giải phạm vi tĩnh qua `stack-graphs` (tier-3, hiện hỗ trợ Python). Được bảo vệ bởi **hai deadline độc lập**: một cho bước build stack-graph (TSG) và một cho bước path-stitching, cộng thêm cap `MAX_WORK_PER_PHASE = 4096` để chống DoS. Python builtins (`len`, `print`, `range`...) resolve qua tier này nhờ `build_python_builtins_graph` tự build (bundled `src/builtins.py` của `tree-sitter-stack-graphs-python` 0.3.0 rỗng, không dùng được trực tiếp).
+     > **Lưu ý**: builtin call hiện được gắn đúng `edge_confidence: formal` ở tầng lưu trữ nội bộ
+     > (`call_sites`), nhưng **chưa hiển thị qua `callers`/`path`/`caller_count_by_confidence`** —
+     > các tool đó chỉ đọc `call_edges`, vốn chỉ chứa cạnh giữa 2 symbol đã index trong project;
+     > builtin không phải project symbol nên không tạo `call_edges` dù ở tier nào.
    - `textual` — chỉ khớp tên (fallback).
 3. **Import graph** — `import_edges` (file→module/file) cho tool `dependencies`.
 4. **Graph metrics** — `coreness` (k-core, O(V+E)) và `is_hub` để AI biết đâu là lõi hệ thống.

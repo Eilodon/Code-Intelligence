@@ -855,6 +855,7 @@ struct SymbolInfoOutput {
 
 #[derive(Serialize, JsonSchema)]
 struct CallerCountByConfidence {
+    formal: i64,
     resolved: i64,
     inferred: i64,
     textual: i64,
@@ -891,6 +892,7 @@ fn build_health(
     );
 
     let caller_count_by_confidence = if edges_ready {
+        let mut formal = 0i64;
         let mut resolved = 0i64;
         let mut inferred = 0i64;
         let mut textual = 0i64;
@@ -902,16 +904,25 @@ fn build_health(
                 .query_map([&c.qualified_name], |row| {
                     let conf: String = row.get(0)?;
                     let cnt: i64 = row.get(1)?;
-                    match conf.as_str() {
-                        "resolved" => resolved += cnt,
-                        "inferred" => inferred += cnt,
-                        _ => textual += cnt,
+                    // Exhaustive match on the typed enum (not the raw string) so
+                    // a future EdgeConfidence variant fails to compile here
+                    // instead of silently miscounting into the wrong bucket —
+                    // which is exactly what happened to `formal` before this
+                    // fix (it fell into the `_` catch-all as `textual`).
+                    if let Some(ec) = ci_core::types::EdgeConfidence::parse(&conf) {
+                        match ec {
+                            ci_core::types::EdgeConfidence::Formal => formal += cnt,
+                            ci_core::types::EdgeConfidence::Resolved => resolved += cnt,
+                            ci_core::types::EdgeConfidence::Inferred => inferred += cnt,
+                            ci_core::types::EdgeConfidence::Textual => textual += cnt,
+                        }
                     }
                     Ok(())
                 })
                 .map(|rows| rows.for_each(|_| {}));
         }
         Some(CallerCountByConfidence {
+            formal,
             resolved,
             inferred,
             textual,
@@ -1293,6 +1304,11 @@ struct PathOutput {
 // Tool 10: edit_context
 // ---------------------------------------------------------------------------
 
+/// Lookback window for the `trend` field — chosen to match typical daily CI
+/// cadence (one `ci fitness-check` snapshot/day) while staying short enough
+/// to reflect recent activity rather than all-time drift.
+const EDIT_CONTEXT_TREND_LOOKBACK_DAYS: i64 = 7;
+
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct EditContextParams {
@@ -1307,6 +1323,28 @@ struct BlastRadiusInfo {
     files_affected: Vec<String>,
 }
 
+/// How much `caller_count`/`coreness`/`is_hub` moved since the oldest snapshot
+/// still at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS` old — see
+/// `ci_core::fitness::compute_trend`.
+#[derive(Serialize, JsonSchema)]
+struct TrendOutput {
+    compared_to: String,
+    caller_count_delta: i64,
+    coreness_delta: i64,
+    is_hub_changed: bool,
+}
+
+impl From<ci_core::fitness::TrendInfo> for TrendOutput {
+    fn from(t: ci_core::fitness::TrendInfo) -> Self {
+        Self {
+            compared_to: t.compared_to,
+            caller_count_delta: t.caller_count_delta,
+            coreness_delta: t.coreness_delta,
+            is_hub_changed: t.is_hub_changed,
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 struct EditContextOutput {
     symbol: String,
@@ -1317,6 +1355,10 @@ struct EditContextOutput {
     blast_radius: BlastRadiusInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     risk_assessment: Option<String>,
+    /// Absent when there's no snapshot yet at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS`
+    /// old (e.g. `ci fitness-check` hasn't run for that long) — not an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trend: Option<TrendOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -2384,6 +2426,15 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 Some("low".into())
             };
 
+            let trend = ci_core::fitness::compute_trend(
+                &conn,
+                &c.qualified_name,
+                EDIT_CONTEXT_TREND_LOOKBACK_DAYS,
+            )
+            .ok()
+            .flatten()
+            .map(TrendOutput::from);
+
             serde_json::to_string_pretty(&EditContextOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
@@ -2392,6 +2443,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 callees,
                 blast_radius,
                 risk_assessment: risk,
+                trend,
                 suggested_next: self.filter_sn(suggested(
                     "diff_impact",
                     "MANDATORY after changes — verify blast radius",
@@ -3115,6 +3167,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// B1 regression: `caller_count_by_confidence` used to have no `formal`
+    /// bucket, so a `formal`-tier call_edges row fell into the `_ => textual`
+    /// catch-all and was silently miscounted. Every tier must land in its own
+    /// bucket now that the match is exhaustive over `EdgeConfidence`.
+    #[test]
+    fn symbol_info_caller_count_by_confidence_buckets_formal_tier_separately() {
+        let dir = std::env::temp_dir().join(format!("ci_health_conf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.target', 'target', 'function', 'python', 'mod.py', 1, 1, '', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for (from, confidence) in [
+                ("mod.a", "formal"),
+                ("mod.b", "resolved"),
+                ("mod.c", "inferred"),
+                ("mod.d", "textual"),
+            ] {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES (?1, 'mod.target', ?2)",
+                    rusqlite::params![from, confidence],
+                )
+                .unwrap();
+            }
+        }
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "target".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let by_conf = &v["health"]["caller_count_by_confidence"];
+
+        assert_eq!(
+            by_conf["formal"], 1,
+            "formal caller must not miscount as textual, got: {by_conf}"
+        );
+        assert_eq!(by_conf["resolved"], 1);
+        assert_eq!(by_conf["inferred"], 1);
+        assert_eq!(by_conf["textual"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn diff_impact_raw_diff_maps_to_affected_symbols_and_reviewers() {
         let dir = std::env::temp_dir().join(format!("ci_diff_impact_{}", std::process::id()));
@@ -3382,6 +3486,80 @@ mod tests {
         );
         assert_eq!(v["index_freshness"], "scanning");
         assert_eq!(v["edges_ready"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A1: `edit_context` must omit `trend` entirely (not emit `null`) when
+    /// `symbol_metrics_history` has no snapshot old enough yet.
+    #[test]
+    fn edit_context_omits_trend_when_no_snapshot_history() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_notrend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.a', 'a', 'function', 'rust', 'src/a.rs', 1, 1, '', '', 'a', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.edit_context(Parameters(EditContextParams {
+            symbol: "a".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(
+            v.get("trend").is_none(),
+            "trend must be absent (not null) with no snapshot history, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A1: `edit_context` surfaces `trend` (caller/coreness/hub delta) against
+    /// the oldest `symbol_metrics_history` snapshot that is at least
+    /// `EDIT_CONTEXT_TREND_LOOKBACK_DAYS` old.
+    #[test]
+    fn edit_context_includes_trend_when_snapshot_exists() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_trend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, coreness, is_hub, is_entry_point)
+                 VALUES ('mod.a', 'a', 'function', 'rust', 'src/a.rs', 1, 1, '', '', 'a', 8, 6, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // Fixed far-past snapshot (well outside the 7-day lookback) with
+            // lower caller_count/coreness and is_hub=0 — must be the baseline.
+            conn.execute(
+                "INSERT INTO symbol_metrics_history (qualified_name, snapshot_at, caller_count, coreness, is_hub)
+                 VALUES ('mod.a', '2000-01-01', 3, 2, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.edit_context(Parameters(EditContextParams {
+            symbol: "a".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["trend"]["compared_to"], "2000-01-01");
+        assert_eq!(v["trend"]["caller_count_delta"], 5); // 8 - 3
+        assert_eq!(v["trend"]["coreness_delta"], 4); // 6 - 2
+        assert_eq!(v["trend"]["is_hub_changed"], true); // 0 -> 1
 
         let _ = std::fs::remove_dir_all(&dir);
     }

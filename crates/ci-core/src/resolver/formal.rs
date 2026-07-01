@@ -55,6 +55,111 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// before the deadline check below ever gets a chance to fire.
 const MAX_WORK_PER_PHASE: usize = 4096;
 
+/// Synthetic source for a virtual "<builtins>.py" file, standing in for
+/// `tree-sitter-stack-graphs-python` 0.3.0's own bundled `src/builtins.py`
+/// (which ships empty — see DEBT-005 / the regression test below for the
+/// original investigation). Bodies are `pass` — only the *names* need to
+/// exist as top-level definitions for references to resolve to; nothing
+/// calls into these bodies. Not exhaustive, but covers the builtins that
+/// show up in real code by a wide margin.
+const PYTHON_BUILTINS_STUB: &str = r#"
+def print(*args, **kwargs): pass
+def len(obj): pass
+def range(*args): pass
+def isinstance(obj, cls): pass
+def issubclass(cls, classinfo): pass
+def super(*args): pass
+def open(*args, **kwargs): pass
+def enumerate(iterable, start=0): pass
+def zip(*iterables): pass
+def map(func, *iterables): pass
+def filter(func, iterable): pass
+def sorted(iterable, *, key=None, reverse=False): pass
+def reversed(seq): pass
+def min(*args, **kwargs): pass
+def max(*args, **kwargs): pass
+def sum(iterable, start=0): pass
+def abs(x): pass
+def round(number, ndigits=None): pass
+def all(iterable): pass
+def any(iterable): pass
+def iter(obj, *args): pass
+def next(iterator, *args): pass
+def hasattr(obj, name): pass
+def getattr(obj, name, *args): pass
+def setattr(obj, name, value): pass
+def delattr(obj, name): pass
+def callable(obj): pass
+def repr(obj): pass
+def format(value, spec=""): pass
+def id(obj): pass
+def hash(obj): pass
+def vars(*args): pass
+def dir(*args): pass
+def input(*args): pass
+def staticmethod(func): pass
+def classmethod(func): pass
+def property(*args): pass
+
+class object: pass
+class type: pass
+class str: pass
+class int: pass
+class float: pass
+class bool: pass
+class complex: pass
+class list: pass
+class dict: pass
+class set: pass
+class frozenset: pass
+class tuple: pass
+class bytes: pass
+class bytearray: pass
+
+class BaseException: pass
+class Exception: pass
+class ValueError: pass
+class TypeError: pass
+class KeyError: pass
+class IndexError: pass
+class AttributeError: pass
+class StopIteration: pass
+class RuntimeError: pass
+class NotImplementedError: pass
+class ZeroDivisionError: pass
+class NameError: pass
+class ImportError: pass
+class OSError: pass
+class FileNotFoundError: pass
+class KeyboardInterrupt: pass
+"#;
+
+/// Builds a `StackGraph` holding definitions for `PYTHON_BUILTINS_STUB`,
+/// reusing the *same* compiled TSG rules (`sgl`) the upstream crate uses for
+/// ordinary files — no grammar patch needed. The FILE_PATH `"<builtins>.py"`
+/// is the load-bearing part: the grammar's per-file module-path rule (the
+/// branch that turns a file's relative path into a `pop_symbol` chain
+/// anchored at ROOT_NODE) turns this exact path into a single
+/// `pop_symbol = "<builtins>"` node hanging directly off ROOT_NODE — which is
+/// precisely the counterpart every file's `push_symbol = "<builtins>"`
+/// fallback edge (the one stack-graphs.tsg wires up for any reference that
+/// falls through local scope) was missing.
+fn build_python_builtins_graph(sgl: &StackGraphLanguage) -> anyhow::Result<StackGraph> {
+    let mut graph = StackGraph::new();
+    let file = graph.get_or_create_file("<builtins>.py");
+
+    let mut globals = Variables::new();
+    globals
+        .add("FILE_PATH".into(), "<builtins>.py".into())
+        .map_err(|_| anyhow::anyhow!("Failed to set FILE_PATH global for builtins"))?;
+
+    let deadline = TsgCancelAfterDuration::new(RESOLVE_TIMEOUT);
+    sgl.build_stack_graph_into(&mut graph, file, PYTHON_BUILTINS_STUB, &globals, &deadline)
+        .map_err(|e| anyhow::anyhow!("Failed to build Python builtins stack graph: {e:?}"))?;
+
+    Ok(graph)
+}
+
 /// Same as `ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file`
 /// (stack-graphs 0.14), but with `max_work_per_phase` bounded — see
 /// `MAX_WORK_PER_PHASE` for why.
@@ -150,11 +255,16 @@ impl FormalResolver {
     pub fn load_python(&mut self) -> anyhow::Result<()> {
         let lc = tree_sitter_stack_graphs_python::try_language_configuration(cancellation_flag())
             .map_err(|e| anyhow::anyhow!("Failed to load Python stack-graphs config: {e}"))?;
+        // Upstream's own `lc.builtins` is built from its bundled (empty)
+        // src/builtins.py — replace it with our own, built through the same
+        // `sgl` rules. See `build_python_builtins_graph` for why this alone
+        // is enough to make builtins resolve, with no grammar patch.
+        let builtins = build_python_builtins_graph(&lc.sgl)?;
         self.configs.insert(
             "python".to_string(),
             FormalLanguageConfig {
                 sgl: lc.sgl,
-                builtins: lc.builtins,
+                builtins,
                 no_similar_paths_in_file: lc.no_similar_paths_in_file,
             },
         );
@@ -354,18 +464,10 @@ def bar():
     /// unnoticed since it was never touched.
     ///
     /// NOTE on scope: this only verifies the merge happens correctly (file
-    /// count grows, no `add_from_graph` error). It deliberately does NOT
-    /// assert that a Python builtin like `len()` resolves end-to-end —
-    /// investigating that surfaced two independent upstream gaps in the
-    /// pinned `tree-sitter-stack-graphs-python` 0.3.0: (1) its bundled
-    /// `src/builtins.py` is empty (`include_str!` yields 0 bytes), and (2)
-    /// even with a synthetic non-empty builtins file built through the same
-    /// real `sgl` rules, `stack-graphs.tsg`'s `global -> ROOT_NODE` edge
-    /// pushes the symbol `"<builtins>"` but no node anywhere in that grammar
-    /// pops `"<builtins>"` — the binding is a dead end at the grammar level,
-    /// not something this merge can route around. Fixing that needs a newer/
-    /// different `tree-sitter-stack-graphs-python` version or a project-
-    /// authored builtins.py + matching tsg rule, both out of scope here.
+    /// count grows, no `add_from_graph` error) — DEBT-005 covers the actual
+    /// builtin *resolution* (see `test_resolve_file_resolves_python_builtins`
+    /// below), since `config.builtins` here is now `ci`'s own
+    /// `build_python_builtins_graph` output, not upstream's empty one.
     #[test]
     fn test_resolve_file_merges_builtins_without_error() {
         let mut resolver = FormalResolver::new();
@@ -378,7 +480,7 @@ def bar():
         // would pass vacuously.
         assert!(
             builtins_file_count > 0,
-            "builtins graph should contain at least the <builtins> file, even though its source is empty"
+            "builtins graph should contain at least the <builtins> file"
         );
 
         let mut graph = StackGraph::new();
@@ -398,6 +500,60 @@ def bar():
         assert!(
             edges.iter().any(|e| e.definition_symbol == "foo"),
             "same-file resolution must still work after merging builtins. Edges: {edges:?}"
+        );
+    }
+
+    /// DEBT-005: `len()` and `print()` must resolve to the synthetic
+    /// `build_python_builtins_graph` definitions through the `formal` tier —
+    /// the actual fix, not just "the merge doesn't crash" (see
+    /// `test_resolve_file_merges_builtins_without_error` above).
+    #[test]
+    fn test_resolve_file_resolves_python_builtins() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_python().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "python",
+                "test.py",
+                "def use_builtins():\n    print(len([1, 2, 3]))\n",
+            )
+            .unwrap();
+
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "len" && e.definition_symbol == "len"),
+            "len() must resolve through the formal tier. Edges: {edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "print" && e.definition_symbol == "print"),
+            "print() must resolve through the formal tier. Edges: {edges:?}"
+        );
+    }
+
+    /// A genuinely undefined name must still fail to resolve — the builtins
+    /// fix must not make FormalResolver resolve *everything*.
+    #[test]
+    fn test_resolve_file_does_not_resolve_undefined_name() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_python().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "python",
+                "test.py",
+                "def use_undefined():\n    return totally_undefined_xyz()\n",
+            )
+            .unwrap();
+
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.reference_symbol == "totally_undefined_xyz"),
+            "a genuinely undefined name must not resolve. Edges: {edges:?}"
         );
     }
 

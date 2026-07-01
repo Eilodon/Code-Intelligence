@@ -4,9 +4,11 @@ pub mod lang_constants;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::types::EdgeConfidence;
+
 #[derive(Debug, Clone)]
 pub struct ResolveResult {
-    pub confidence: &'static str,
+    pub confidence: EdgeConfidence,
     pub resolved_path: Option<String>,
 }
 

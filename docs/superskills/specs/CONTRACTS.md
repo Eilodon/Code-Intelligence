@@ -376,7 +376,7 @@ INVARIANT: args keys phải match target tool's input schema — no unknown keys
 Health :: {
   dead_code_confidence      :: Ref<DeadCodeConfidence>          // xem Glossary: Dead Code Confidence
   dead_code_source          :: Ref<DeadCodeSource>              // MANDATORY khi Health present — "static" | "static+coverage"
-  caller_count_by_confidence :: Map<string, int>?               // {"resolved": N, "inferred": N, "textual": N} — null khi edges_ready: false
+  caller_count_by_confidence :: Map<string, int>?               // {"formal": N, "resolved": N, "inferred": N, "textual": N} — null khi edges_ready: false
   test_files                :: List<string>                     // Test files that reference this symbol — [] khi none found
 }
 ```

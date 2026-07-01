@@ -4,6 +4,7 @@ use tree_sitter::Node;
 
 use super::lang_constants::assignment_nodes;
 use super::{FileContext, ResolveResult};
+use crate::types::EdgeConfidence;
 
 pub struct ConservativeResolver {
     assignment_node_types: HashMap<&'static str, &'static [&'static str]>,
@@ -65,24 +66,24 @@ impl ConservativeResolver {
     ) -> ResolveResult {
         if ctx.file_symbols.contains(callee_name) {
             return ResolveResult {
-                confidence: "resolved",
+                confidence: EdgeConfidence::Resolved,
                 resolved_path: None,
             };
         }
         if let Some(path) = ctx.import_map.get(callee_name) {
             return ResolveResult {
-                confidence: "resolved",
+                confidence: EdgeConfidence::Resolved,
                 resolved_path: Some(path.clone()),
             };
         }
         if let Some(alias_target) = alias_map.get(callee_name) {
             return ResolveResult {
-                confidence: "resolved",
+                confidence: EdgeConfidence::Resolved,
                 resolved_path: ctx.import_map.get(alias_target).cloned(),
             };
         }
         ResolveResult {
-            confidence: "textual",
+            confidence: EdgeConfidence::Textual,
             resolved_path: None,
         }
     }
@@ -299,7 +300,7 @@ mod tests {
         let ctx = make_ctx(&["my_func"], &[]);
         let alias_map = HashMap::new();
         let result = resolver.resolve_tier1("my_func", &ctx, &alias_map);
-        assert_eq!(result.confidence, "resolved");
+        assert_eq!(result.confidence, EdgeConfidence::Resolved);
         assert!(result.resolved_path.is_none());
     }
 
@@ -309,7 +310,7 @@ mod tests {
         let ctx = make_ctx(&[], &[("requests", "requests")]);
         let alias_map = HashMap::new();
         let result = resolver.resolve_tier1("requests", &ctx, &alias_map);
-        assert_eq!(result.confidence, "resolved");
+        assert_eq!(result.confidence, EdgeConfidence::Resolved);
         assert_eq!(result.resolved_path, Some("requests".to_string()));
     }
 
@@ -320,7 +321,7 @@ mod tests {
         let mut alias_map = HashMap::new();
         alias_map.insert("alias".to_string(), "original".to_string());
         let result = resolver.resolve_tier1("alias", &ctx, &alias_map);
-        assert_eq!(result.confidence, "resolved");
+        assert_eq!(result.confidence, EdgeConfidence::Resolved);
         assert_eq!(result.resolved_path, Some("mod.original".to_string()));
     }
 
@@ -330,7 +331,7 @@ mod tests {
         let ctx = make_ctx(&[], &[]);
         let alias_map = HashMap::new();
         let result = resolver.resolve_tier1("unknown_func", &ctx, &alias_map);
-        assert_eq!(result.confidence, "textual");
+        assert_eq!(result.confidence, EdgeConfidence::Textual);
         assert!(result.resolved_path.is_none());
     }
 
@@ -399,7 +400,7 @@ mod tests {
         let ctx = make_ctx(&["name"], &[("name", "external.name")]);
         let alias_map = HashMap::new();
         let result = resolver.resolve_tier1("name", &ctx, &alias_map);
-        assert_eq!(result.confidence, "resolved");
+        assert_eq!(result.confidence, EdgeConfidence::Resolved);
         assert!(
             result.resolved_path.is_none(),
             "File symbol match takes priority — no resolved_path"

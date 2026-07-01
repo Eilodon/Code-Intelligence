@@ -855,6 +855,7 @@ struct SymbolInfoOutput {
 
 #[derive(Serialize, JsonSchema)]
 struct CallerCountByConfidence {
+    formal: i64,
     resolved: i64,
     inferred: i64,
     textual: i64,
@@ -891,6 +892,7 @@ fn build_health(
     );
 
     let caller_count_by_confidence = if edges_ready {
+        let mut formal = 0i64;
         let mut resolved = 0i64;
         let mut inferred = 0i64;
         let mut textual = 0i64;
@@ -902,16 +904,25 @@ fn build_health(
                 .query_map([&c.qualified_name], |row| {
                     let conf: String = row.get(0)?;
                     let cnt: i64 = row.get(1)?;
-                    match conf.as_str() {
-                        "resolved" => resolved += cnt,
-                        "inferred" => inferred += cnt,
-                        _ => textual += cnt,
+                    // Exhaustive match on the typed enum (not the raw string) so
+                    // a future EdgeConfidence variant fails to compile here
+                    // instead of silently miscounting into the wrong bucket —
+                    // which is exactly what happened to `formal` before this
+                    // fix (it fell into the `_` catch-all as `textual`).
+                    if let Some(ec) = ci_core::types::EdgeConfidence::parse(&conf) {
+                        match ec {
+                            ci_core::types::EdgeConfidence::Formal => formal += cnt,
+                            ci_core::types::EdgeConfidence::Resolved => resolved += cnt,
+                            ci_core::types::EdgeConfidence::Inferred => inferred += cnt,
+                            ci_core::types::EdgeConfidence::Textual => textual += cnt,
+                        }
                     }
                     Ok(())
                 })
                 .map(|rows| rows.for_each(|_| {}));
         }
         Some(CallerCountByConfidence {
+            formal,
             resolved,
             inferred,
             textual,
@@ -3152,6 +3163,58 @@ mod tests {
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
         assert_eq!(server.phase_str(), "ready");
         assert!(server.edges_ready());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1 regression: `caller_count_by_confidence` used to have no `formal`
+    /// bucket, so a `formal`-tier call_edges row fell into the `_ => textual`
+    /// catch-all and was silently miscounted. Every tier must land in its own
+    /// bucket now that the match is exhaustive over `EdgeConfidence`.
+    #[test]
+    fn symbol_info_caller_count_by_confidence_buckets_formal_tier_separately() {
+        let dir = std::env::temp_dir().join(format!("ci_health_conf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.target', 'target', 'function', 'python', 'mod.py', 1, 1, '', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for (from, confidence) in [
+                ("mod.a", "formal"),
+                ("mod.b", "resolved"),
+                ("mod.c", "inferred"),
+                ("mod.d", "textual"),
+            ] {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES (?1, 'mod.target', ?2)",
+                    rusqlite::params![from, confidence],
+                )
+                .unwrap();
+            }
+        }
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "target".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let by_conf = &v["health"]["caller_count_by_confidence"];
+
+        assert_eq!(
+            by_conf["formal"], 1,
+            "formal caller must not miscount as textual, got: {by_conf}"
+        );
+        assert_eq!(by_conf["resolved"], 1);
+        assert_eq!(by_conf["inferred"], 1);
+        assert_eq!(by_conf["textual"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

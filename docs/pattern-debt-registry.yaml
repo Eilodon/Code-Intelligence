@@ -54,24 +54,27 @@ items:
     owner_hint: testing
 
   DEBT-005-formal-python-builtins-unresolved:
-    status: open
-    urgency: low
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-01"
     description: >
       FormalResolver (formal.rs) không resolve được Python builtins (len, print,
-      range...). Root cause đã điều tra trong test_resolve_file_merges_builtins_
-      without_error (formal.rs): src/builtins.py bundled trong
+      range...). Root cause: src/builtins.py bundled trong
       tree-sitter-stack-graphs-python 0.3.0 rỗng, và stack-graphs.tsg push symbol
-      "<builtins>" nhưng không rule nào pop lại — dead-end ở tầng grammar upstream,
-      không sửa được từ phía merge builtins graph. Verified 2026-07-01: 0.3.0 vẫn
-      là bản mới nhất (12/2024), repo github/stack-graphs đã bị archive 9/2025 nên
-      sẽ không có upstream fix. Không ảnh hưởng correctness — reference gọi
-      builtin fall back về resolved/textual tier bình thường, chỉ mất confidence
-      tier cao nhất.
-    current_control: "README caveat dưới bullet formal tier; fallback resolver vẫn hoạt động"
+      "<builtins>" mà không có source builtins nào tận dụng đúng cơ chế per-file
+      module-path để pop lại nó. Fix: build_python_builtins_graph() tự build
+      StackGraph cho một PYTHON_BUILTINS_STUB (~70 builtin phổ biến) bằng đúng
+      `sgl` upstream, với FILE_PATH="<builtins>.py" — path này khớp regex
+      "([^/]+)\.py$" của chính stack-graphs.tsg, tự nhiên tạo ra node
+      pop_symbol="<builtins>" gắn thẳng vào ROOT_NODE. KHÔNG cần vá/fork TSG rule
+      nào — chỉ cần gọi đúng API public (build_stack_graph_into) với nội dung và
+      FILE_PATH phù hợp. Verified bằng test thật (test_resolve_file_resolves_
+      python_builtins) + smoke test CLI thật (index file dùng len/print/enumerate/
+      isinstance/sorted → call_sites.confidence='formal' cho cả 5).
+    current_control: "build_python_builtins_graph() trong formal.rs; 2 regression test (resolves builtins + vẫn từ chối tên thật sự undefined)"
     remaining:
-      - "Xác nhận tree_sitter_stack_graphs::StackGraphLanguage::from_str + tsg_source() đủ để tự vá TSG rule (pop \"<builtins>\") mà không cần fork toàn crate"
-      - "Tự viết builtins.py (định nghĩa len/print/range/...) + override rule TSG bù chỗ thiếu pop \"<builtins>\""
-      - "Regression test: len()/print() resolve tới definition_symbol qua formal tier, không chỉ textual"
+      - "GIỚI HẠN ĐÃ BIẾT: call_sites.confidence='formal' cho builtin KHÔNG tạo ra call_edges row — rebuild_graph() (pipeline.rs) lọc theo tên khớp symbols đã index trong project, độc lập với confidence, nên builtin (không phải project symbol) không bao giờ có call_edges dù tier nào. Nghĩa là callers/path/CallerCountByConfidence chưa thấy được thay đổi này — chỉ đúng ở tầng lưu trữ call_sites, sẵn sàng cho consumer tương lai."
+      - "Nếu muốn builtin hiển thị qua tool: cần thiết kế riêng (builtin thành pseudo-symbol?) — rủi ro thật: len/print sẽ có caller_count khổng lồ khắp mọi codebase Python, có thể làm lệch hub_count/coreness. Cố ý chưa làm, cần bàn kỹ trước khi động vào."
     owner_hint: ci-core/resolver
 
   DEBT-006-ty-subprocess-premise-invalid:

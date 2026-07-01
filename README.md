@@ -22,11 +22,13 @@ này ảnh hưởng bao nhiêu file?", "hàm này có phải hub không?" — th
 # 1. Build binary
 cargo build --release -p ci-cli
 
-# 2. Khởi tạo index cho project
+# 2. Khởi tạo config cho project
 ci init  --project-root .
+
+# 3. Build index (bao gồm cả semantic embeddings nếu enabled trong config.json)
 ci index --project-root .
 
-# 3. Chạy MCP server (stdio)
+# 4. Chạy MCP server (stdio) — tự incremental reindex nếu đã có index
 ci serve --project-root .
 ```
 
@@ -43,6 +45,9 @@ Tích hợp vào MCP client (ví dụ Claude Code) qua `.mcp.json`:
   }
 }
 ```
+
+> **Lưu ý**: `ci serve` tự động thêm `.codeindex/` vào `.gitignore` khi khởi động để tránh
+> commit DB vào repo.
 
 ## Ví dụ sử dụng (agent workflow)
 
@@ -61,46 +66,55 @@ agent: "tôi cần sửa hàm getUserByEmail"
 
 ## Tính năng chính
 
-- **AST indexing** — 6 ngôn ngữ tier-0 (Python, TypeScript, JavaScript, Java, Rust, Go) với AST đầy
-  đủ; 8 ngôn ngữ tier-0.5 (C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell) quét nông qua feature flags.
+- **AST indexing — 6 ngôn ngữ Tier-0** (Python, TypeScript, JavaScript, Java, Rust, Go): parse đầy
+  đủ bằng tree-sitter, dựng call graph + import graph, áp resolver đa cấp.
+- **Shallow indexing — 8 ngôn ngữ Tier-0.5** (C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell): trích
+  xuất symbol bằng line-scan regex; không có call-graph hay import resolution — built-in, không cần
+  feature flag.
 - **Call graph có độ tin cậy** — mỗi edge được gắn nhãn `resolved` / `inferred` / `formal` /
-  `textual` tuỳ vào mức độ chắc chắn khi resolve, giúp agent biết khi nào nên tin và khi nào nên
-  double-check thủ công.
+  `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python.
 - **Import graph** — file-level dependency graph cho tool `dependencies`.
 - **Graph metrics** — `coreness` (k-core) và `is_hub` để nhận diện symbol trung tâm trước khi sửa.
-- **Incremental watcher** — chỉ re-parse file thay đổi (hash-diff), rebuild call graph tăng dần;
-  song song hoá bằng `rayon`. `ci serve` tự động incremental reindex khi có index cũ.
+- **Incremental watcher** — chỉ re-parse file thay đổi (FNV-1a hash-diff), rebuild call graph tăng
+  dần; parallel hoá bằng `rayon`. `ci serve` tự động chọn incremental reindex khi đã có index cũ.
 - **Full-text + semantic search** — FTS5 (BM25) kết hợp semantic embeddings (`model2vec-rs`,
-  pure-Rust, không cần ONNX) qua Reciprocal Rank Fusion — tìm được cả khi câu query không trùng tên
-  symbol, chỉ trùng ý nghĩa/idiom trong thân hàm.
+  pure-Rust, không cần ONNX) qua Reciprocal Rank Fusion 3-way (FTS + symbol-identity vector +
+  code-body chunk vector) — tìm được cả khi câu query không trùng tên symbol.
 - **Index freshness minh bạch** — mọi response đều báo trạng thái index (`scanning → parsing →
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
+- **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
+  khởi động; kết hợp với static analysis cho `dead_code_confidence`.
 
 ## Cấu trúc Crates
 
-- `crates/ci-core/` — Index Engine: tree-sitter parser, SQLite schema, resolver đa cấp, graph
-  algorithms, FTS5/semantic search, analysis (hotspot/coverage/codeowners/diff_impact/dead_code).
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 16 tools + file watcher.
+- `crates/ci-core/` — Index Engine: tree-sitter parser, SQLite schema, resolver đa cấp (conservative
+  → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
+  symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
+  fitness metrics, gitignore management.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 16 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
 
 ```bash
-ci init     --project-root .   # tạo .codeindex/ + config.json
-ci index    --project-root .   # one-shot index (Scanning → Parsing → BuildingEdges → Ready)
-ci serve    --project-root .   # MCP server qua stdio + incremental reindex + watcher
-ci serve    --project-root /project --db-path /data/index.db   # tách DB khỏi project root (container)
-ci doctor   --project-root .   # kiểm tra config, DB, tree-sitter, git
-ci fitness-check --project-root .                            # CI gate, exit 1 nếu fail
-ci fitness-check --project-root . --json                     # output JSON
-ci fitness-check --project-root . --config thresholds.toml   # thresholds tùy chỉnh
+ci init     --project-root .    # tạo .codeindex/config.json với defaults
+ci index    --project-root .    # one-shot full index (Scanning → Parsing → BuildingEdges → Ready)
+                                # tự embed symbols+chunks nếu semantic_search.enabled=true
+ci serve    --project-root .    # MCP server qua stdio + incremental reindex + file watcher
+ci serve    --project-root /project --db-path /data/index.db   # tách DB (container deployment)
+ci serve    --project-root . --preset orient   # chỉ đăng ký tools của phase orient
+ci doctor   --project-root .    # kiểm tra config, DB (symbols/files/metrics history), git
+ci fitness-check --project-root .                             # CI gate, exit 1 nếu fail
+ci fitness-check --project-root . --json                      # output JSON
+ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
 ## 16 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
-(mặc định) qua `ci serve --preset`. Mọi response đều kèm `suggested_next` để hướng dẫn bước tiếp
-theo — xem chi tiết từng tool và workflow đầy đủ trong [AGENTS.md](AGENTS.md).
+(mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
+`suggested_next` để hướng dẫn bước tiếp theo — xem chi tiết từng tool và workflow đầy đủ trong
+[AGENTS.md](AGENTS.md).
 
 | Nhóm | Tools |
 |---|---|
@@ -124,21 +138,27 @@ theo — xem chi tiết từng tool và workflow đầy đủ trong [AGENTS.md](
 | `hotspot_risk` | Hotspot score cao nhất trong codebase | ≤ 0.75 |
 | `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
 
+Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
+trend (delta so với ngày trước).
+
 ## Deployment
 
-- `cargo build --release` → binary tĩnh musl (x86_64/aarch64 linux, aarch64 macOS) qua
-  `.github/workflows/release.yml`.
-- `Containerfile` multi-stage (`rust:alpine` → `scratch`), image ~10.8MB.
-- `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`).
+- `cargo build --release` → binary tĩnh musl qua `.github/workflows/release.yml`, matrix:
+  `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`.
+- `Containerfile` multi-stage (`rust:alpine` → `scratch`), image ~10MB.
+- `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
+  `mem_limit: 256m`).
 
 ## Testing
 
 ```bash
-cargo test --workspace                        # mặc định
-cargo test -p ci-core --features embeddings   # gồm semantic/vector path
+cargo test --workspace                        # unit + integration (mặc định)
+cargo test -p ci-core --features embeddings   # bao gồm semantic/vector path (vec0 KNN)
+cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 
-Property-based + spec-based + parity với golden JSON tĩnh (không cần Python runtime).
+Ba CI jobs chạy trên mọi PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus`
+(formal resolver parity), `embeddings` (clippy + test với feature `embeddings`).
 
 ## Tài liệu kỹ thuật sâu
 

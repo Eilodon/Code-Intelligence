@@ -73,3 +73,28 @@ items:
       - "Tự viết builtins.py (định nghĩa len/print/range/...) + override rule TSG bù chỗ thiếu pop \"<builtins>\""
       - "Regression test: len()/print() resolve tới definition_symbol qua formal tier, không chỉ textual"
     owner_hint: ci-core/resolver
+
+  DEBT-006-ty-subprocess-premise-invalid:
+    status: open
+    urgency: low
+    description: >
+      B3 (nhóm B, static-fidelity) đề xuất resolver/ty_bridge.rs spawn `ty check
+      --output-format json` để thêm tier EdgeConfidence::TypeChecked xếp trên
+      Formal. POC thực tế 2026-07-01 (cài ty 0.0.55 thật, chạy trực tiếp — không
+      đoán từ doc) phát hiện premise sai ở 2 điểm: (1) `--output-format json`
+      không tồn tại, chỉ có full/concise/gitlab/github/junit — gitlab là JSON
+      dùng được nhưng là schema GitLab Code Quality, không phải ty-native; (2)
+      quan trọng hơn — ty CHỈ xuất diagnostic khi KHÔNG resolve được
+      (`unresolved-reference`/`unresolved-import`), hoàn toàn im lặng với call
+      resolve được. Không giống stack-graphs (FormalEdge{reference_symbol,
+      definition_symbol} — xác nhận DƯƠNG TÍNH). Không có dữ liệu "resolved to
+      X" để nâng tier trên Formal. Thêm nữa: thiếu pyproject.toml/project
+      context khiến ty báo unresolved-import sai cho import nội bộ hợp lệ cùng
+      thư mục — nếu wire naive sẽ hạ sai edge resolved/formal đang đúng thành
+      nghi ngờ.
+    current_control: "Không code gì thêm cho B3 dạng subprocess-tier; giữ nguyên 4 tier hiện có"
+    remaining:
+      - "Đánh giá lại: ty (hoặc pyright/jedi) dùng làm health signal riêng (has_type_error trên symbol) thay vì EdgeConfidence tier — tận dụng đúng loại dữ liệu (âm tính) ty thật sự cung cấp"
+      - "Nếu muốn dữ liệu dương tính thật (goto-definition) phải qua LSP (ty server/pyright-langserver), không phải subprocess một lần — chi phí kỹ thuật khác hẳn, cần đánh giá riêng"
+      - "So sánh giá trị/chi phí với DEBT-005 (fix builtins pop rule) — cùng ngân sách kỹ thuật, builtins fix cải thiện tier formal đã có sẵn, phủ mọi file Python (len/print/range dùng khắp nơi)"
+    owner_hint: ci-core/resolver

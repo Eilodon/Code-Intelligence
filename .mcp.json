@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "hex-graph": {
+      "command": "hex-graph-mcp",
+      "args": [],
+      "env": {}
+    },
+    "hex-line": {
+      "command": "hex-line-mcp",
+      "args": [],
+      "env": {}
+    },
+    "semble": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "semble[mcp]", "semble"]
+    }
+  }
+}

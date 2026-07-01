@@ -168,6 +168,7 @@ mod tests {
             docstring: String::new(),
             name_tokens: name.to_string(),
             is_entry_point: false,
+            is_test: false,
             class_context: None,
         }
     }

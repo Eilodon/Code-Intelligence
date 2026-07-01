@@ -17,6 +17,13 @@ use crate::config::HotspotsConfig;
 #[serde(default)]
 pub struct FitnessThresholds {
     pub max_hub_count: i64,
+    /// Scale-invariant companion to `max_hub_count`: `is_hub` is assigned by
+    /// percentile (top N% by caller count, plus bridge-hubs via coreness),
+    /// so raw hub_count grows with codebase size regardless of real fan-in
+    /// concentration. `max_hub_pct` (of total symbols) stays meaningful as
+    /// the codebase grows; `max_hub_count` is kept for backward compat with
+    /// existing thresholds.toml files.
+    pub max_hub_pct: f64,
     pub max_avg_coreness: f64,
     pub max_dead_code_pct: f64,
     pub max_hotspot_risk: f64,
@@ -27,6 +34,7 @@ impl Default for FitnessThresholds {
     fn default() -> Self {
         Self {
             max_hub_count: 50,
+            max_hub_pct: 20.0,
             max_avg_coreness: 15.0,
             max_dead_code_pct: 10.0,
             max_hotspot_risk: 0.75,
@@ -59,6 +67,7 @@ pub fn load_thresholds(config_path: Option<&Path>) -> anyhow::Result<FitnessThre
 #[derive(Debug, Serialize)]
 pub struct FitnessMetrics {
     pub hub_count: i64,
+    pub hub_pct: f64,
     pub avg_coreness: f64,
     pub dead_code_pct: f64,
     pub hotspot_risk: f64,
@@ -66,8 +75,8 @@ pub struct FitnessMetrics {
 }
 
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
-/// (path, line_start, line_end, caller_count, is_entry_point, language, name, signature).
-type DeadCodeRow = (String, i64, i64, i64, bool, String, String, String);
+/// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature).
+type DeadCodeRow = (String, i64, i64, i64, bool, bool, String, String, String);
 
 pub fn collect_metrics(
     conn: &Connection,
@@ -108,7 +117,7 @@ pub fn collect_metrics(
     let dead_code_pct = if total_symbols > 0 {
         let mut stmt = conn.prepare(
             "SELECT path, line_start, line_end, COALESCE(caller_count, 0), is_entry_point, \
-             language, name, signature FROM symbols",
+             is_test, language, name, signature FROM symbols",
         )?;
         let rows: Vec<DeadCodeRow> = stmt
             .query_map([], |r| {
@@ -118,9 +127,10 @@ pub fn collect_metrics(
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)? != 0,
-                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(5)? != 0,
                     r.get::<_, String>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -129,7 +139,7 @@ pub fn collect_metrics(
         let high_confidence_dead = rows
             .iter()
             .filter(
-                |(path, line_start, line_end, caller_count, is_entry, lang, name, sig)| {
+                |(path, line_start, line_end, caller_count, is_entry, is_test, lang, name, sig)| {
                     let abs_path = normalize_path(&project_root.join(path));
                     let is_private = is_private_symbol(lang, name, sig);
                     let scope_clear = scope_clear_for_language(lang);
@@ -139,6 +149,7 @@ pub fn collect_metrics(
                         *line_end,
                         *caller_count,
                         *is_entry,
+                        *is_test,
                         is_private,
                         scope_clear,
                         coverage,
@@ -167,8 +178,15 @@ pub fn collect_metrics(
     .map(|h| h.hotspot_score)
     .unwrap_or(0.0);
 
+    let hub_pct = if total_symbols > 0 {
+        hub_count as f64 / total_symbols as f64 * 100.0
+    } else {
+        0.0
+    };
+
     Ok(FitnessMetrics {
         hub_count,
+        hub_pct,
         avg_coreness,
         dead_code_pct,
         hotspot_risk,
@@ -213,6 +231,17 @@ pub fn run_fitness_check(
         message: format!(
             "Hub count {} (max {})",
             metrics.hub_count, thresholds.max_hub_count
+        ),
+    });
+
+    checks.push(FitnessCheckItem {
+        metric: "hub_pct".into(),
+        value: metrics.hub_pct,
+        threshold: thresholds.max_hub_pct,
+        passed: metrics.hub_pct <= thresholds.max_hub_pct,
+        message: format!(
+            "Hub pct {:.1}% (max {:.1}%)",
+            metrics.hub_pct, thresholds.max_hub_pct
         ),
     });
 
@@ -478,7 +507,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 5);
+        assert_eq!(result.checks.len(), 6);
     }
 
     #[test]
@@ -512,6 +541,52 @@ mod tests {
             .unwrap();
         assert!(!check.passed);
         assert_eq!(check.value, 1.0);
+    }
+
+    /// DEBT-009 regression: `is_hub` is assigned by percentile, so a small
+    /// codebase where every symbol is a hub (100% hub_pct) still passes the
+    /// absolute `max_hub_count` gate (default 50) — but must fail the
+    /// scale-invariant `max_hub_pct` gate (default 20%), proving the new
+    /// metric catches concentration the absolute count cannot.
+    #[test]
+    fn test_hub_pct_fails_when_count_passes() {
+        let conn = test_conn();
+        let thresholds = FitnessThresholds::default();
+
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, is_hub, indexed_at) \
+             VALUES ('mod.foo', 'foo', 'function', 'python', 'mod.py', 1, 5, 1, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
+
+        let hub_count_check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "hub_count")
+            .unwrap();
+        assert!(hub_count_check.passed, "1 hub is well under max_hub_count");
+
+        let hub_pct_check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "hub_pct")
+            .unwrap();
+        assert!(
+            !hub_pct_check.passed,
+            "100% hub density must fail max_hub_pct"
+        );
+        assert_eq!(hub_pct_check.value, 100.0);
+        assert!(!result.passed);
     }
 
     #[test]

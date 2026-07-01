@@ -12,6 +12,12 @@ pub struct ParsedSymbol {
     pub docstring: String,
     pub name_tokens: String,
     pub is_entry_point: bool,
+    /// Best-effort "this is a test function" signal (rust `#[test]`/
+    /// `#[tokio::test]`, python `test_*` under a test path, go `Test*` with a
+    /// `*testing.T` param, java `@Test`). Used to exempt tests from dead-code
+    /// analysis — they have no in-repo callers by design, invoked externally
+    /// by the test harness just like `is_entry_point` symbols.
+    pub is_test: bool,
     /// Enclosing class/impl type name for methods (`None` for free functions).
     /// Drives tier-2 method resolution.
     pub class_context: Option<String>,
@@ -231,6 +237,7 @@ fn walk_symbols(
         };
 
         let is_entry_point = detect_entry_point(node, source, language, &name, &signature);
+        let is_test = detect_is_test(node, source, language, &name, &signature, path);
 
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
@@ -244,6 +251,7 @@ fn walk_symbols(
             docstring,
             name_tokens,
             is_entry_point,
+            is_test,
             class_context,
         });
     }
@@ -287,21 +295,28 @@ fn go_receiver_type(node: tree_sitter::Node, source: &str) -> Option<String> {
     None
 }
 
-/// Decorator/attribute sibling node kind that may precede a definition, per language.
-fn decorator_node_kind(language: &str) -> Option<&'static str> {
+/// Decorator/attribute sibling node kind(s) that may precede a definition, per
+/// language. Java needs two: `@Foo` parses as `marker_annotation`, `@Foo(...)`
+/// as `annotation`.
+fn decorator_node_kinds(language: &str) -> &'static [&'static str] {
     match language {
-        "python" => Some("decorator"),
-        "rust" => Some("attribute_item"),
-        _ => None,
+        "python" => &["decorator"],
+        "rust" => &["attribute_item"],
+        "java" => &["marker_annotation", "annotation"],
+        _ => &[],
     }
 }
 
 /// Source text of every decorator/attribute immediately preceding `node` (innermost first).
-fn collect_decorators<'a>(node: tree_sitter::Node, source: &'a str, kind: &str) -> Vec<&'a str> {
+fn collect_decorators<'a>(
+    node: tree_sitter::Node,
+    source: &'a str,
+    kinds: &[&str],
+) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut sib = node.prev_named_sibling();
     while let Some(s) = sib {
-        if s.kind() != kind {
+        if !kinds.contains(&s.kind()) {
             break;
         }
         out.push(source[s.byte_range()].trim());
@@ -319,9 +334,7 @@ fn detect_entry_point(
     name: &str,
     signature: &str,
 ) -> bool {
-    let decorators = decorator_node_kind(language)
-        .map(|k| collect_decorators(node, source, k))
-        .unwrap_or_default();
+    let decorators = collect_decorators(node, source, decorator_node_kinds(language));
 
     match language {
         "python" => {
@@ -359,6 +372,83 @@ fn detect_entry_point(
                                 .starts_with("export default")
                     })
                     .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Source text of every `annotation`/`marker_annotation` on `node`. Unlike
+/// Rust's `#[attr]` (a preceding sibling of the item), tree-sitter-java parses
+/// `@Foo` as a direct CHILD of the declaration node — either directly, or
+/// nested one level inside a `modifiers` child — so this walks children
+/// instead of `collect_decorators`'s prev-sibling walk.
+fn collect_java_annotations<'a>(node: tree_sitter::Node, source: &'a str) -> Vec<&'a str> {
+    fn is_annotation(kind: &str) -> bool {
+        kind == "annotation" || kind == "marker_annotation"
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_annotation(child.kind()) {
+            out.push(source[child.byte_range()].trim());
+        } else if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for grandchild in child.children(&mut mod_cursor) {
+                if is_annotation(grandchild.kind()) {
+                    out.push(source[grandchild.byte_range()].trim());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort "is this a test function" signal, per language. Feeds
+/// `is_test` on `ParsedSymbol` so dead-code analysis can exempt tests —
+/// they have no in-repo callers by design (invoked by the test harness),
+/// which otherwise makes every test function look like high-confidence
+/// dead code. Javascript/typescript are not covered: Jest/Mocha tests are
+/// anonymous callbacks passed to `it(`/`test(`, not named top-level symbols
+/// the extractor would see here.
+fn detect_is_test(
+    node: tree_sitter::Node,
+    source: &str,
+    language: &str,
+    name: &str,
+    signature: &str,
+    path: &str,
+) -> bool {
+    match language {
+        "rust" => {
+            let decorators = collect_decorators(node, source, decorator_node_kinds(language));
+            decorators.iter().any(|d| {
+                let inner = d.trim_start_matches("#[").trim_end_matches(']');
+                let attr_path = inner.split('(').next().unwrap_or(inner).trim();
+                attr_path == "test" || attr_path == "rstest" || attr_path.ends_with("::test")
+            })
+        }
+        "python" => {
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let test_path = file_name.starts_with("test_")
+                || file_name.ends_with("_test.py")
+                || path.contains("/tests/")
+                || path.contains("/test/");
+            name.starts_with("test_") && test_path
+        }
+        "go" => {
+            path.ends_with("_test.go")
+                && name.starts_with("Test")
+                && name.len() > 4
+                && name[4..5].chars().next().is_some_and(|c| c.is_uppercase())
+                && signature.contains("*testing.T")
+        }
+        "java" => {
+            let decorators = collect_java_annotations(node, source);
+            decorators.iter().any(|d| {
+                let inner = d.trim_start_matches('@');
+                let ann_path = inner.split('(').next().unwrap_or(inner).trim();
+                ann_path == "Test" || ann_path.ends_with(".Test")
+            })
         }
         _ => false,
     }
@@ -1019,6 +1109,7 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
             docstring: String::new(),
             name_tokens: tokenize_identifier(&name),
             is_entry_point: false,
+            is_test: false,
             class_context: None,
         });
     }
@@ -1254,6 +1345,81 @@ public class Main {
         let code = "function main() {}\n";
         let symbols = extract_symbols(code, "typescript", "index.ts").unwrap();
         assert!(find(&symbols, "main").is_entry_point);
+    }
+
+    // ---------------------------------------------------------------
+    // DEBT-008: is_test detection (dead-code false-positive fix)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_rust_is_test_attribute() {
+        let code = r#"
+#[test]
+fn test_addition() {}
+
+#[tokio::test]
+async fn test_async_thing() {}
+
+fn helper() {}
+"#;
+        let symbols = extract_symbols(code, "rust", "src/lib.rs").unwrap();
+        assert!(find(&symbols, "test_addition").is_test);
+        assert!(find(&symbols, "test_async_thing").is_test);
+        assert!(!find(&symbols, "helper").is_test);
+    }
+
+    #[test]
+    fn test_rust_is_test_does_not_flag_non_test_attributes() {
+        let code = "#[allow(dead_code)]\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "src/lib.rs").unwrap();
+        assert!(!find(&symbols, "helper").is_test);
+    }
+
+    #[test]
+    fn test_python_is_test_requires_name_and_path_convention() {
+        let code = "def test_login():\n    pass\n\ndef test_helper_for_prod():\n    pass\n";
+        // Under tests/: pytest convention -> is_test.
+        let symbols = extract_symbols(code, "python", "tests/test_auth.py").unwrap();
+        assert!(find(&symbols, "test_login").is_test);
+
+        // Same name prefix, but NOT under a test path/filename -> not flagged,
+        // avoiding false positives on prod helpers that happen to start with
+        // "test_" (e.g. a health-check `test_connection`).
+        let symbols2 = extract_symbols(code, "python", "app/handlers.py").unwrap();
+        assert!(!find(&symbols2, "test_helper_for_prod").is_test);
+    }
+
+    #[test]
+    fn test_go_is_test_function() {
+        let code =
+            "package p\nimport \"testing\"\nfunc TestFoo(t *testing.T) {}\nfunc Helper() {}\n";
+        let symbols = extract_symbols(code, "go", "foo_test.go").unwrap();
+        assert!(find(&symbols, "TestFoo").is_test);
+        assert!(!find(&symbols, "Helper").is_test);
+
+        // Same source, non-_test.go path -> not flagged (go test discovery
+        // itself requires the _test.go filename convention).
+        let symbols2 = extract_symbols(code, "go", "foo.go").unwrap();
+        assert!(!find(&symbols2, "TestFoo").is_test);
+    }
+
+    #[test]
+    fn test_java_is_test_annotation() {
+        let code = r#"
+public class FooTest {
+    @Test
+    public void testBar() {}
+
+    @org.junit.jupiter.api.Test
+    public void testBaz() {}
+
+    public void helper() {}
+}
+"#;
+        let symbols = extract_symbols(code, "java", "FooTest.java").unwrap();
+        assert!(find(&symbols, "testBar").is_test);
+        assert!(find(&symbols, "testBaz").is_test);
+        assert!(!find(&symbols, "helper").is_test);
     }
 
     // ---------------------------------------------------------------

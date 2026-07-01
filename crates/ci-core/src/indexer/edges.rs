@@ -20,8 +20,8 @@ pub struct ImportEdge {
 
 pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, is_entry_point, class_context)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, is_entry_point, class_context, is_test)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
     )?;
 
     for sym in symbols {
@@ -37,7 +37,8 @@ pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusql
             sym.docstring,
             sym.name_tokens,
             sym.is_entry_point as i32,
-            sym.class_context
+            sym.class_context,
+            sym.is_test as i32
         ])?;
     }
     Ok(())
@@ -128,6 +129,7 @@ mod tests {
             docstring: "".to_string(),
             name_tokens: "hello".to_string(),
             is_entry_point: false,
+            is_test: false,
             class_context: None,
         }];
         insert_symbols_batch(&tx, &symbols).unwrap();

@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_entry_point  INTEGER NOT NULL DEFAULT 0,
     file_hash       TEXT NOT NULL DEFAULT '',
     indexed_at      REAL NOT NULL DEFAULT 0,
-    class_context   TEXT
+    class_context   TEXT,
+    is_test         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
@@ -175,6 +176,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
     migrate_add_column(conn, "symbols", "class_context", "TEXT")?;
+    migrate_add_column(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
     migrate_add_column(conn, "file_index", "mtime", "REAL")?;
     // call_sites columns added after the table first shipped.
     migrate_add_column(

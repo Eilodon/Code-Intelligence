@@ -77,6 +77,101 @@ items:
       - "Nếu muốn builtin hiển thị qua tool: cần thiết kế riêng (builtin thành pseudo-symbol?) — rủi ro thật: len/print sẽ có caller_count khổng lồ khắp mọi codebase Python, có thể làm lệch hub_count/coreness. Cố ý chưa làm, cần bàn kỹ trước khi động vào."
     owner_hint: ci-core/resolver
 
+  DEBT-007-mcp-schema-empty-object:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-01"
+    description: >
+      Cả 14/16 tool handler trong ci-server/src/tools.rs dùng
+      `Parameters(p): Parameters<XxxParams>` KHÔNG có attribute marker
+      `#[tool(aggr)]` mà rmcp-macros 0.1.5 yêu cầu để phát sinh input_schema
+      thật. Hệ quả: MCP `tools/list` quảng cáo input_schema = EmptyObject
+      (không property nào) cho tất cả 14 tool có tham số. Xác nhận bằng JSON-RPC
+      stdio thật (tools/list dump) + root-cause trong rmcp-macros source
+      (tool_fn_item/ParamMarker, chỉ set ToolParams khi có attribute marker
+      trên chính argument, KHÔNG suy ra từ type Parameters<T>) + xác nhận độc
+      lập bởi 1 subagent judge riêng (không chia sẻ context). Runtime call
+      path (Parameters<T>::from_tool_call_context_part) vẫn deserialize đúng
+      field thật — nên bug CHỈ lộ ra ở tầng schema quảng cáo, không phải mọi
+      lời gọi. Đã tái hiện: gọi tools/call "search"/"path" với arguments={}
+      (hợp lệ theo schema quảng cáo) → lỗi -32602 "missing field `query`"/
+      "missing field `from_symbol`". Một MCP client tổng quát (không đọc được
+      Rust source) sẽ không biết field nào cần truyền cho 14/16 tool.
+    current_control: >
+      Fix: đổi cả 14 handler từ `Parameters(p): Parameters<XxxParams>` sang
+      `#[tool(aggr)] p: XxxParams` (bỏ hẳn wrapper `Parameters<T>` khỏi chữ ký
+      — đúng pattern README của chính rmcp, KHÔNG chỉ thêm attribute lên
+      binding cũ, vì cách đó tạo double-wrap `Parameters<Parameters<T>>` chạy
+      được nhờ serde transparent nhưng cẩu thả và không khớp API upstream).
+      Test regression `all_tool_schemas_expose_real_properties` gọi thẳng
+      `{tool}_tool_attr()` (API test chuẩn của rmcp, xác nhận qua
+      rmcp-0.1.5/tests/test_complex_schema.rs) và assert mọi field thật xuất
+      hiện trong input_schema.properties, cho cả 14 tool.
+    remaining: []
+    owner_hint: ci-server
+
+  DEBT-008-dead-code-test-fn-false-positive:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-01"
+    description: >
+      compute_dead_code_confidence / is_private_symbol (ci-core/src/analysis/
+      dead_code.rs) không loại trừ test function. Xác nhận bằng query trực
+      tiếp trên DB index của chính repo này: 191/698 symbol (27%) là hàm
+      Rust `test_*`, tất cả non-pub + caller_count=0 + không phải entry point
+      → bị chấm "high confidence dead code". Riêng blind spot này chiếm phần
+      lớn kết quả dead_code_pct=48.9% mà `ci fitness-check` báo fail (dead
+      code thật, loại nhiễu test, ước tính chỉ còn ~21%). Khả năng cao cùng
+      gap áp dụng cho quy ước test ở ngôn ngữ khác (pytest test_*, Go Test*,
+      JUnit @Test) vì không ngôn ngữ nào được đặc cách.
+    current_control: >
+      Fix: thêm `is_test: bool` vào ParsedSymbol (parser.rs), cột DB
+      `symbols.is_test` (migration), detect_is_test() theo ngôn ngữ — rust:
+      attribute #[test]/#[tokio::test]/#[rstest] (collect_decorators,
+      prev-sibling); python: name test_* + path dưới tests/ hoặc
+      test_*.py/*_test.py; go: name Test* + path *_test.go + signature chứa
+      "*testing.T"; java: @Test/@org.junit...Test — nhưng phải đọc CHILDREN
+      của node (annotation/marker_annotation nằm trong method_declaration
+      hoặc modifiers, KHÔNG phải preceding sibling như Rust/Python — bug thật
+      bắt được ngay khi viết test, cần collect_java_annotations riêng, không
+      dùng chung collect_decorators). is_test short-circuit trong
+      compute_dead_code_confidence giống is_entry_point. js/ts CHƯA cover
+      (Jest/Mocha test là callback ẩn danh trong it(/test(, không phải named
+      top-level symbol) — ghi rõ trong doc-comment, không giả vờ đã xong.
+      Verified thật trên chính repo: dead_code_pct 48.9% → 11.1% sau khi
+      re-index (ci fitness-check --json thật, không phải ước tính).
+    remaining:
+      - "js/ts: không có tín hiệu test-function tĩnh đáng tin cậy (Jest/Mocha dùng callback trong it()/test(), không phải symbol top-level) — vẫn có thể còn dead_code_pct false-positive nhỏ cho JS/TS test files, chưa cover"
+      - "Có thể re-baseline max_dead_code_pct sau khi có nhiều dữ liệu thật hơn — 11.1% hiện đã rất gần ngưỡng 10%, nhưng đây là tín hiệu thật (không còn nhiễu test), không cần đổi threshold ngay"
+    owner_hint: ci-core/analysis
+
+  DEBT-009-hub-count-absolute-threshold-vs-percentile:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-01"
+    description: >
+      fitness-check dùng max_hub_count=50 (absolute count) để gate is_hub,
+      nhưng update_is_hub_flags (graph/hub.rs) phân loại hub theo percentile
+      (top_pct=5% theo caller_count, HOẶC bridge-hub khi coreness>=p75) —
+      một classifier tương đối. hub_count vì vậy tỉ lệ thuận gần đúng với
+      tổng số symbol đủ điều kiện (caller_count>=1 OR coreness>0), nên
+      threshold tuyệt đối sẽ luôn fail khi codebase đủ lớn (~300-350+ symbol
+      đủ điều kiện) bất kể mức độ tập trung fan-in thật sự có xấu hay không.
+    current_control: >
+      Fix: thêm metric `hub_pct` (hub_count / total_symbols * 100) +
+      threshold `max_hub_pct` (default 20.0%) song song với max_hub_count
+      hiện có (giữ nguyên, không breaking change — #[serde(default)] ở struct
+      level nên thresholds.toml cũ vẫn load được bình thường, field mới tự
+      lấy default). Test regression `test_hub_pct_fails_when_count_passes`
+      dựng đúng ca thật: 1 symbol is_hub=1/1 total → pass max_hub_count
+      (1<=50) nhưng fail max_hub_pct (100%>20%), chứng minh metric mới bắt
+      được điều absolute count bỏ lọt. Verified thật trên chính repo: hub_pct
+      = 14.2% (pass ngưỡng 20%) qua `ci fitness-check --json`, trong khi
+      hub_count=101 vẫn fail max_hub_count=50 như cũ (không đổi hành vi cũ,
+      chỉ bổ sung tín hiệu scale-invariant).
+    remaining: []
+    owner_hint: ci-core/fitness
+
   DEBT-006-ty-subprocess-premise-invalid:
     status: open
     urgency: low

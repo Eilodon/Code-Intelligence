@@ -31,11 +31,12 @@ pub fn compute_dead_code_confidence(
     line_end: i64,
     caller_count: i64,
     is_entry_point: bool,
+    is_test: bool,
     is_private: bool,
     scope_clear: bool,
     coverage: &CoverageData,
 ) -> (&'static str, &'static str) {
-    if is_entry_point || caller_count > 0 {
+    if is_entry_point || is_test || caller_count > 0 {
         let source = if coverage.source != "none" {
             "static+coverage"
         } else {
@@ -89,16 +90,54 @@ mod tests {
 
     #[test]
     fn test_entry_point_always_none() {
-        let (conf, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, true, false, false, &no_coverage());
+        let (conf, src) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            0,
+            true,
+            false,
+            false,
+            false,
+            &no_coverage(),
+        );
         assert_eq!(conf, "none");
         assert_eq!(src, "static");
     }
 
     #[test]
     fn test_has_callers_always_none() {
-        let (conf, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 3, false, false, false, &no_coverage());
+        let (conf, src) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            3,
+            false,
+            false,
+            false,
+            false,
+            &no_coverage(),
+        );
+        assert_eq!(conf, "none");
+        assert_eq!(src, "static");
+    }
+
+    /// DEBT-008 regression: a `#[test]`/`test_*` symbol has no in-repo callers
+    /// by design (invoked by the test harness) — it must never be flagged as
+    /// dead code just because `is_private` + zero callers happen to hold too.
+    #[test]
+    fn test_is_test_always_none_even_when_private_and_zero_callers() {
+        let (conf, src) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            0,
+            false,
+            true,
+            true,
+            true,
+            &no_coverage(),
+        );
         assert_eq!(conf, "none");
         assert_eq!(src, "static");
     }
@@ -107,40 +146,77 @@ mod tests {
     fn test_runtime_covered_returns_low() {
         let cov = with_coverage("/f.py", &[5]);
         let (conf, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, false, false, false, &cov);
+            compute_dead_code_confidence("/f.py", 1, 10, 0, false, false, false, false, &cov);
         assert_eq!(conf, "low");
         assert_eq!(src, "static+coverage");
     }
 
     #[test]
     fn test_private_no_callers_returns_high() {
-        let (conf, _) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, false, true, false, &no_coverage());
+        let (conf, _) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            0,
+            false,
+            false,
+            true,
+            false,
+            &no_coverage(),
+        );
         assert_eq!(conf, "high");
     }
 
     #[test]
     fn test_scope_clear_returns_medium() {
-        let (conf, _) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, false, false, true, &no_coverage());
+        let (conf, _) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            0,
+            false,
+            false,
+            false,
+            true,
+            &no_coverage(),
+        );
         assert_eq!(conf, "medium");
     }
 
     #[test]
     fn test_unclear_scope_returns_low() {
-        let (conf, _) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, false, false, false, &no_coverage());
+        let (conf, _) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            0,
+            false,
+            false,
+            false,
+            false,
+            &no_coverage(),
+        );
         assert_eq!(conf, "low");
     }
 
     #[test]
     fn test_source_reflects_coverage_availability() {
-        let (_, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 5, false, false, false, &no_coverage());
+        let (_, src) = compute_dead_code_confidence(
+            "/f.py",
+            1,
+            10,
+            5,
+            false,
+            false,
+            false,
+            false,
+            &no_coverage(),
+        );
         assert_eq!(src, "static");
 
         let cov = with_coverage("/other.py", &[1]);
-        let (_, src) = compute_dead_code_confidence("/f.py", 1, 10, 5, false, false, false, &cov);
+        let (_, src) =
+            compute_dead_code_confidence("/f.py", 1, 10, 5, false, false, false, false, &cov);
         assert_eq!(src, "static+coverage");
     }
 }

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use rmcp::handler::server::tool::Parameters;
 use rmcp::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -428,6 +427,7 @@ struct CandidateRow {
     language: String,
     class_context: Option<String>,
     is_entry_point: bool,
+    is_test: bool,
     coreness: Option<i64>, // from symbols.coreness column
 }
 
@@ -474,10 +474,10 @@ fn resolve_symbol_candidates(
     path: Option<&str>,
 ) -> Vec<CandidateRow> {
     let sql = if path.is_some() {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
          FROM symbols WHERE name = ?1 AND path = ?2"
     } else {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
          FROM symbols WHERE name = ?1"
     };
 
@@ -501,7 +501,8 @@ fn resolve_symbol_candidates(
             language: row.get(10)?,
             class_context: row.get(11)?,
             is_entry_point: row.get::<_, i64>(12)? != 0,
-            coreness: row.get(13)?,
+            is_test: row.get::<_, i64>(13)? != 0,
+            coreness: row.get(14)?,
         })
     };
 
@@ -886,6 +887,7 @@ fn build_health(
         c.line_end,
         c.caller_count,
         c.is_entry_point,
+        c.is_test,
         is_private,
         scope_clear,
         coverage,
@@ -1769,7 +1771,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "search",
         description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
     )]
-    fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
+    fn search(&self, #[tool(aggr)] p: SearchParams) -> String {
         self.timed_tool("search", || {
             let kind = match p.kind.as_str() {
                 "symbol" => ci_core::types::SearchKind::Symbol,
@@ -1847,7 +1849,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "file_overview",
         description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
     )]
-    fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
+    fn file_overview(&self, #[tool(aggr)] p: FileOverviewParams) -> String {
         self.timed_tool("file_overview", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
@@ -1878,7 +1880,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "symbol_info",
         description = "USE WHEN: you have a symbol name and want metadata + health signals BEFORE reading source. Check is_hub + coreness before deciding whether to modify — hub symbols need edit_context. NOT FOR: reading source (use source), finding symbols (use search/locate). vs source: symbol_info is metadata-only (no code body)."
     )]
-    fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
+    fn symbol_info(&self, #[tool(aggr)] p: SymbolInfoParams) -> String {
         self.timed_tool("symbol_info", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -1915,7 +1917,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "source",
         description = "USE THIS INSTEAD OF native Read file tool — reads symbol-precise code, always fresh from disk. USE WHEN: you need to read the actual implementation of a specific function/class/method. NEVER use native Read tool on a full file — it floods context with unrelated code."
     )]
-    fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
+    fn source(&self, #[tool(aggr)] p: SourceParams) -> String {
         self.timed_tool("source", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let resolution = {
@@ -1983,7 +1985,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "callers",
         description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
-    fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
+    fn callers(&self, #[tool(aggr)] p: CallersParams) -> String {
         self.timed_tool("callers", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -2075,7 +2077,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "callees",
         description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]
-    fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
+    fn callees(&self, #[tool(aggr)] p: CalleesParams) -> String {
         self.timed_tool("callees", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -2159,7 +2161,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "dependencies",
         description = "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level."
     )]
-    fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
+    fn dependencies(&self, #[tool(aggr)] p: DependenciesParams) -> String {
         self.timed_tool("dependencies", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
@@ -2247,7 +2249,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result."
     )]
-    fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
+    fn path(&self, #[tool(aggr)] p: PathParams) -> String {
         self.timed_tool("path", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -2337,7 +2339,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "edit_context",
         description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
     )]
-    fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
+    fn edit_context(&self, #[tool(aggr)] p: EditContextParams) -> String {
         self.timed_tool("edit_context", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -2525,7 +2527,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "diff_impact",
         description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Provide exactly one of: diff, staged, commits."
     )]
-    fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> String {
+    fn diff_impact(&self, #[tool(aggr)] p: DiffImpactParams) -> String {
         self.timed_tool("diff_impact", || {
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
@@ -2726,7 +2728,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "indexing_status",
         description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
     )]
-    fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
+    fn indexing_status(&self, #[tool(aggr)] p: IndexingStatusParams) -> String {
         self.timed_tool("indexing_status", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -2790,7 +2792,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "locate",
         description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
     )]
-    fn locate(&self, Parameters(p): Parameters<LocateParams>) -> String {
+    fn locate(&self, #[tool(aggr)] p: LocateParams) -> String {
         self.timed_tool("locate", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
@@ -2944,7 +2946,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "hotspots",
         description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
     )]
-    fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> String {
+    fn hotspots(&self, #[tool(aggr)] p: HotspotsParams) -> String {
         self.timed_tool("hotspots", || {
             let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
             let hc = &config.hotspots;
@@ -3000,7 +3002,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "understand",
         description = "Compound: locate + source + callers summary in 1 call. USE INSTEAD OF calling locate then source then callers separately. NOT FOR: pre-edit (use edit_context — more complete blast radius). NOT FOR: browsing results list (use locate with depth=search_only)."
     )]
-    fn understand(&self, Parameters(p): Parameters<UnderstandParams>) -> String {
+    fn understand(&self, #[tool(aggr)] p: UnderstandParams) -> String {
         self.timed_tool("understand", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
@@ -3148,6 +3150,101 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
 mod tests {
     use super::*;
 
+    /// DEBT-007 regression: rmcp-macros 0.1.5 only derives a real input_schema
+    /// for a tool argument when it carries the `#[tool(aggr)]` marker — using
+    /// `Parameters(p): Parameters<T>` without that marker silently falls back
+    /// to `ToolParams::NoParam`, publishing an empty-object schema over MCP
+    /// while call-time deserialization (a separate code path) still works.
+    /// Every parameterized tool must expose its real fields here, matching
+    /// what a generic MCP client sees from `tools/list`.
+    #[test]
+    fn all_tool_schemas_expose_real_properties() {
+        fn assert_has_fields(tool_name: &str, tool: rmcp::model::Tool, fields: &[&str]) {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{tool_name}: input_schema has no properties object"));
+            for field in fields {
+                assert!(
+                    props.contains_key(*field),
+                    "{tool_name}: input_schema missing field `{field}` (got {props:?})"
+                );
+            }
+        }
+
+        assert_has_fields(
+            "search",
+            CodeIntelligenceServer::search_tool_attr(),
+            &["query"],
+        );
+        assert_has_fields(
+            "file_overview",
+            CodeIntelligenceServer::file_overview_tool_attr(),
+            &["path"],
+        );
+        assert_has_fields(
+            "symbol_info",
+            CodeIntelligenceServer::symbol_info_tool_attr(),
+            &["symbol"],
+        );
+        assert_has_fields(
+            "source",
+            CodeIntelligenceServer::source_tool_attr(),
+            &["symbol"],
+        );
+        assert_has_fields(
+            "callers",
+            CodeIntelligenceServer::callers_tool_attr(),
+            &["symbol"],
+        );
+        assert_has_fields(
+            "callees",
+            CodeIntelligenceServer::callees_tool_attr(),
+            &["symbol"],
+        );
+        assert_has_fields(
+            "dependencies",
+            CodeIntelligenceServer::dependencies_tool_attr(),
+            &["path"],
+        );
+        assert_has_fields(
+            "path",
+            CodeIntelligenceServer::path_tool_attr(),
+            &["from_symbol", "to_symbol"],
+        );
+        assert_has_fields(
+            "edit_context",
+            CodeIntelligenceServer::edit_context_tool_attr(),
+            &["symbol"],
+        );
+        assert_has_fields(
+            "diff_impact",
+            CodeIntelligenceServer::diff_impact_tool_attr(),
+            &["diff", "staged", "commits"],
+        );
+        assert_has_fields(
+            "indexing_status",
+            CodeIntelligenceServer::indexing_status_tool_attr(),
+            &["retry_embeddings"],
+        );
+        assert_has_fields(
+            "locate",
+            CodeIntelligenceServer::locate_tool_attr(),
+            &["query"],
+        );
+        assert_has_fields(
+            "hotspots",
+            CodeIntelligenceServer::hotspots_tool_attr(),
+            &["top_n", "since", "min_churn"],
+        );
+        assert_has_fields(
+            "understand",
+            CodeIntelligenceServer::understand_tool_attr(),
+            &["query"],
+        );
+    }
+
     #[test]
     fn edges_ready_follows_indexing_phase() {
         let dir = std::env::temp_dir().join(format!("ci_phase_{}", std::process::id()));
@@ -3201,10 +3298,10 @@ mod tests {
         }
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
 
-        let output = server.symbol_info(Parameters(SymbolInfoParams {
+        let output = server.symbol_info(SymbolInfoParams {
             symbol: "target".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         let by_conf = &v["health"]["caller_count_by_confidence"];
 
@@ -3249,11 +3346,11 @@ mod tests {
                       context\n\
                      +new line\n";
 
-        let output = server.diff_impact(Parameters(DiffImpactParams {
+        let output = server.diff_impact(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["files_changed"], serde_json::json!(["src/foo.rs"]));
@@ -3282,11 +3379,11 @@ mod tests {
                      @@ -0,0 +1,3 @@\n\
                      +fn new_fn() {}\n";
 
-        let output = server.diff_impact(Parameters(DiffImpactParams {
+        let output = server.diff_impact(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["unindexed_files"], serde_json::json!(["src/new.rs"]));
@@ -3385,12 +3482,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.callers(Parameters(CallersParams {
+        let output = server.callers(CallersParams {
             symbol: "foo".into(),
             path: None,
             transitive: false,
             max_depth: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["edges_ready"], false, "edges not built yet in this test");
@@ -3432,12 +3529,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.callers(Parameters(CallersParams {
+        let output = server.callers(CallersParams {
             symbol: "a".into(),
             path: None,
             transitive: true,
             max_depth: Some(5),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["transitive_count"], 2, "b at depth 1, c at depth 2");
@@ -3473,10 +3570,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(Parameters(EditContextParams {
+        let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["blast_radius"]["transitive"], 1);
@@ -3509,10 +3606,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(Parameters(EditContextParams {
+        let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(
             v.get("trend").is_none(),
@@ -3550,10 +3647,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(Parameters(EditContextParams {
+        let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["trend"]["compared_to"], "2000-01-01");
@@ -3571,11 +3668,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let output = server.diff_impact(Parameters(DiffImpactParams {
+        let output = server.diff_impact(DiffImpactParams {
             diff: Some("diff --git a/x b/x\n".into()),
             staged: Some(true),
             commits: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(v["error"]["code"], "INVALID_INPUT");
 
@@ -3602,13 +3699,13 @@ mod tests {
             .unwrap();
         }
 
-        let _ = server.symbol_info(Parameters(SymbolInfoParams {
+        let _ = server.symbol_info(SymbolInfoParams {
             symbol: "foo".into(),
             path: None,
-        }));
-        let _ = server.file_overview(Parameters(FileOverviewParams {
+        });
+        let _ = server.file_overview(FileOverviewParams {
             path: "src/foo.rs".into(),
-        }));
+        });
 
         let output = server.session_context();
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -3838,10 +3935,10 @@ mod tests {
         // Same `name` + `path`, but two distinct `qualified_name`s — path alone
         // does not disambiguate, so this must stay ambiguous rather than
         // silently picking the first row.
-        let output = server.symbol_info(Parameters(SymbolInfoParams {
+        let output = server.symbol_info(SymbolInfoParams {
             symbol: "method".into(),
             path: Some("src/multi.py".into()),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["ambiguous"], true);
@@ -3876,13 +3973,13 @@ mod tests {
 
         // Requested 10 hops exceeds the configured max_allowed_hops=5 — with the
         // old hardcoded literal (20) this would NOT have been clamped.
-        let output = server.path(Parameters(PathParams {
+        let output = server.path(PathParams {
             from_symbol: "a".into(),
             to_symbol: "b".into(),
             from_path: None,
             to_path: None,
             max_hops: Some(10),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["hops_clamped"], true);
@@ -3907,12 +4004,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.locate(Parameters(LocateParams {
+        let output = server.locate(LocateParams {
             query: "foo".into(),
             kind: None,
             depth: Some("search_only".into()),
             limit: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert!(v["top_symbol"].is_null());
@@ -3946,12 +4043,12 @@ mod tests {
 
         // kind="text" + default depth ("with_symbol") must auto-downgrade per
         // the LocateDepth invariant, since a text match has no symbol to enrich.
-        let output = server.locate(Parameters(LocateParams {
+        let output = server.locate(LocateParams {
             query: "bar".into(),
             kind: Some("text".into()),
             depth: None,
             limit: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["depth_adjusted"], "with_file");
@@ -3984,10 +4081,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.understand(Parameters(UnderstandParams {
+        let output = server.understand(UnderstandParams {
             query: "foo".into(),
             kind: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["symbol"]["qualified_name"], "foo.py::foo");
@@ -4015,9 +4112,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.file_overview(Parameters(FileOverviewParams {
+        let output = server.file_overview(FileOverviewParams {
             path: "a.py".into(),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["symbols"][0]["caller_count"], 7);
@@ -4047,11 +4144,11 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.source(Parameters(SourceParams {
+        let output = server.source(SourceParams {
             symbol: "foo".into(),
             path: None,
             include_metadata: false,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["data_source"], "disk");
@@ -4082,9 +4179,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.dependencies(Parameters(DependenciesParams {
+        let output = server.dependencies(DependenciesParams {
             path: "a.py".into(),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(
@@ -4123,9 +4220,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.dependencies(Parameters(DependenciesParams {
+        let output = server.dependencies(DependenciesParams {
             path: "a.py".into(),
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["imports"].as_array().unwrap().len(), 1);
@@ -4157,9 +4254,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.indexing_status(Parameters(IndexingStatusParams {
+        let output = server.indexing_status(IndexingStatusParams {
             retry_embeddings: false,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["files_indexed"], 1);
@@ -4245,10 +4342,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.symbol_info(Parameters(SymbolInfoParams {
+        let output = server.symbol_info(SymbolInfoParams {
             symbol: "my_fn".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         // coreness must be present and equal to 3
@@ -4296,10 +4393,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.symbol_info(Parameters(SymbolInfoParams {
+        let output = server.symbol_info(SymbolInfoParams {
             symbol: "my_fn2".into(),
             path: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         // When edges not ready, coreness must be null (not missing)
@@ -4385,12 +4482,12 @@ mod tests {
             ).unwrap();
         }
 
-        let output = server.locate(Parameters(LocateParams {
+        let output = server.locate(LocateParams {
             query: "orphan_fn".into(),
             kind: None,  // symbol kind
             depth: None, // defaults to with_symbol
             limit: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         let sn = &v["suggested_next"];
         assert_eq!(
@@ -4434,12 +4531,12 @@ mod tests {
         }
 
         // Use depth="search_only" so top_symbol is None and both results are visible
-        let output = server.locate(Parameters(LocateParams {
+        let output = server.locate(LocateParams {
             query: "process".into(),
             kind: None,
             depth: Some("search_only".into()),
             limit: None,
-        }));
+        });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         let sn = &v["suggested_next"];
         assert_eq!(

@@ -52,3 +52,24 @@ items:
     current_control: "Explicit regression test"
     remaining: []
     owner_hint: testing
+
+  DEBT-005-formal-python-builtins-unresolved:
+    status: open
+    urgency: low
+    description: >
+      FormalResolver (formal.rs) không resolve được Python builtins (len, print,
+      range...). Root cause đã điều tra trong test_resolve_file_merges_builtins_
+      without_error (formal.rs): src/builtins.py bundled trong
+      tree-sitter-stack-graphs-python 0.3.0 rỗng, và stack-graphs.tsg push symbol
+      "<builtins>" nhưng không rule nào pop lại — dead-end ở tầng grammar upstream,
+      không sửa được từ phía merge builtins graph. Verified 2026-07-01: 0.3.0 vẫn
+      là bản mới nhất (12/2024), repo github/stack-graphs đã bị archive 9/2025 nên
+      sẽ không có upstream fix. Không ảnh hưởng correctness — reference gọi
+      builtin fall back về resolved/textual tier bình thường, chỉ mất confidence
+      tier cao nhất.
+    current_control: "README caveat dưới bullet formal tier; fallback resolver vẫn hoạt động"
+    remaining:
+      - "Xác nhận tree_sitter_stack_graphs::StackGraphLanguage::from_str + tsg_source() đủ để tự vá TSG rule (pop \"<builtins>\") mà không cần fork toàn crate"
+      - "Tự viết builtins.py (định nghĩa len/print/range/...) + override rule TSG bù chỗ thiếu pop \"<builtins>\""
+      - "Regression test: len()/print() resolve tới definition_symbol qua formal tier, không chỉ textual"
+    owner_hint: ci-core/resolver

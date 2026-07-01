@@ -21,6 +21,11 @@ tính graph metrics (coreness/hubs), và phục vụ qua SQLite FTS5 + semantic 
    - `resolved` — khớp file symbol / import / alias (tier-1, conservative resolver).
    - `inferred` — method call phân giải theo kiểu của receiver (tier-2: `self`/`this` → class bao quanh; biến typed → `type_map`).
    - `formal` — phân giải phạm vi tĩnh qua `stack-graphs` (tier-3, hiện hỗ trợ Python). Được bảo vệ bởi **hai deadline độc lập**: một cho bước build stack-graph (TSG) và một cho bước path-stitching, cộng thêm cap `MAX_WORK_PER_PHASE = 4096` để chống DoS.
+     > **Lưu ý `formal` tier**: `formal` **không resolve được builtin Python** (`len`, `print`, `range`...) —
+     > `src/builtins.py` bundled trong `tree-sitter-stack-graphs-python` 0.3.0 rỗng, và rule TSG upstream
+     > push symbol `"<builtins>"` nhưng không có rule nào pop lại — dead-end ở tầng grammar, không phải bug
+     > phía `ci`. Repo upstream (`github/stack-graphs`) đã bị archive từ 9/2025, không còn nhận fix. Các
+     > reference gọi builtin sẽ fall back về `resolved`/`textual` tier như bình thường.
    - `textual` — chỉ khớp tên (fallback).
 3. **Import graph** — `import_edges` (file→module/file) cho tool `dependencies`.
 4. **Graph metrics** — `coreness` (k-core, O(V+E)) và `is_hub` để AI biết đâu là lõi hệ thống.

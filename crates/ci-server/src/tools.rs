@@ -906,6 +906,7 @@ fn build_health(
         is_private,
         scope_clear,
         coverage,
+        &c.kind,
     );
 
     let caller_count_by_confidence = if edges_ready {
@@ -2787,7 +2788,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                         let signature_changed = !is_new_symbol
                             && ci_core::analysis::diff_impact::is_signature_changed(
                                 (line_start, sig_end),
-                                &fd.hunks,
+                                &fd.added_lines,
                             );
 
                         let base_level = if caller_count > 10 {

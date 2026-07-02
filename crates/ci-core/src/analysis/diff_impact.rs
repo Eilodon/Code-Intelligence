@@ -211,11 +211,17 @@ fn parse_hunk_header(rest: &str) -> Option<(i64, i64)> {
     Some((start, end))
 }
 
-pub fn is_signature_changed(signature_range: (i64, i64), hunk_ranges: &[(i64, i64)]) -> bool {
-    let (sig_start, sig_end) = signature_range;
-    hunk_ranges
-        .iter()
-        .any(|&(hunk_start, hunk_end)| !(hunk_end < sig_start || hunk_start > sig_end))
+/// True when at least one line in `signature_range` is an actual `+`
+/// addition (`added_lines` — see `FileDiff`), i.e. text that differs from
+/// the pre-diff version, rather than unchanged context merely spanned by
+/// the same hunk. Line-precise on purpose: real diffs carry several lines
+/// of unchanged context around any edit (git's default -U3), so a coarser
+/// "does any hunk's overall numeric range overlap this symbol" check flags
+/// every symbol sitting near an edit within the same hunk — not just the
+/// one actually touched — as "signature changed".
+pub fn is_signature_changed(signature_range: (i64, i64), added_lines: &HashSet<i64>) -> bool {
+    let (start, end) = signature_range;
+    (start..=end).any(|line| added_lines.contains(&line))
 }
 
 /// True when `signature_range` falls entirely within territory that didn't
@@ -318,7 +324,7 @@ pub fn sort_affected_symbols(
     symbols.truncate(max_affected);
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod tests {
@@ -326,20 +332,38 @@ mod tests {
 
     #[test]
     fn test_is_signature_changed_overlap() {
-        assert!(is_signature_changed((5, 10), &[(8, 15)]));
-        assert!(is_signature_changed((5, 10), &[(1, 6)]));
-        assert!(is_signature_changed((5, 10), &[(5, 10)]));
+        assert!(is_signature_changed((5, 10), &HashSet::from([8])));
+        assert!(is_signature_changed((5, 10), &HashSet::from([6])));
+        assert!(is_signature_changed((5, 10), &HashSet::from([5, 10])));
     }
 
     #[test]
     fn test_is_signature_changed_no_overlap() {
-        assert!(!is_signature_changed((5, 10), &[(11, 20)]));
-        assert!(!is_signature_changed((5, 10), &[(1, 4)]));
+        assert!(!is_signature_changed((5, 10), &HashSet::from([11, 20])));
+        assert!(!is_signature_changed((5, 10), &HashSet::from([1, 4])));
     }
 
     #[test]
-    fn test_is_signature_changed_empty_hunks() {
-        assert!(!is_signature_changed((5, 10), &[]));
+    fn test_is_signature_changed_empty_added_lines() {
+        assert!(!is_signature_changed((5, 10), &HashSet::new()));
+    }
+
+    /// Regression: a symbol sitting near a real edit — but not itself
+    /// touched — must not be flagged just because a hunk's *numeric range*
+    /// (context lines included) happens to span it. `line 7` is unchanged
+    /// context in the same hunk as an edit at line 3; only line 3 is an
+    /// actual addition.
+    #[test]
+    fn test_is_signature_changed_ignores_unchanged_context_in_same_hunk() {
+        let added = HashSet::from([3]);
+        assert!(
+            !is_signature_changed((7, 9), &added),
+            "lines 7-9 are unchanged context, not touched by this diff"
+        );
+        assert!(
+            is_signature_changed((1, 5), &added),
+            "line 3 is genuinely new"
+        );
     }
 
     #[test]

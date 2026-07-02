@@ -352,16 +352,93 @@ fn detect_entry_point(
                 ".delete(",
                 ".patch(",
             ];
-            decorators
-                .iter()
-                .any(|d| HOOKS.iter().any(|h| d.contains(h)))
+            // Dunder methods (`__init__`, `__str__`, `__eq__`, `__iter__`, ...)
+            // are invoked by Python's data model via protocol dispatch
+            // (`str(x)` calls `__str__`, `for v in x` calls `__iter__`, a
+            // constructor call `X()` calls `__init__`) — never by their
+            // literal name at a call site, so a name-based call-graph can
+            // never see a "caller" for them regardless of real usage.
+            (name.len() > 4 && name.starts_with("__") && name.ends_with("__"))
+                || decorators
+                    .iter()
+                    .any(|d| HOOKS.iter().any(|h| d.contains(h)))
         }
         "rust" => {
+            // Any non-trivial attribute macro on a function/method is a
+            // strong, general signal that something other than an ordinary
+            // call site invokes or registers it — route/tool/RPC
+            // registration, FFI export, a plugin/handler framework, etc.
+            // (see `NON_DISPATCH_ATTRS` for the small set of modifier
+            // attributes that don't imply this).
+            const NON_DISPATCH_ATTRS: &[&str] = &[
+                "allow",
+                "deny",
+                "warn",
+                "forbid",
+                "must_use",
+                "deprecated",
+                "inline",
+                "cold",
+                "cfg",
+                "cfg_attr",
+                "doc",
+                "track_caller",
+                "non_exhaustive",
+                "repr",
+                "should_panic",
+                "ignore",
+                "test",
+                "derive",
+                "automatically_derived",
+            ];
+            // Common std/core trait methods dispatched via operator or
+            // protocol syntax (`x.into()`, `x == y`, `for v in x`,
+            // `x.clone()`, ...) rather than by their literal name at a call
+            // site — invisible to a name-based call-graph regardless of how
+            // many places genuinely invoke them through the trait.
+            const TRAIT_DISPATCH_NAMES: &[&str] = &[
+                "from",
+                "try_from",
+                "fmt",
+                "drop",
+                "deref",
+                "deref_mut",
+                "default",
+                "clone",
+                "eq",
+                "ne",
+                "partial_cmp",
+                "cmp",
+                "hash",
+                "next",
+                "into_iter",
+                "index",
+                "index_mut",
+                "add",
+                "sub",
+                "mul",
+                "div",
+                "rem",
+                "neg",
+                "not",
+                "bitand",
+                "bitor",
+                "bitxor",
+                "as_ref",
+                "as_mut",
+                "borrow",
+                "borrow_mut",
+                "deserialize",
+                "serialize",
+            ];
             name == "main"
+                || TRAIT_DISPATCH_NAMES.contains(&name)
                 || decorators.iter().any(|d| {
                     let inner = d.trim_start_matches("#[").trim_end_matches(']');
                     let path = inner.split('(').next().unwrap_or(inner).trim();
-                    path == "main" || path.ends_with("::main")
+                    path == "main"
+                        || path.ends_with("::main")
+                        || !NON_DISPATCH_ATTRS.contains(&path)
                 })
         }
         "go" => node.kind() == "function_declaration" && (name == "main" || name == "init"),
@@ -1354,6 +1431,22 @@ def run():
         assert!(find(&symbols, "run").is_entry_point);
     }
 
+    /// Regression: dunder methods are invoked by Python's data model via
+    /// protocol dispatch (`X()` calls `__init__`, `str(x)` calls `__str__`),
+    /// never by their literal name — must not be flagged as dead code just
+    /// because a name-based call-graph never sees a "caller" for them.
+    /// Single-underscore-prefixed names (the usual "private" convention)
+    /// are a different thing entirely and must not match.
+    #[test]
+    fn test_python_entry_point_dunder_methods() {
+        let code = "class C:\n    def __init__(self):\n        pass\n    def __str__(self):\n        return \"\"\n    def _private_helper(self):\n        pass\n    def helper(self):\n        pass\n";
+        let symbols = extract_symbols(code, "python", "c.py").unwrap();
+        assert!(find(&symbols, "__init__").is_entry_point);
+        assert!(find(&symbols, "__str__").is_entry_point);
+        assert!(!find(&symbols, "_private_helper").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
     #[test]
     fn test_rust_entry_point_main_name() {
         let code = "fn main() {}\nfn helper() {}\n";
@@ -1367,6 +1460,49 @@ def run():
         let code = "#[tokio::main]\nasync fn main() {}\n";
         let symbols = extract_symbols(code, "rust", "main.rs").unwrap();
         assert!(find(&symbols, "main").is_entry_point);
+    }
+
+    /// Regression: an attribute-macro-registered handler (route/RPC/tool
+    /// framework, etc.) is invoked externally via the macro's generated
+    /// dispatch, never by a literal call site — a name-based call-graph can
+    /// never give it a nonzero caller_count, so it must be treated as an
+    /// entry point (like `main`) rather than flagged as dead code.
+    #[test]
+    fn test_rust_entry_point_attribute_macro() {
+        let code = "struct S;\nimpl S {\n    #[tool(name = \"repo_overview\")]\n    fn repo_overview(&self) {}\n}\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "server.rs").unwrap();
+        assert!(find(&symbols, "repo_overview").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    /// Regression: a small set of purely-cosmetic/compiler-directive
+    /// attributes must NOT trigger the broad "has an attribute macro"
+    /// entry-point signal — they don't imply anything invokes the function
+    /// other than an ordinary call site.
+    #[test]
+    fn test_rust_non_dispatch_attributes_dont_trigger_entry_point() {
+        let code = "#[allow(dead_code)]\nfn helper() {}\n\n#[inline]\nfn also_helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(!find(&symbols, "helper").is_entry_point);
+        assert!(!find(&symbols, "also_helper").is_entry_point);
+    }
+
+    /// Regression: common std/core trait methods (`from`, `clone`, `fmt`,
+    /// `default`, `next`, ...) are invoked via operator/trait/protocol
+    /// syntax (`.into()`, `==`, `for` loops, ...), never by their literal
+    /// name at a call site — a name-based call-graph can never see a real
+    /// "caller" for them, so they must not be flagged as dead code just
+    /// because they have zero recorded callers.
+    #[test]
+    fn test_rust_entry_point_trait_dispatch_names() {
+        let code = "struct S;\nimpl S {\n    fn from(x: i32) -> Self {\n        S\n    }\n    fn clone(&self) -> Self {\n        S\n    }\n    fn process(&self) {}\n}\n";
+        let symbols = extract_symbols(code, "rust", "types.rs").unwrap();
+        assert!(find(&symbols, "from").is_entry_point);
+        assert!(find(&symbols, "clone").is_entry_point);
+        assert!(
+            !find(&symbols, "process").is_entry_point,
+            "an ordinary method name not in the trait-dispatch list is unaffected"
+        );
     }
 
     #[test]

@@ -214,6 +214,52 @@ fn complexity_score(c: &ComplexityInfo) -> f64 {
         + c.avg_caller_count * 0.5
 }
 
+/// "Already quite high in absolute terms" reference points for
+/// [`compute_absolute_hotspot_risk`] — deliberately independent of any other
+/// file in the repo (see that function's doc comment for why).
+const ABSOLUTE_CHURN_REFERENCE: f64 = 50.0;
+const ABSOLUTE_COMPLEXITY_REFERENCE: f64 = 150.0;
+
+/// Highest single-file hotspot risk on an absolute 0..=1 scale, for use as a
+/// fitness-check gate — unlike `compute_hotspots`' `hotspot_score`, which is
+/// *relative*: min-max normalized against this same repo's own busiest and
+/// most complex file (`norm = value / max_in_this_repo`). That's the right
+/// behavior for the `hotspots` tool ("which file should I look at first, in
+/// this repo") but makes the #1-ranked file's score approach 1.0 *by
+/// construction* — divided by its own repo's max, it doesn't matter whether
+/// that max is genuinely alarming or the repo is small and healthy, there is
+/// always a "biggest" file. Comparing that relative score against a fixed
+/// `max_hotspot_risk` threshold is a category error: a relative ranking
+/// compared against an absolute gate will tend to fail for nearly any
+/// multi-file repo where churn and complexity concentrate in the same file
+/// (common — the main implementation file usually is both), regardless of
+/// whether the codebase is actually healthy.
+///
+/// This anchors both dimensions to fixed reference points instead, so a
+/// file only approaches 1.0 by being absolutely high on both axes, not
+/// merely higher than its neighbors.
+pub fn compute_absolute_hotspot_risk(project_root: &Path, conn: &Connection, since: &str) -> f64 {
+    let (churn_map, git_available) = collect_git_churn(project_root, since);
+    let complexity_map = collect_complexity(conn);
+
+    complexity_map
+        .iter()
+        .map(|(path, cm)| {
+            let norm_compl = (complexity_score(cm) / ABSOLUTE_COMPLEXITY_REFERENCE).min(1.0);
+            if git_available {
+                let commits = churn_map.get(path).map(|c| c.commit_count).unwrap_or(0);
+                let norm_churn = (commits as f64 / ABSOLUTE_CHURN_REFERENCE).min(1.0);
+                norm_churn * norm_compl
+            } else {
+                // Matches compute_hotspots' own no-git fallback: rank by
+                // complexity alone rather than treating "no churn data" as
+                // "zero churn" (which would silently zero out every score).
+                norm_compl
+            }
+        })
+        .fold(0.0_f64, f64::max)
+}
+
 fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, ChurnInfo>, bool) {
     // Git already reports paths relative to `current_dir` (project_root) using
     // forward slashes — this must match `symbols.path`'s format exactly (see
@@ -409,5 +455,75 @@ mod tests {
         assert_eq!(output.hotspots.len(), 1);
         assert_eq!(output.hotspots[0].path, "hot.py");
         assert_eq!(output.hotspots[0].churn.commit_count, 2);
+    }
+
+    /// Regression: `compute_absolute_hotspot_risk` must NOT saturate to
+    /// ~1.0 just because one file is *relatively* the busiest in a small,
+    /// healthy repo — unlike `compute_hotspots`' `hotspot_score` (min-max
+    /// normalized against this same repo's own max), which mathematically
+    /// approaches 1.0 for the #1 file regardless of absolute health, since
+    /// it's divided by its own repo's max. Here `busy.py` has 2 commits and
+    /// a single tiny symbol — the repo's relatively "busiest" file, but
+    /// nowhere near the absolute reference points (50 commits, complexity
+    /// 150) — and must score far below the fitness-check's
+    /// `max_hotspot_risk` threshold (0.75).
+    #[test]
+    fn test_absolute_hotspot_risk_does_not_saturate_for_healthy_small_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("busy.py"), "def foo():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("quiet.py"), "def bar():\n    pass\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+        // One more commit to busy.py only, making it the repo's relatively
+        // "busiest" file (2 commits vs. quiet.py's 1) — exactly the
+        // situation that saturated the old relative score to ~1.0.
+        std::fs::write(dir.path().join("busy.py"), "def foo():\n    return 1\n").unwrap();
+        run_git(dir.path(), &["commit", "-q", "-am", "update busy"]);
+
+        let conn = setup_db();
+        insert_symbol(&conn, "busy.foo", "busy.py", 0, false, 0);
+        insert_symbol(&conn, "quiet.bar", "quiet.py", 0, false, 0);
+
+        let risk = compute_absolute_hotspot_risk(dir.path(), &conn, "1 year");
+        assert!(
+            risk < 0.1,
+            "a 2-commit, 1-symbol file is nowhere near the absolute reference points, got {risk}"
+        );
+    }
+
+    /// Companion case: a file that genuinely IS high churn and high
+    /// complexity in absolute terms still scores high — the fix changes the
+    /// *normalization basis*, not whether real hotspots get flagged.
+    #[test]
+    fn test_absolute_hotspot_risk_still_flags_genuinely_busy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("giant.py"), "def f():\n    pass\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+        for i in 0..60 {
+            std::fs::write(
+                dir.path().join("giant.py"),
+                format!("def f():\n    return {i}\n"),
+            )
+            .unwrap();
+            run_git(dir.path(), &["commit", "-q", "-am", &format!("update {i}")]);
+        }
+
+        let conn = setup_db();
+        for i in 0..200 {
+            insert_symbol(&conn, &format!("giant.f{i}"), "giant.py", 0, i < 30, 1);
+        }
+
+        let risk = compute_absolute_hotspot_risk(dir.path(), &conn, "1 year");
+        assert!(
+            risk > 0.75,
+            "61 commits + 200 symbols/30 hubs is genuinely high churn+complexity, got {risk}"
+        );
     }
 }

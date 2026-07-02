@@ -271,8 +271,15 @@ pub fn collect_metrics(
         &HotspotsConfig::default().default_since,
     );
 
-    let hub_pct = if total_symbols > 0 {
-        hub_count as f64 / total_symbols as f64 * 100.0
+    // Same category error as dead_code_pct/edge_coverage_pct: a struct/class
+    // symbol can be constructed and referenced constantly without that ever
+    // showing up as call fan-in, so it can (in principle) never earn `is_hub`
+    // the way a heavily-called function/method does. Denominator matches
+    // `callable_symbols` above so hub_pct measures "hub concentration among
+    // symbols that could actually become a hub," not diluted by symbols that
+    // structurally never can.
+    let hub_pct = if callable_symbols > 0 {
+        hub_count as f64 / callable_symbols as f64 * 100.0
     } else {
         0.0
     };
@@ -743,6 +750,55 @@ mod tests {
         );
         assert_eq!(hub_pct_check.value, 100.0);
         assert!(!result.passed);
+    }
+
+    /// Same taxonomy fix as `edge_coverage_pct`/`dead_code_pct`: a `struct`
+    /// symbol can never earn `is_hub` (no incoming *call* fan-in is possible
+    /// for a type), so padding the denominator with structs only dilutes
+    /// hub_pct — it can never cause a false failure, but it can mask real
+    /// concentration in a struct-heavy codebase. Denominator must be
+    /// `callable_symbols` (function/method), not every symbol.
+    #[test]
+    fn test_hub_pct_denominator_excludes_structs() {
+        let conn = test_conn();
+        let thresholds = FitnessThresholds::default();
+
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, is_hub, indexed_at) \
+             VALUES ('mod.foo', 'foo', 'function', 'python', 'mod.py', 1, 5, 1, 0.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..9 {
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+                 line_start, line_end, is_hub, indexed_at) \
+                 VALUES (?1, ?1, 'struct', 'python', 'mod.py', 1, 5, 0, 0.0)",
+                rusqlite::params![format!("mod.Struct{i}")],
+            )
+            .unwrap();
+        }
+
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+        )
+        .unwrap();
+
+        // 1 hub / 1 callable symbol = 100%, not 1 hub / 10 total symbols = 10%
+        // (which would have stayed under the 20% threshold, hiding the fact
+        // that every callable symbol in this codebase is a hub).
+        let hub_pct_check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "hub_pct")
+            .unwrap();
+        assert_eq!(hub_pct_check.value, 100.0);
+        assert!(!hub_pct_check.passed);
     }
 
     #[test]

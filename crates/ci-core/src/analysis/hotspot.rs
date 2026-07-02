@@ -292,6 +292,14 @@ fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, Churn
 }
 
 fn collect_complexity(conn: &Connection) -> HashMap<String, ComplexityInfo> {
+    // is_test = 0: test functions structurally call production code, so they
+    // almost always end up with coreness > 0 despite never being called
+    // *back* (never hubs). Left unfiltered, a thoroughly-tested file's own
+    // test module inflates connected_coreness_count/symbol_count as if that
+    // were production complexity — penalizing exactly the files that
+    // invested most in test coverage. Same taxonomy as the dead_code_pct /
+    // edge_coverage_pct denominators: only count symbols that can actually
+    // carry production risk.
     let mut stmt = conn
         .prepare(
             "SELECT path, \
@@ -300,7 +308,7 @@ fn collect_complexity(conn: &Connection) -> HashMap<String, ComplexityInfo> {
              AVG(COALESCE(caller_count, 0)) as avg_caller_count, \
              SUM(CASE WHEN coreness > 0 THEN 1 ELSE 0 END) as connected_coreness_count, \
              MAX(language) as language \
-             FROM symbols WHERE path IS NOT NULL GROUP BY path",
+             FROM symbols WHERE path IS NOT NULL AND is_test = 0 GROUP BY path",
         )
         .unwrap();
 
@@ -416,6 +424,41 @@ mod tests {
         let syms = output.hotspots[0].top_symbols.as_ref().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "m.foo"); // higher caller_count first
+    }
+
+    fn insert_test_symbol(conn: &Connection, qname: &str, path: &str, coreness: i64) {
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, caller_count, is_hub, coreness, is_test, indexed_at) \
+             VALUES (?, ?, 'function', 'python', ?, 1, 10, 0, 0, ?, 1, 0.0)",
+            rusqlite::params![qname, qname, path, coreness],
+        )
+        .unwrap();
+    }
+
+    /// Regression: a file's own `#[test]` functions must not count toward its
+    /// complexity score. Test functions almost always end up `coreness > 0`
+    /// (they call production code) despite never being hubs, so a
+    /// thoroughly-tested file with modest production code but many test
+    /// cases used to look far more "complex" than one with the same
+    /// production code and no tests at all — penalizing test coverage.
+    #[test]
+    fn test_complexity_ignores_test_symbols() {
+        let conn = setup_db();
+        insert_symbol(&conn, "prod.func1", "/prod.py", 0, false, 1);
+        for i in 0..50 {
+            insert_test_symbol(&conn, &format!("prod.test_func{i}"), "/prod.py", 1);
+        }
+
+        let complexity = collect_complexity(&conn);
+        let info = complexity
+            .get("/prod.py")
+            .expect("prod.py should be present");
+        assert_eq!(
+            info.symbol_count, 1,
+            "the 50 test-flagged symbols must not inflate symbol_count"
+        );
+        assert_eq!(info.connected_coreness_count, 1);
     }
 
     fn run_git(dir: &Path, args: &[&str]) {

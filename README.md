@@ -84,6 +84,14 @@ agent: "tôi cần sửa hàm getUserByEmail"
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
 - **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
   khởi động; kết hợp với static analysis cho `dead_code_confidence`.
+- **Output sanitization** — `source`/`understand` redact credentials (PEM key, GitHub/AWS/Slack
+  token, JWT, password assignment...) trước khi trả về, và gắn cờ `content_warning` khi code chứa
+  văn bản giống prompt-injection (`"ignore previous instructions"`, fake `system:` marker...) —
+  không sửa nội dung code, chỉ cảnh báo, vì false positive ở đây sẽ làm hỏng code thật.
+- **Mandatory tools thật sự bắt buộc khi dùng Claude Code** — `.claude/hooks/ci-nudge.sh` (PreToolUse
+  hook, không phải chỉ quy ước trong docs) chặn cứng: `Edit` đầu tiên lên file code mỗi session bị từ
+  chối tới khi gọi `edit_context`; `git commit`/`git push` bị từ chối nếu có file đổi từ lần gọi
+  `diff_impact` gần nhất.
 
 ## Cấu trúc Crates
 
@@ -122,7 +130,7 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) |
+| Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) — hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
 | Recover | `session_context` |
 
 ## Fitness Check — CI Gate

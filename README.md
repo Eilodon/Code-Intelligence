@@ -74,7 +74,10 @@ agent: "tôi cần sửa hàm getUserByEmail"
   dần; parallel hoá bằng `rayon`. `ci serve` tự động chọn incremental reindex khi đã có index cũ.
 - **Full-text + semantic search** — FTS5 (BM25) kết hợp semantic embeddings (`model2vec-rs`,
   pure-Rust, không cần ONNX) qua Reciprocal Rank Fusion 3-way (FTS + symbol-identity vector +
-  code-body chunk vector) — tìm được cả khi câu query không trùng tên symbol.
+  code-body chunk vector) — tìm được cả khi câu query không trùng tên symbol. KNN là brute-force
+  cosine scan thuần Rust (cache theo path DB trong RAM, không phải re-fetch SQL mỗi query) — không
+  còn phụ thuộc extension C nào, nên hoạt động giống hệt trên mọi platform release (trước đây
+  `sqlite-vec` không compile được trên musl libc, khiến bản Linux/Docker bị tắt semantic).
 - **Index freshness minh bạch** — mọi response đều báo trạng thái index (`scanning → parsing →
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
 - **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
@@ -193,9 +196,9 @@ reason = "core không được phụ thuộc server layer"
   `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` tự tải + verify checksum bản
   đúng platform khi checkout đang ở đúng git tag — xem
   [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md).
-- `Containerfile` multi-stage (`rust:alpine` → `scratch`), image ~10MB, publish
-  lên `ghcr.io/eilodon/code-intelligence` (tag theo version + `latest`) mỗi khi
-  push git tag.
+- `Containerfile` multi-stage (`rust:alpine` → `scratch`) — single static binary,
+  không cần runtime image nào khác, publish lên `ghcr.io/eilodon/code-intelligence`
+  (tag theo version + `latest`) mỗi khi push git tag.
 - `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
   `mem_limit: 256m`).
 
@@ -203,7 +206,7 @@ reason = "core không được phụ thuộc server layer"
 
 ```bash
 cargo test --workspace                        # unit + integration (mặc định)
-cargo test -p ci-core --features embeddings   # bao gồm semantic/vector path (vec0 KNN)
+cargo test -p ci-core --features embeddings   # bao gồm semantic/vector path (brute-force cosine KNN)
 cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 

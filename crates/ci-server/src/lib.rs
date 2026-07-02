@@ -26,10 +26,6 @@ pub async fn serve_stdio_with_preset(
     db_path: PathBuf,
     preset: String,
 ) -> Result<()> {
-    // Register the sqlite-vec extension before any connection is opened (no-op
-    // unless built with the `embeddings` feature).
-    ci_core::embedding::register_extension();
-
     ci_core::gitignore::ensure_gitignore(&project_root)?;
 
     let server =

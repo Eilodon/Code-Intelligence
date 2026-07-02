@@ -24,7 +24,6 @@ stack-graphs = { workspace = true }
 tree-sitter-stack-graphs = { workspace = true }
 tree-sitter-stack-graphs-python = { workspace = true }
 model2vec-rs = { version = "0.2.1", optional = true }
-sqlite-vec = { version = "0.1.9", optional = true }
 tree-sitter-c       = { workspace = true, optional = true }
 tree-sitter-cpp     = { workspace = true, optional = true }
 tree-sitter-ruby    = { workspace = true, optional = true }
@@ -36,11 +35,13 @@ tree-sitter-bash    = { workspace = true, optional = true }
 tempfile = "3"
 
 [features]
-# Semantic embeddings: pure-Rust static code embeddings (model2vec-rs) stored
-# in sqlite-vec. On by default for native builds; musl release builds explicitly
-# opt-out via --no-default-features to keep the static binary lean.
+# Semantic embeddings: pure-Rust static code embeddings (model2vec-rs).
+# Nearest-neighbour search is a data-parallel brute-force cosine scan
+# (embedding.rs::knn) over plain SQLite BLOB storage — no vector-search C
+# extension (previously sqlite-vec, which failed to compile on musl libc),
+# so this is on by default for every target, release or native.
 default = ["embeddings", "tier0-5"]
-embeddings = ["dep:model2vec-rs", "dep:sqlite-vec"]
+embeddings = ["dep:model2vec-rs"]
 # Tier-0.5 upgrade: optional per-language tree-sitter grammars for accurate
 # AST-based extraction (replaces regex fallback when compiled in).
 # Individual flags let users include only the languages they need.

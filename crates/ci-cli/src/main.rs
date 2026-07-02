@@ -96,9 +96,6 @@ async fn main() -> Result<()> {
         Commands::Index { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;
             tracing::info!("Indexing {}", root.display());
-            // Register sqlite-vec before opening the connection (no-op unless the
-            // `embeddings` feature is built in).
-            ci_core::embedding::register_extension();
             let db_path = ci_server::default_db_path(&root);
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent)?;

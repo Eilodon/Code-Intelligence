@@ -1,10 +1,13 @@
 //! Opt-in semantic embeddings (Cargo feature `embeddings`).
 //!
 //! Pure-Rust static code embeddings via `model2vec-rs` (default
-//! `minishlab/potion-code-16M`, 256-dim), stored and searched in `sqlite-vec`.
-//! The feature is off by default so the musl static binary stays lean; this
-//! module exposes the *same* surface in both builds — when the feature is off,
-//! every entry point is a no-op and semantic search degrades to FTS.
+//! `minishlab/potion-code-16M`, 256-dim). Nearest-neighbour search is a
+//! exact brute-force cosine scan (`knn`/`knn_chunks`) over plain SQLite BLOB
+//! storage — no vector-search C extension, so this stays pure Rust and
+//! portable on every target (previously used `sqlite-vec`, which failed to
+//! compile on musl libc). This module exposes the *same* surface in both
+//! builds — when the feature is off, every entry point is a no-op and
+//! semantic search degrades to FTS.
 
 use rusqlite::Connection;
 
@@ -31,44 +34,36 @@ pub fn symbol_doc(name: &str, signature: &str, docstring: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Feature ON: real model2vec-rs + sqlite-vec implementation.
+// Feature ON: real model2vec-rs + brute-force cosine-scan implementation.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "embeddings")]
 mod imp {
     use super::*;
     use model2vec_rs::model::StaticModel;
+    use rayon::prelude::*;
 
-    /// Register the sqlite-vec extension for every subsequent connection. Must be
-    /// called once, before opening any connection that uses the `vec0` table.
-    pub fn register_extension() {
-        unsafe {
-            #[allow(clippy::missing_transmute_annotations)]
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-    }
-
-    /// Create the KNN table for `dim`-dimensional cosine vectors (idempotent).
-    pub fn create_embedding_table(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS embedding_vecs USING vec0(
+    /// Create the KNN table for symbol embeddings (idempotent). Plain BLOB
+    /// storage — nearest-neighbour search is an exact brute-force
+    /// cosine scan (see `knn`), not a vector-search extension.
+    pub fn create_embedding_table(conn: &Connection, _dim: usize) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS embedding_vecs (
                 symbol_id INTEGER PRIMARY KEY,
-                embedding FLOAT[{dim}] distance_metric=cosine
-            );"
-        ))
+                embedding BLOB NOT NULL
+            );",
+        )
     }
 
-    /// Create the Layer-2 KNN table for `dim`-dimensional code-chunk vectors
-    /// (idempotent). Separate from `embedding_vecs` — chunk ids and symbol ids
-    /// are unrelated key spaces.
-    pub fn create_chunk_embedding_table(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS code_chunk_vecs USING vec0(
+    /// Create the Layer-2 KNN table for code-chunk embeddings (idempotent).
+    /// Separate from `embedding_vecs` — chunk ids and symbol ids are
+    /// unrelated key spaces.
+    pub fn create_chunk_embedding_table(conn: &Connection, _dim: usize) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS code_chunk_vecs (
                 chunk_id INTEGER PRIMARY KEY,
-                embedding FLOAT[{dim}] distance_metric=cosine
-            );"
-        ))
+                embedding BLOB NOT NULL
+            );",
+        )
     }
 
     /// A loaded static embedding model.
@@ -107,11 +102,44 @@ mod imp {
         b
     }
 
+    fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Process-wide cache of decoded embeddings, keyed by the on-disk DB
+    /// file path. A full-table blob fetch is dominated by SQLite's per-row
+    /// marshaling, not the dot-product arithmetic, so `knn`/`knn_chunks`
+    /// decode once per (re)index cycle and reuse the result across queries
+    /// instead of re-fetching on every call. In-memory `:memory:`
+    /// connections (`Connection::path()` returns `None` — every test in
+    /// this crate uses one) bypass the cache entirely: always fetch fresh,
+    /// so tests can never leak state into each other through it.
+    type PathCache = std::sync::Mutex<std::collections::HashMap<String, Vec<(i64, Vec<f32>)>>>;
+
+    fn symbol_cache() -> &'static PathCache {
+        static CACHE: std::sync::OnceLock<PathCache> = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn chunk_cache() -> &'static PathCache {
+        static CACHE: std::sync::OnceLock<PathCache> = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn invalidate(cache: &PathCache, conn: &Connection) {
+        if let Some(path) = conn.path() {
+            cache.lock().unwrap().remove(path);
+        }
+    }
+
     pub fn store_embedding(conn: &Connection, symbol_id: i64, vec: &[f32]) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO embedding_vecs(symbol_id, embedding) VALUES (?1, ?2)",
             rusqlite::params![symbol_id, vec_to_blob(vec)],
         )?;
+        invalidate(symbol_cache(), conn);
         Ok(())
     }
 
@@ -124,6 +152,7 @@ mod imp {
             "INSERT OR REPLACE INTO code_chunk_vecs(chunk_id, embedding) VALUES (?1, ?2)",
             rusqlite::params![chunk_id, vec_to_blob(vec)],
         )?;
+        invalidate(chunk_cache(), conn);
         Ok(())
     }
 
@@ -151,18 +180,35 @@ mod imp {
         Ok(rows.len())
     }
 
-    /// Nearest `k` symbol ids to `query` by cosine distance (ascending).
+    /// Nearest `k` symbol ids to `query` by cosine distance (ascending) —
+    /// exact brute-force scan, data-parallel via `rayon` over a decoded
+    /// cache (see `symbol_cache`) so repeat queries within one (re)index
+    /// cycle skip the SQL fetch entirely — SQLite's per-row marshaling, not
+    /// the arithmetic, is what dominates cost at table-scan scale. Vectors
+    /// are L2-normalised (`Embedder::load`), so cosine distance reduces to
+    /// `1.0 - dot_product`.
     pub fn knn(conn: &Connection, query: &[f32], k: usize) -> rusqlite::Result<Vec<(i64, f64)>> {
-        let mut stmt = conn.prepare(
-            "SELECT symbol_id, distance FROM embedding_vecs \
-             WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![vec_to_blob(query), k as i64], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        match conn.path() {
+            Some(path) => {
+                let mut guard = symbol_cache().lock().unwrap();
+                if !guard.contains_key(path) {
+                    let vecs = fetch_symbol_vecs(conn)?;
+                    guard.insert(path.to_string(), vecs);
+                }
+                Ok(top_k_by_cosine(&guard[path], query, k))
+            }
+            None => Ok(top_k_by_cosine(&fetch_symbol_vecs(conn)?, query, k)),
+        }
+    }
+
+    fn fetch_symbol_vecs(conn: &Connection) -> rusqlite::Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = conn.prepare("SELECT symbol_id, embedding FROM embedding_vecs")?;
+        stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let blob = r.get_ref(1)?.as_blob().unwrap_or(&[]);
+            Ok((id, blob_to_vec(blob)))
+        })?
+        .collect()
     }
 
     /// Remove `code_chunk_vecs` rows whose chunk no longer exists in
@@ -175,10 +221,14 @@ mod imp {
     /// has no way to know a returned id is dangling before doing this exact
     /// lookup).
     pub fn prune_orphaned_chunk_vecs(conn: &Connection) -> rusqlite::Result<usize> {
-        conn.execute(
+        let n = conn.execute(
             "DELETE FROM code_chunk_vecs WHERE chunk_id NOT IN (SELECT id FROM code_chunks)",
             [],
-        )
+        )?;
+        if n > 0 {
+            invalidate(chunk_cache(), conn);
+        }
+        Ok(n)
     }
 
     /// Embed every Layer-2 code chunk that has no embedding yet; returns how
@@ -206,22 +256,49 @@ mod imp {
         Ok(rows.len())
     }
 
-    /// Nearest `k` chunk ids to `query` by cosine distance (ascending).
+    /// Nearest `k` chunk ids to `query` by cosine distance (ascending) —
+    /// same cached, data-parallel scan as `knn`.
     pub fn knn_chunks(
         conn: &Connection,
         query: &[f32],
         k: usize,
     ) -> rusqlite::Result<Vec<(i64, f64)>> {
-        let mut stmt = conn.prepare(
-            "SELECT chunk_id, distance FROM code_chunk_vecs \
-             WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![vec_to_blob(query), k as i64], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        match conn.path() {
+            Some(path) => {
+                let mut guard = chunk_cache().lock().unwrap();
+                if !guard.contains_key(path) {
+                    let vecs = fetch_chunk_vecs(conn)?;
+                    guard.insert(path.to_string(), vecs);
+                }
+                Ok(top_k_by_cosine(&guard[path], query, k))
+            }
+            None => Ok(top_k_by_cosine(&fetch_chunk_vecs(conn)?, query, k)),
+        }
+    }
+
+    fn fetch_chunk_vecs(conn: &Connection) -> rusqlite::Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM code_chunk_vecs")?;
+        stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let blob = r.get_ref(1)?.as_blob().unwrap_or(&[]);
+            Ok((id, blob_to_vec(blob)))
+        })?
+        .collect()
+    }
+
+    /// Data-parallel brute-force top-`k` by cosine distance (ascending —
+    /// smallest distance first) over already-decoded vectors.
+    fn top_k_by_cosine(vecs: &[(i64, Vec<f32>)], query: &[f32], k: usize) -> Vec<(i64, f64)> {
+        let mut scored: Vec<(i64, f64)> = vecs
+            .par_iter()
+            .map(|(id, v)| {
+                let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
+                (*id, (1.0 - dot) as f64)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
     }
 }
 
@@ -231,8 +308,6 @@ mod imp {
 #[cfg(not(feature = "embeddings"))]
 mod imp {
     use super::*;
-
-    pub fn register_extension() {}
 
     pub fn create_embedding_table(_conn: &Connection, _dim: usize) -> rusqlite::Result<()> {
         Ok(())
@@ -285,8 +360,8 @@ mod imp {
 
 pub use imp::{
     Embedder, create_chunk_embedding_table, create_embedding_table, embed_pending,
-    embed_pending_chunks, knn, knn_chunks, prune_orphaned_chunk_vecs, register_extension,
-    store_chunk_embedding, store_embedding,
+    embed_pending_chunks, knn, knn_chunks, prune_orphaned_chunk_vecs, store_chunk_embedding,
+    store_embedding,
 };
 
 #[cfg(test)]
@@ -304,9 +379,8 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn vec0_knn_with_synthetic_vectors() {
+    fn knn_with_synthetic_vectors() {
         use rusqlite::Connection;
-        register_extension();
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         create_embedding_table(&conn, 3).unwrap();
@@ -323,9 +397,8 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn vec0_knn_chunks_with_synthetic_vectors() {
+    fn knn_chunks_with_synthetic_vectors() {
         use rusqlite::Connection;
-        register_extension();
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         create_chunk_embedding_table(&conn, 3).unwrap();
@@ -344,7 +417,6 @@ mod tests {
     #[test]
     fn prune_orphaned_chunk_vecs_removes_only_dangling_rows() {
         use rusqlite::Connection;
-        register_extension();
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         create_chunk_embedding_table(&conn, 3).unwrap();
@@ -368,15 +440,20 @@ mod tests {
         assert_eq!(hits[0].0, 2);
     }
 
-    /// KNN latency benchmark: 100k synthetic 256-dim vectors, topK=10.
-    /// Run with: cargo test -p ci-core --features embeddings -- --ignored --nocapture bench_knn_latency
+    /// KNN latency benchmark: 100k synthetic 256-dim vectors, topK=10, a
+    /// *fresh connection per query* — matching real MCP usage
+    /// (`make_read_conn` opens a new `Connection` per tool call). The cache
+    /// is keyed by file path, not `Connection` identity, so this still
+    /// exercises it.
+    /// Run with: cargo test -p ci-core --release --features embeddings -- --ignored --nocapture bench_knn_latency
     #[cfg(feature = "embeddings")]
     #[test]
     #[ignore]
     fn bench_knn_latency_100k_256dim() {
         use rusqlite::Connection;
-        register_extension();
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bench.db");
+        let conn = Connection::open(&db_path).unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         create_embedding_table(&conn, 256).unwrap();
 
@@ -398,12 +475,13 @@ mod tests {
         const RUNS: u32 = 20;
         let t = std::time::Instant::now();
         for _ in 0..RUNS {
-            let h = knn(&conn, &query, 10).unwrap();
+            let fresh = Connection::open(&db_path).unwrap();
+            let h = knn(&fresh, &query, 10).unwrap();
             assert_eq!(h.len(), 10);
         }
         let total = t.elapsed();
         eprintln!(
-            "KNN {N}×{D} topK=10: {RUNS} queries | total={total:?} | avg={:?}/query",
+            "KNN {N}×{D} topK=10 (fresh connection/query): {RUNS} queries | total={total:?} | avg={:?}/query",
             total / RUNS
         );
     }

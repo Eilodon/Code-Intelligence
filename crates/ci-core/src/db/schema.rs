@@ -97,8 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
 -- matching only implementation vocabulary (e.g. a library name used inside a
 -- function body) still has something to match against. Always created —
 -- populated only when the `embeddings` feature is enabled at build time; the
--- companion `code_chunk_vecs` vec0 table lives in embedding.rs (needs the
--- sqlite-vec extension registered and a runtime-configured dimension, so it
+-- companion `code_chunk_vecs` table lives in embedding.rs (plain BLOB
+-- storage, created once the runtime-configured dimension is known, so it
 -- can't be part of this static schema).
 CREATE TABLE IF NOT EXISTS code_chunks (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

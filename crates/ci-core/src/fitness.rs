@@ -2,6 +2,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::analysis::boundaries::{BoundaryRule, BoundaryViolation, check_boundaries};
 use crate::analysis::coverage::{CoverageData, normalize_path};
 use crate::analysis::dead_code::{
     compute_dead_code_confidence, is_private_symbol, scope_clear_for_language,
@@ -34,6 +35,11 @@ pub struct FitnessThresholds {
     /// the numerator — this dilutes the percentage as their share of the
     /// codebase grows, a known limitation rather than a precision claim.
     pub max_high_complexity_pct: f64,
+    /// Max allowed count of `import_edges` that match a declared `[[boundaries]]`
+    /// rule (see `load_boundary_rules`). Default 0 — any violation of a rule
+    /// you bothered to declare fails the gate; there's no "a few is fine"
+    /// case for an architecture boundary the way there is for e.g. dead code.
+    pub max_boundary_violations: i64,
 }
 
 /// Per-symbol cyclomatic complexity above this is "high" for
@@ -51,6 +57,7 @@ impl Default for FitnessThresholds {
             max_hotspot_risk: 0.75,
             min_edge_coverage_pct: 60.0,
             max_high_complexity_pct: 15.0,
+            max_boundary_violations: 0,
         }
     }
 }
@@ -70,6 +77,28 @@ pub fn load_thresholds(config_path: Option<&Path>) -> anyhow::Result<FitnessThre
         return Ok(parsed.thresholds);
     }
     Ok(FitnessThresholds::default())
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct BoundariesTomlFile {
+    #[serde(default)]
+    boundaries: Vec<BoundaryRule>,
+}
+
+/// Architecture boundary rules declared in the same `thresholds.toml` as
+/// `load_thresholds`, under a `[[boundaries]]` array — a separate parse of
+/// the same small file rather than folding into `FitnessThresholds` itself,
+/// since a rule list isn't a scalar threshold and `load_thresholds`'
+/// existing signature/callers shouldn't need to change for this.
+pub fn load_boundary_rules(config_path: Option<&Path>) -> anyhow::Result<Vec<BoundaryRule>> {
+    if let Some(path) = config_path
+        && path.exists()
+    {
+        let text = std::fs::read_to_string(path)?;
+        let parsed: BoundariesTomlFile = toml::from_str(&text)?;
+        return Ok(parsed.boundaries);
+    }
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +276,9 @@ pub struct FitnessCheckResult {
     pub passed: bool,
     pub checks: Vec<FitnessCheckItem>,
     pub metrics: FitnessMetrics,
+    /// Full detail behind the `boundary_violations` check — empty whenever
+    /// that check passes (including when no rules are declared at all).
+    pub boundary_violations: Vec<BoundaryViolation>,
 }
 
 pub fn run_fitness_check(
@@ -254,8 +286,10 @@ pub fn run_fitness_check(
     thresholds: &FitnessThresholds,
     project_root: &Path,
     coverage: &CoverageData,
+    boundary_rules: &[BoundaryRule],
 ) -> rusqlite::Result<FitnessCheckResult> {
     let metrics = collect_metrics(conn, project_root, coverage)?;
+    let boundary_violations = check_boundaries(conn, boundary_rules)?;
     let mut checks = Vec::new();
 
     checks.push(FitnessCheckItem {
@@ -337,11 +371,29 @@ pub fn run_fitness_check(
         ),
     });
 
+    checks.push(FitnessCheckItem {
+        metric: "boundary_violations".into(),
+        value: boundary_violations.len() as f64,
+        threshold: thresholds.max_boundary_violations as f64,
+        passed: boundary_violations.len() as i64 <= thresholds.max_boundary_violations,
+        message: format!(
+            "Architecture boundary violations {} (max {}){}",
+            boundary_violations.len(),
+            thresholds.max_boundary_violations,
+            if boundary_rules.is_empty() {
+                " — no [[boundaries]] rules declared"
+            } else {
+                ""
+            }
+        ),
+    });
+
     let passed = checks.iter().all(|c| c.passed);
     Ok(FitnessCheckResult {
         passed,
         checks,
         metrics,
+        boundary_violations,
     })
 }
 
@@ -542,6 +594,7 @@ mod tests {
         assert_eq!(t.max_hotspot_risk, 0.75);
         assert_eq!(t.min_edge_coverage_pct, 60.0);
         assert_eq!(t.max_high_complexity_pct, 15.0);
+        assert_eq!(t.max_boundary_violations, 0);
     }
 
     #[test]
@@ -553,10 +606,11 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 7);
+        assert_eq!(result.checks.len(), 8);
     }
 
     #[test]
@@ -580,6 +634,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(!result.passed);
@@ -615,6 +670,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
 
@@ -662,6 +718,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(!result.passed);
@@ -761,6 +818,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         let check = result
@@ -827,6 +885,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         let check = result
@@ -908,6 +967,105 @@ mod tests {
     fn test_load_thresholds_missing_file() {
         let thresholds = load_thresholds(Some(Path::new("/nonexistent/path.toml"))).unwrap();
         assert_eq!(thresholds.max_hub_count, 50);
+    }
+
+    #[test]
+    fn test_load_boundary_rules_from_same_toml_file() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[thresholds]\nmax_hub_count = 5\n\n\
+             [[boundaries]]\n\
+             from = \"crates/ci-core/\"\n\
+             to = \"crates/ci-server/\"\n\
+             reason = \"core must not depend on server\"\n\n\
+             [[boundaries]]\n\
+             from = \"a/\"\n\
+             to = \"b/\"\n"
+        )
+        .unwrap();
+
+        let rules = load_boundary_rules(Some(f.path())).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].from, "crates/ci-core/");
+        assert_eq!(rules[0].to, "crates/ci-server/");
+        assert_eq!(rules[0].reason, "core must not depend on server");
+        assert_eq!(rules[1].reason, "", "reason defaults to empty string");
+
+        // Same file, load_thresholds must still work independently.
+        let thresholds = load_thresholds(Some(f.path())).unwrap();
+        assert_eq!(thresholds.max_hub_count, 5);
+    }
+
+    #[test]
+    fn test_load_boundary_rules_missing_file_or_no_section() {
+        assert!(
+            load_boundary_rules(Some(Path::new("/nonexistent/path.toml")))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_boundary_rules(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_boundary_violations_fail_gates_fitness_check() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) \
+             VALUES ('crates/ci-core/src/x.rs', 'crates/ci-server/src/y.rs', 'y')",
+            [],
+        )
+        .unwrap();
+        let rules = vec![crate::analysis::boundaries::BoundaryRule {
+            from: "crates/ci-core/".into(),
+            to: "crates/ci-server/".into(),
+            reason: "core must not depend on server".into(),
+        }];
+
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &rules,
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "boundary_violations")
+            .unwrap();
+        assert!(!check.passed);
+        assert_eq!(check.value, 1.0);
+        assert!(!result.passed);
+        assert_eq!(result.boundary_violations.len(), 1);
+        assert_eq!(
+            result.boundary_violations[0].reason,
+            "core must not depend on server"
+        );
+    }
+
+    #[test]
+    fn test_no_boundary_rules_declared_passes_by_default() {
+        let conn = test_conn();
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "boundary_violations")
+            .unwrap();
+        assert!(check.passed);
+        assert!(result.boundary_violations.is_empty());
     }
 
     #[test]

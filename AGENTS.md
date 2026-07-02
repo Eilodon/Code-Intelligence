@@ -12,6 +12,8 @@
 
 **`edit_context` is PRE-edit. `diff_impact` is POST-edit.** Never swap them.
 
+**MCP Prompts for recurring workflows.** `review_symbol(symbol)`, `debug_symbol(symbol)`, `onboard_area(path)` package a whole multi-stage sequence (e.g. Stage 2→3→5 for `review_symbol`) into one message, surfaced by clients as slash-commands. A prompt returns instructions only — it does not call tools itself; you still execute each step. Use one when a user's ask matches its shape instead of re-deriving the stage sequence from scratch.
+
 ---
 
 ## Stage 1 — Orient
@@ -120,6 +122,7 @@ edit_context("getUserByEmail")
 - `index_freshness.stale_callers: true` → file changed since last index; results may lag
 - `edges_ready: false` → call graph still building; treat results as lower-confidence
 - `callers[].edge_confidence == "textual"` → may be false positives AND missed real callers
+- `co_changed_files` non-empty → these files have no import/call relationship to the one you're editing, but historically changed together with it in the same commit — a coupling signal the call graph cannot see (e.g. a model + its migration). Consider whether they need updating too.
 
 **Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced, not just convention: the first `Edit` of a source-code file each session is denied until `edit_context` has been called at least once that session.
 

@@ -1368,6 +1368,27 @@ impl From<ci_core::fitness::TrendInfo> for TrendOutput {
     }
 }
 
+/// A file with no import/call relationship to the symbol's file, but that
+/// historically changed alongside it in the same commit — a coupling signal
+/// the static graph cannot see. See `ci_core::analysis::cochange`.
+#[derive(Serialize, JsonSchema)]
+struct CoChangedFileOutput {
+    path: String,
+    co_change_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_co_changed: Option<String>,
+}
+
+impl From<ci_core::analysis::cochange::CoChangeEntry> for CoChangedFileOutput {
+    fn from(e: ci_core::analysis::cochange::CoChangeEntry) -> Self {
+        Self {
+            path: e.path,
+            co_change_count: e.co_change_count,
+            last_co_changed: e.last_co_changed,
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 struct EditContextOutput {
     symbol: String,
@@ -1382,6 +1403,10 @@ struct EditContextOutput {
     /// old (e.g. `ci fitness-check` hasn't run for that long) — not an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     trend: Option<TrendOutput>,
+    /// Empty when git is unavailable or no file co-changed with this
+    /// symbol's file often enough to clear `config.cochange.min_co_changes`
+    /// — not an error signal, most edits legitimately have none.
+    co_changed_files: Vec<CoChangedFileOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -2483,8 +2508,9 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .collect()
             };
 
+            let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+
             let blast_radius = {
-                let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
                 let (entries, _capped) = transitive_bfs(
                     &conn,
                     &c.qualified_name,
@@ -2501,6 +2527,19 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     files_affected,
                 }
             };
+
+            let co_changed_files: Vec<CoChangedFileOutput> =
+                ci_core::analysis::cochange::compute_co_changes(
+                    &self.project_root,
+                    &c.path,
+                    &config.cochange.since,
+                    config.cochange.min_co_changes,
+                    config.cochange.top_n,
+                )
+                .entries
+                .into_iter()
+                .map(CoChangedFileOutput::from)
+                .collect();
 
             let risk = if callers.len() > 10 {
                 Some("high".into())
@@ -2528,6 +2567,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 blast_radius,
                 risk_assessment: risk,
                 trend,
+                co_changed_files,
                 suggested_next: self.filter_sn(suggested(
                     "diff_impact",
                     "MANDATORY after changes — verify blast radius",
@@ -3329,6 +3369,101 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     }
 }
 
+/// MCP Prompts — canned, parameterized instruction messages a client can
+/// surface as slash commands (e.g. Claude Code shows these as
+/// `/mcp__ci__review_symbol`). Distinct from `suggested_next`: a prompt
+/// returns one message *before* the agent starts, packaging a whole
+/// recurring workflow (pre-PR review, debugging a symbol, onboarding to an
+/// area) into one invocation instead of the agent discovering the right
+/// tool sequence step by step. A prompt does NOT execute tool calls itself
+/// — rmcp's `get_prompt`/`list_prompts` only return message content; the
+/// agent still has to act on the returned instructions itself.
+fn ci_prompts() -> Vec<rmcp::model::Prompt> {
+    vec![
+        rmcp::model::Prompt::new(
+            "review_symbol",
+            Some(
+                "Pre-edit review: locate, read source, check blast radius/risk, and list callers for one symbol before touching it.",
+            ),
+            Some(vec![rmcp::model::PromptArgument {
+                name: "symbol".into(),
+                description: Some("Symbol name to review".into()),
+                required: Some(true),
+            }]),
+        ),
+        rmcp::model::Prompt::new(
+            "debug_symbol",
+            Some(
+                "Debug a symbol: read its implementation, trace callers, and check dead-code/test-coverage signals.",
+            ),
+            Some(vec![rmcp::model::PromptArgument {
+                name: "symbol".into(),
+                description: Some("Symbol name to debug".into()),
+                required: Some(true),
+            }]),
+        ),
+        rmcp::model::Prompt::new(
+            "onboard_area",
+            Some(
+                "Get oriented in an unfamiliar area: map overall structure, then zoom into one path and its hotspots.",
+            ),
+            Some(vec![rmcp::model::PromptArgument {
+                name: "path".into(),
+                description: Some("File or directory path to onboard into".into()),
+                required: Some(true),
+            }]),
+        ),
+    ]
+}
+
+/// Text for one prompt's message, with `{name}` substituted into the
+/// template — kept as plain string building (no template engine) since
+/// there are exactly 3 prompts and each has exactly one argument.
+fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Option<String> {
+    let arg = |key: &str| -> String {
+        arguments
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<MISSING ARGUMENT>")
+            .to_string()
+    };
+
+    match name {
+        "review_symbol" => {
+            let symbol = arg("symbol");
+            Some(format!(
+                "Review `{symbol}` before editing it, following the CI MCP workflow (AGENTS.md Stage 2-5):\n\
+                 1. Call locate(\"{symbol}\") to find its file, line range, and hub status.\n\
+                 2. Call source(\"{symbol}\") to read its current implementation.\n\
+                 3. Call edit_context(\"{symbol}\") — mandatory, never skip — for the confidence-ordered callers list, blast radius, and risk assessment.\n\
+                 4. Summarize: is this safe to edit? What's the risk level? Which callers (if any) would need updating if the signature changes?"
+            ))
+        }
+        "debug_symbol" => {
+            let symbol = arg("symbol");
+            Some(format!(
+                "Debug `{symbol}`:\n\
+                 1. Call understand(\"{symbol}\") to read its implementation and callers summary in one call.\n\
+                 2. Call callers(\"{symbol}\", max_depth=3) for the full transitive call chain if the bug could originate upstream.\n\
+                 3. Check `health.test_files`/`dead_code_confidence` in the result — if test_files is empty, flag that this symbol has no test coverage before concluding.\n\
+                 Summarize what the symbol does, who calls it, and any coverage gaps relevant to the bug."
+            ))
+        }
+        "onboard_area" => {
+            let path = arg("path");
+            Some(format!(
+                "Get oriented in `{path}`:\n\
+                 1. Call repo_overview() first if you haven't this session, for overall structure.\n\
+                 2. Call file_overview(\"{path}\") (or dependencies(\"{path}\") for a whole module) to see what's there and how it connects to the rest of the codebase.\n\
+                 3. Call hotspots(top_n=5) and check whether any hotspot falls under `{path}` — that's where the riskiest code in this area is.\n\
+                 Summarize: what does this area do, what's its role in the codebase, and what should I be careful about here?"
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[tool(tool_box)]
 impl rmcp::ServerHandler for CodeIntelligenceServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
@@ -3337,12 +3472,55 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
             // Without this, `capabilities.tools` is omitted from `initialize`
             // (ServerCapabilities::default() -> tools: None), and a spec-compliant
             // MCP client never calls tools/list at all — the server responds fine
-            // if asked directly, but no tools ever get registered.
+            // if asked directly, but no tools ever get registered. Same logic
+            // applies to `enable_prompts()` for `prompts/list`.
             capabilities: rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_prompts()
                 .build(),
             ..Default::default()
         }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: rmcp::model::PaginatedRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<
+        Output = Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData>,
+    > + Send
+    + '_ {
+        std::future::ready(Ok(rmcp::model::ListPromptsResult {
+            next_cursor: None,
+            prompts: ci_prompts(),
+        }))
+    }
+
+    fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<
+        Output = Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData>,
+    > + Send
+    + '_ {
+        let result = match render_prompt(&request.name, &request.arguments) {
+            Some(text) => Ok(rmcp::model::GetPromptResult {
+                description: ci_prompts()
+                    .into_iter()
+                    .find(|p| p.name == request.name)
+                    .and_then(|p| p.description),
+                messages: vec![rmcp::model::PromptMessage::new_text(
+                    rmcp::model::PromptMessageRole::User,
+                    text,
+                )],
+            }),
+            None => Err(rmcp::model::ErrorData::invalid_params(
+                format!("unknown prompt: {}", request.name),
+                None,
+            )),
+        };
+        std::future::ready(result)
     }
 }
 
@@ -3476,6 +3654,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same regression class as `get_info_advertises_tools_capability`,
+    /// for `prompts/list` this time.
+    #[test]
+    fn get_info_advertises_prompts_capability() {
+        use rmcp::ServerHandler;
+
+        let dir = std::env::temp_dir().join(format!("ci_prompt_caps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        assert!(
+            server.get_info().capabilities.prompts.is_some(),
+            "capabilities.prompts must be Some, or clients never call prompts/list"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ci_prompts_lists_all_three_with_required_arguments() {
+        let prompts = ci_prompts();
+        let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["review_symbol", "debug_symbol", "onboard_area"]);
+        for p in &prompts {
+            assert!(p.description.is_some(), "{}: missing description", p.name);
+            let args = p
+                .arguments
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: must declare its argument", p.name));
+            assert_eq!(args.len(), 1, "{}: expected exactly 1 argument", p.name);
+            assert_eq!(args[0].required, Some(true));
+        }
+    }
+
+    #[test]
+    fn render_prompt_review_symbol_substitutes_argument_and_mentions_workflow_tools() {
+        let mut args = serde_json::Map::new();
+        args.insert("symbol".into(), serde_json::json!("getUserByEmail"));
+
+        let text = render_prompt("review_symbol", &Some(args)).unwrap();
+        assert!(text.contains("getUserByEmail"));
+        assert!(text.contains("locate("));
+        assert!(text.contains("source("));
+        assert!(text.contains("edit_context("));
+        assert!(
+            text.to_lowercase().contains("mandatory"),
+            "must not soften the edit_context requirement, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_prompt_debug_symbol_mentions_coverage_check() {
+        let mut args = serde_json::Map::new();
+        args.insert("symbol".into(), serde_json::json!("parse_config"));
+
+        let text = render_prompt("debug_symbol", &Some(args)).unwrap();
+        assert!(text.contains("parse_config"));
+        assert!(text.contains("understand("));
+        assert!(text.contains("callers("));
+        assert!(text.contains("test_files"));
+    }
+
+    #[test]
+    fn render_prompt_onboard_area_substitutes_path() {
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), serde_json::json!("crates/ci-core/src/graph"));
+
+        let text = render_prompt("onboard_area", &Some(args)).unwrap();
+        assert!(text.contains("crates/ci-core/src/graph"));
+        assert!(text.contains("repo_overview("));
+        assert!(text.contains("hotspots("));
+    }
+
+    #[test]
+    fn render_prompt_unknown_name_returns_none() {
+        assert!(render_prompt("not_a_real_prompt", &None).is_none());
+    }
+
+    #[test]
+    fn render_prompt_missing_argument_is_visible_not_silently_empty() {
+        // No "symbol" key supplied at all — must not render as an empty
+        // string that reads like a valid (if odd) instruction.
+        let text = render_prompt("review_symbol", &None).unwrap();
+        assert!(text.contains("<MISSING ARGUMENT>"));
     }
 
     #[test]
@@ -3816,6 +4081,65 @@ mod tests {
         );
         assert_eq!(v["index_freshness"], "scanning");
         assert_eq!(v["edges_ready"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `edit_context` must surface files that historically co-changed with
+    /// the target symbol's file even though nothing imports/calls between
+    /// them — a signal the call graph alone cannot produce.
+    #[test]
+    fn edit_context_includes_co_changed_files() {
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        let dir = std::env::temp_dir().join(format!("ci_editctx_cochange_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "Test"]);
+
+        // model.rs and migration.rs change together 3x — no import/call
+        // relationship between them at all.
+        std::fs::write(dir.join("model.rs"), "1").unwrap();
+        std::fs::write(dir.join("migration.rs"), "1").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+        for i in 0..2 {
+            std::fs::write(dir.join("model.rs"), format!("{i}")).unwrap();
+            std::fs::write(dir.join("migration.rs"), format!("{i}")).unwrap();
+            run_git(&dir, &["commit", "-q", "-am", "bump"]);
+        }
+
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.model_fn', 'model_fn', 'function', 'rust', 'model.rs', 1, 1, '', '', 'model_fn', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.edit_context(EditContextParams {
+            symbol: "model_fn".into(),
+            path: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let co_changed = v["co_changed_files"].as_array().unwrap();
+        assert_eq!(co_changed.len(), 1, "got: {v}");
+        assert_eq!(co_changed[0]["path"], "migration.rs");
+        assert_eq!(co_changed[0]["co_change_count"], 3);
+        assert!(co_changed[0]["last_co_changed"].is_string());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

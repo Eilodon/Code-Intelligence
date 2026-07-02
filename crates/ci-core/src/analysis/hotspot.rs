@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
 
 use rusqlite::Connection;
 
@@ -216,45 +215,29 @@ fn complexity_score(c: &ComplexityInfo) -> f64 {
 }
 
 fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, ChurnInfo>, bool) {
-    let result = Command::new("git")
-        .args([
-            "log",
-            &format!("--since={since}"),
-            "--name-only",
-            "--format=|||%ae|||%aI",
-        ])
-        .current_dir(project_root)
-        .output();
+    // Git already reports paths relative to `current_dir` (project_root) using
+    // forward slashes — this must match `symbols.path`'s format exactly (see
+    // `pipeline::rel_path`), or the churn/complexity merge below silently drops
+    // every candidate.
+    let (commits, git_available) = super::git_log::commits_with_files(project_root, since);
+    if !git_available {
+        return (HashMap::new(), false);
+    }
 
-    let output = match result {
-        Ok(o) if o.status.success() => o,
-        _ => return (HashMap::new(), false),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut churn_map: HashMap<String, ChurnInfo> = HashMap::new();
-    let mut current_author: Option<String> = None;
-    let mut current_date: Option<String> = None;
-
-    for line in stdout.lines() {
-        if line.starts_with("|||") {
-            let parts: Vec<&str> = line.split("|||").collect();
-            current_author = parts.get(1).map(|s| s.trim().to_string());
-            current_date = parts.get(2).map(|s| s.trim().to_string());
-        } else if !line.trim().is_empty() {
-            // Git already reports paths relative to `current_dir` (project_root) using
-            // forward slashes — this must match `symbols.path`'s format exactly (see
-            // `pipeline::rel_path`), or the churn/complexity merge below silently drops
-            // every candidate.
-            let rel_path = line.trim().to_string();
-            let entry = churn_map.entry(rel_path).or_insert_with(|| ChurnInfo {
+    // `commits` is newest-first (git log's default order): `or_insert_with`
+    // only fires on a file's first occurrence, so `last_changed` naturally
+    // ends up as the date of the most recent commit that touched it.
+    for commit in &commits {
+        for path in &commit.files {
+            let entry = churn_map.entry(path.clone()).or_insert_with(|| ChurnInfo {
                 commit_count: 0,
                 authors: HashSet::new(),
                 // H-1 fix: last_changed is Option<String>, None instead of ""
-                last_changed: current_date.clone(),
+                last_changed: commit.date.clone(),
             });
             entry.commit_count += 1;
-            if let Some(ref author) = current_author {
+            if let Some(ref author) = commit.author {
                 entry.authors.insert(author.clone());
             }
         }
@@ -320,6 +303,7 @@ fn query_top_symbols(conn: &Connection, path: &str) -> Vec<HotspotSymbol> {
 mod tests {
     use super::*;
     use crate::db::schema::init_db;
+    use std::process::Command;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

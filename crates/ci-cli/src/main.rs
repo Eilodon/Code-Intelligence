@@ -123,12 +123,12 @@ async fn main() -> Result<()> {
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 match ci_core::embedding::Embedder::load(&semantic.model, semantic.dimensions) {
                     Ok(embedder) => {
-                        ci_core::embedding::create_embedding_table(&conn, semantic.dimensions)?;
+                        // embedder.dim() (real, probed at load time) rather than
+                        // semantic.dimensions (config, possibly stale) — see
+                        // Embedder::load and create_embedding_table's self-heal.
+                        ci_core::embedding::create_embedding_table(&conn, embedder.dim())?;
                         let n = ci_core::embedding::embed_pending(&conn, &embedder)?;
-                        ci_core::embedding::create_chunk_embedding_table(
-                            &conn,
-                            semantic.dimensions,
-                        )?;
+                        ci_core::embedding::create_chunk_embedding_table(&conn, embedder.dim())?;
                         let nc = ci_core::embedding::embed_pending_chunks(&conn, &embedder)?;
                         println!(" {n} symbols, {nc} code chunks embedded.");
                     }

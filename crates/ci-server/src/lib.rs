@@ -156,12 +156,15 @@ pub fn bootstrap_embeddings(
             return;
         }
     };
-    if let Err(e) = ci_core::embedding::create_embedding_table(conn, semantic.dimensions) {
+    // `model.dim()` (real, probed at load time) rather than
+    // `semantic.dimensions` (config, possibly stale) — see
+    // `Embedder::load` and `create_embedding_table`'s self-heal.
+    if let Err(e) = ci_core::embedding::create_embedding_table(conn, model.dim()) {
         tracing::error!("Embedding table creation failed: {e}");
         *status.write().unwrap() = EmbedStatus::Failed;
         return;
     }
-    if let Err(e) = ci_core::embedding::create_chunk_embedding_table(conn, semantic.dimensions) {
+    if let Err(e) = ci_core::embedding::create_chunk_embedding_table(conn, model.dim()) {
         tracing::error!("Chunk embedding table creation failed: {e}");
         *status.write().unwrap() = EmbedStatus::Failed;
         return;

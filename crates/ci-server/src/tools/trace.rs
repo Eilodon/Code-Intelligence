@@ -13,7 +13,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -105,7 +105,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -277,9 +277,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let from = {
-                resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref())
-            };
+            let from = { resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref(), p.from_line) };
             let from = match from {
                 SymbolResolution::NotFound => return not_found_json(&p.from_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -288,9 +286,7 @@ impl CodeIntelligenceServer {
             self.track_symbol(&from.qualified_name);
             self.track_file(&from.path);
 
-            let to = {
-                resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref())
-            };
+            let to = { resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref(), p.to_line) };
             let to = match to {
                 SymbolResolution::NotFound => return not_found_json(&p.to_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -363,6 +359,11 @@ pub(crate) struct CallersParams {
     pub(crate) symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file — any line within
+    /// the intended candidate's range (see an earlier `ambiguous` response's
+    /// `line_start`/`line_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
     #[serde(default)]
     pub(crate) transitive: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,6 +396,11 @@ pub(crate) struct CalleesParams {
     pub(crate) symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file — any line within
+    /// the intended candidate's range (see an earlier `ambiguous` response's
+    /// `line_start`/`line_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
     #[serde(default)]
     pub(crate) transitive: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,6 +465,13 @@ pub(crate) struct PathParams {
     pub(crate) from_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) to_path: Option<String>,
+    /// Disambiguates a same-named `from_symbol` in the same file — any line
+    /// within the intended candidate's range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from_line: Option<i64>,
+    /// Same as `from_line`, for `to_symbol`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_hops: Option<i64>,
 }

@@ -73,6 +73,23 @@ is_code_file() {
   esac
 }
 
+# Deliberately an denylist, not "not is_code_file()": Grep's `path` can be a
+# directory or unset (repo-wide, likely to include real code either way), so
+# the safe default is to keep nudging unless the target is unambiguously a
+# single file of a kind `ci` never indexes (see repo_overview's 14-language
+# list — YAML/Markdown/TOML/JSON/lockfiles aren't in it). An allowlist like
+# is_code_file's would misfire on a bare directory path (no matching suffix
+# -> wrongly treated as "not code") and suppress a nudge that's still useful.
+is_clearly_non_code_file() {
+  case "$1" in
+    *.yml | *.yaml | *.md | *.toml | *.json | *.lock | *.txt | \
+    *.gitignore | *.gitattributes)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 # Resolve the git repo root that `cmd` will actually operate on, so the
 # commit/push gate only fires for *this* project's repo — not an unrelated
 # repo the agent is inspecting/debugging elsewhere (e.g. a scratch clone
@@ -116,10 +133,18 @@ fi
 
 case "$tool_name" in
   Read)
-    nudge 'CI available in this repo — prefer mcp__ci__source(symbol) for a symbol-precise read, or mcp__ci__file_overview(path) instead of reading the whole file (AGENTS.md Stage 3).'
+    # Fail toward showing the nudge on an empty/unrecognized file_path (same
+    # philosophy as resolve_git_target_root below) — only suppress it for a
+    # file we're sure `ci` has nothing indexed for.
+    if [ -z "$file_path" ] || is_code_file "$file_path"; then
+      nudge 'CI available in this repo — prefer mcp__ci__source(symbol) for a symbol-precise read, or mcp__ci__file_overview(path) instead of reading the whole file (AGENTS.md Stage 3).'
+    fi
     ;;
   Grep)
-    nudge 'CI available in this repo — prefer mcp__ci__search(query, kind="hybrid") or mcp__ci__locate(query) instead of Grep (AGENTS.md Stage 2).'
+    grep_path=$(jq -r '.tool_input.path // ""' <<<"$input")
+    if [ -z "$grep_path" ] || ! is_clearly_non_code_file "$grep_path"; then
+      nudge 'CI available in this repo — prefer mcp__ci__search(query, kind="hybrid") or mcp__ci__locate(query) instead of Grep (AGENTS.md Stage 2).'
+    fi
     ;;
   Edit)
     save_state "$edit_context_called" true

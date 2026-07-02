@@ -19,7 +19,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
@@ -267,11 +267,25 @@ impl CodeIntelligenceServer {
                         // A symbol that didn't exist before this diff cannot have had
                         // its signature "changed" — there is no prior signature to
                         // compare against, and (by definition) no prior call sites.
+                        // `is_signature_changed` (line-overlap) is a cheap pre-filter;
+                        // when it's true, `is_signature_semantically_changed` still has
+                        // to agree the *text* actually differs (not just a parameter
+                        // rename or reformat) before this escalates to high risk.
                         let signature_changed = !is_new_symbol
                             && ci_core::analysis::diff_impact::is_signature_changed(
                                 (line_start, sig_end),
                                 &fd.added_lines,
-                            );
+                            )
+                            && {
+                                let (old_text, new_text) =
+                                    ci_core::analysis::diff_impact::signature_text_before_after(
+                                        fd,
+                                        (line_start, sig_end),
+                                    );
+                                ci_core::analysis::diff_impact::is_signature_semantically_changed(
+                                    &old_text, &new_text,
+                                )
+                            };
 
                         let base_level = if caller_count > 10 {
                             "high"
@@ -404,6 +418,12 @@ pub(crate) struct EditContextParams {
     pub(crate) symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file (e.g. a
+    /// `#[cfg(feature)]` real impl vs. its stub) — any line within the
+    /// intended candidate's range, as echoed in an earlier `ambiguous`
+    /// response's `line_start`/`line_end`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
 }
 
 #[derive(Serialize, JsonSchema)]

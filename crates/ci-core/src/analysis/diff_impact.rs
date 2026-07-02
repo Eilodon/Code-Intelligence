@@ -112,6 +112,15 @@ pub struct FileDiff {
     /// not enough — this is precise per line. A symbol whose signature range
     /// is fully covered by these didn't exist as that text before this diff.
     pub added_lines: std::collections::HashSet<i64>,
+    /// Text of each `+` line, keyed by the same new-file line numbers as
+    /// `added_lines` — lets a caller reconstruct what a changed range now
+    /// reads as, not just that it changed (see `is_signature_semantically_changed`).
+    pub added_line_text: std::collections::HashMap<i64, String>,
+    /// Text of each `-` line, grouped per hunk (index-aligned with `hunks`)
+    /// in original hunk order. Old-file line numbers aren't tracked at all
+    /// (nothing here needs them) — this is only ever used to reconstruct
+    /// "what did this hunk's pre-image roughly read as", concatenated.
+    pub removed_line_text: Vec<Vec<String>>,
     pub is_new_file: bool,
     pub is_deleted_file: bool,
 }
@@ -135,6 +144,8 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
                 path: parse_diff_git_header(rest),
                 hunks: Vec::new(),
                 added_lines: std::collections::HashSet::new(),
+                added_line_text: std::collections::HashMap::new(),
+                removed_line_text: Vec::new(),
                 is_new_file: false,
                 is_deleted_file: false,
             });
@@ -159,6 +170,7 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
             && let Some(f) = current.as_mut()
         {
             f.hunks.push((new_start, new_end));
+            f.removed_line_text.push(Vec::new());
             new_line_cursor = new_start;
         } else if new_line_cursor > 0
             && let Some(f) = current.as_mut()
@@ -167,14 +179,19 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
             // new-file line (then the cursor advances); ` ` (context) lines
             // also advance the cursor but aren't additions; `-` (old-file
             // only) lines don't touch the new-file cursor at all.
-            if line.starts_with('+') {
+            if let Some(text) = line.strip_prefix('+') {
                 f.added_lines.insert(new_line_cursor);
+                f.added_line_text.insert(new_line_cursor, text.to_string());
                 new_line_cursor += 1;
             } else if line.starts_with(' ') {
                 new_line_cursor += 1;
+            } else if let Some(text) = line.strip_prefix('-')
+                && let Some(removed) = f.removed_line_text.last_mut()
+            {
+                removed.push(text.to_string());
             }
-            // Anything else (e.g. `-` lines, "\ No newline at end of file")
-            // doesn't correspond to a new-file line — ignored.
+            // Anything else (e.g. "\ No newline at end of file") doesn't
+            // correspond to a new-file line — ignored.
         }
     }
     if let Some(f) = current.take() {
@@ -222,6 +239,62 @@ fn parse_hunk_header(rest: &str) -> Option<(i64, i64)> {
 pub fn is_signature_changed(signature_range: (i64, i64), added_lines: &HashSet<i64>) -> bool {
     let (start, end) = signature_range;
     (start..=end).any(|line| added_lines.contains(&line))
+}
+
+/// Matches a bare parameter-name prefix (`ident:`) so it can be stripped
+/// down to just `:` before comparing signature text — e.g. `_dim: usize`
+/// and `dim: usize` both normalize to `: usize`. Deliberately does not
+/// touch `->` (return types are never preceded by an identifier + `:` in
+/// this shape), so a return-type change still registers as a real diff.
+static PARAM_NAME: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\s*:").unwrap());
+
+/// Collapses whitespace runs and strips parameter names (see `PARAM_NAME`)
+/// so two signature snippets that differ only in naming or formatting
+/// normalize to the same string.
+fn normalize_signature_text(text: &str) -> String {
+    let stripped = PARAM_NAME.replace_all(text, ":");
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when the *meaning* of a signature changed, not just that a line
+/// inside its range was touched. `is_signature_changed`'s line-overlap
+/// check can't tell a parameter rename (`_dim: usize` -> `dim: usize`, no
+/// caller impact) apart from a real type/arity/order/return-type change
+/// (breaks every caller) — this compares normalized old vs. new text
+/// instead. Also absorbs same-line whitespace-only reformatting (extra/
+/// collapsed spaces); it does *not* claim multi-line-vs-single-line
+/// rewraps normalize the same (rustfmt's multi-line form adds trailing
+/// commas single-line form doesn't have — a real textual difference this
+/// intentionally leaves as "changed" rather than trying to be a real
+/// parser).
+pub fn is_signature_semantically_changed(old_text: &str, new_text: &str) -> bool {
+    normalize_signature_text(old_text) != normalize_signature_text(new_text)
+}
+
+/// Reconstructs old and new text for `signature_range`, for
+/// `is_signature_semantically_changed` to compare. "New" is `fd`'s added
+/// (`+`) line text for exactly the lines in range; "old" is the removed
+/// (`-`) text of every hunk overlapping the range — both joined with a
+/// space in original order. Either side can come back empty (a pure
+/// insertion or pure removal within the range); the caller compares
+/// whatever it gets as-is.
+pub fn signature_text_before_after(fd: &FileDiff, signature_range: (i64, i64)) -> (String, String) {
+    let (start, end) = signature_range;
+    let new_text = (start..=end)
+        .filter_map(|l| fd.added_line_text.get(&l))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let old_text = fd
+        .hunks
+        .iter()
+        .zip(fd.removed_line_text.iter())
+        .filter(|((hs, he), _)| !(*he < start || *hs > end))
+        .flat_map(|(_, removed)| removed.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (old_text, new_text)
 }
 
 /// True when `signature_range` falls entirely within territory that didn't
@@ -364,6 +437,94 @@ mod tests {
             is_signature_changed((1, 5), &added),
             "line 3 is genuinely new"
         );
+    }
+
+    /// Regression: a parameter rename (no caller impact) must not register
+    /// as a semantic signature change, but a real type/arity/order/return
+    /// change (breaks every caller) must — this is the whole point of
+    /// `is_signature_semantically_changed` over line-overlap alone.
+    #[test]
+    fn test_is_signature_semantically_changed_distinguishes_rename_from_real_change() {
+        assert!(
+            !is_signature_semantically_changed(
+                "pub fn f(_dim: usize) -> Result<()> {",
+                "pub fn f(dim: usize) -> Result<()> {"
+            ),
+            "renaming a parameter must not count as a signature change"
+        );
+        assert!(
+            !is_signature_semantically_changed(
+                "pub fn f(dim:    usize)   ->   Result<()> {",
+                "pub fn f(dim: usize) -> Result<()> {"
+            ),
+            "whitespace-only reformatting must not count as a signature change"
+        );
+        assert!(
+            is_signature_semantically_changed(
+                "pub fn f(dim: usize) -> Result<()> {",
+                "pub fn f(dim: u64) -> Result<()> {"
+            ),
+            "a real type change must count as a signature change"
+        );
+        assert!(
+            is_signature_semantically_changed(
+                "pub fn f(dim: usize) -> Result<()> {",
+                "pub fn f(dim: usize, extra: bool) -> Result<()> {"
+            ),
+            "adding a parameter must count as a signature change"
+        );
+        assert!(
+            is_signature_semantically_changed(
+                "pub fn f(a: usize, b: String) -> Result<()> {",
+                "pub fn f(b: String, a: usize) -> Result<()> {"
+            ),
+            "reordering parameters must count as a signature change (breaks positional callers)"
+        );
+        assert!(
+            is_signature_semantically_changed(
+                "pub fn f(dim: usize) -> Result<()> {",
+                "pub fn f(dim: usize) -> Result<i64> {"
+            ),
+            "a return-type change must count as a signature change"
+        );
+    }
+
+    /// End-to-end: a real unified diff that only renames a parameter must
+    /// resolve to "not semantically changed" once `signature_text_before_after`
+    /// reconstructs old/new text from the parsed hunks.
+    #[test]
+    fn test_signature_text_before_after_rename_only_diff() {
+        let diff = [
+            "diff --git a/src/lib.rs b/src/lib.rs",
+            "--- a/src/lib.rs",
+            "+++ b/src/lib.rs",
+            "@@ -1,3 +1,3 @@",
+            "-pub fn load(_dim: usize) -> Result<()> {",
+            "+pub fn load(dim: usize) -> Result<()> {",
+            "     Ok(())",
+            " }",
+        ]
+        .join("\n");
+        let files = parse_unified_diff(&diff);
+        let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
+        assert!(!is_signature_semantically_changed(&old_text, &new_text));
+
+        // Contrast: a same-shaped diff that actually changes the type must
+        // resolve to "changed".
+        let diff = [
+            "diff --git a/src/lib.rs b/src/lib.rs",
+            "--- a/src/lib.rs",
+            "+++ b/src/lib.rs",
+            "@@ -1,3 +1,3 @@",
+            "-pub fn load(dim: usize) -> Result<()> {",
+            "+pub fn load(dim: u64) -> Result<()> {",
+            "     Ok(())",
+            " }",
+        ]
+        .join("\n");
+        let files = parse_unified_diff(&diff);
+        let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
+        assert!(is_signature_semantically_changed(&old_text, &new_text));
     }
 
     #[test]

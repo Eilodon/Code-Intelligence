@@ -13,7 +13,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref());
+            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             match resolution {
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
@@ -51,7 +51,7 @@ impl CodeIntelligenceServer {
                     Ok(c) => c,
                     Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
                 };
-                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line)
             };
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
@@ -255,6 +255,11 @@ pub(crate) struct SymbolInfoParams {
     pub(crate) symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file — any line within
+    /// the intended candidate's range (see an earlier `ambiguous` response's
+    /// `line_start`/`line_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -380,6 +385,11 @@ pub(crate) struct SourceParams {
     pub(crate) symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file — any line within
+    /// the intended candidate's range (see an earlier `ambiguous` response's
+    /// `line_start`/`line_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
     #[serde(default)]
     pub(crate) include_metadata: bool,
 }

@@ -231,12 +231,21 @@ pub(crate) struct RepoOverviewOutput {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct HotspotsParams {
+    /// Max files to return. Defaults to `hotspots.default_top_n` in
+    /// config.json (10 out of the box).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) top_n: Option<usize>,
+    /// `git log --since` window for churn analysis, e.g. `"3 months ago"`.
+    /// Defaults to `hotspots.default_since` in config.json ("6 months ago"
+    /// out of the box).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) since: Option<String>,
+    /// Minimum commit count for a file to qualify. Defaults to
+    /// `hotspots.default_min_churn` in config.json (2 out of the box).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) min_churn: Option<i64>,
+    /// `true` to also list the highest-risk symbols within each hotspot
+    /// file, not just the file-level score. `false` (default) is cheaper.
     #[serde(default)]
     pub(crate) include_symbols: bool,
 }

@@ -137,10 +137,17 @@ pub fn bootstrap_embeddings(
     status: &Arc<RwLock<EmbedStatus>>,
 ) {
     *status.write().unwrap() = EmbedStatus::Downloading;
-    tracing::info!(
-        "Loading embedding model `{}` (may download ~30 MB on first run)...",
-        semantic.model
-    );
+    if semantic.model == ci_core::embedding::DEFAULT_MODEL_ID {
+        tracing::info!(
+            "Loading embedding model `{}` (vendored in the binary, no network needed)...",
+            semantic.model
+        );
+    } else {
+        tracing::info!(
+            "Loading embedding model `{}` (may download from the HuggingFace Hub on first run)...",
+            semantic.model
+        );
+    }
     let model = match Embedder::load(&semantic.model, semantic.dimensions) {
         Ok(m) => Arc::new(m),
         Err(e) => {
@@ -149,12 +156,15 @@ pub fn bootstrap_embeddings(
             return;
         }
     };
-    if let Err(e) = ci_core::embedding::create_embedding_table(conn, semantic.dimensions) {
+    // `model.dim()` (real, probed at load time) rather than
+    // `semantic.dimensions` (config, possibly stale) — see
+    // `Embedder::load` and `create_embedding_table`'s self-heal.
+    if let Err(e) = ci_core::embedding::create_embedding_table(conn, model.dim()) {
         tracing::error!("Embedding table creation failed: {e}");
         *status.write().unwrap() = EmbedStatus::Failed;
         return;
     }
-    if let Err(e) = ci_core::embedding::create_chunk_embedding_table(conn, semantic.dimensions) {
+    if let Err(e) = ci_core::embedding::create_chunk_embedding_table(conn, model.dim()) {
         tracing::error!("Chunk embedding table creation failed: {e}");
         *status.write().unwrap() = EmbedStatus::Failed;
         return;

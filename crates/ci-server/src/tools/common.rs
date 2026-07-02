@@ -419,18 +419,34 @@ pub(crate) enum SymbolResolution {
     Found(Box<CandidateRow>),
 }
 
-/// Resolve a bare symbol name (+ optional path) to exactly one row.
-/// `path`, when given, narrows the candidate set (see
-/// `resolve_symbol_candidates`), but does not by itself guarantee a unique
+/// Resolve a bare symbol name (+ optional path, + optional disambiguating
+/// `line`) to exactly one row. `path` narrows the candidate set (see
+/// `resolve_symbol_candidates`) but does not by itself guarantee a unique
 /// match — `name` + `path` is not a DB-enforced unique key (only
-/// `qualified_name` is), so e.g. two same-named methods on different classes
-/// in the same file still resolve as ambiguous even with `path` set.
+/// `qualified_name` is), so e.g. two same-named functions in the same file
+/// (a common shape in this codebase: `#[cfg(feature = "x")]` real impl vs.
+/// `#[cfg(not(feature = "x"))]` stub, both named identically) still resolve
+/// as ambiguous even with `path` set. `line` breaks that tie: when given, it
+/// narrows to whichever candidate's `[line_start, line_end]` contains it —
+/// exactly the range every `Ambiguous` response already echoes back per
+/// candidate, so a caller that got `ambiguous: true` can retry once with
+/// the `line_start` of the one it meant. A `line` that matches none of the
+/// candidates is ignored (falls back to the unnarrowed set) rather than
+/// forcing `NotFound` — a stale/wrong hint should degrade to the old
+/// behavior, not make an otherwise-resolvable symbol disappear.
 pub(crate) fn resolve_symbol(
     conn: &rusqlite::Connection,
     name: &str,
     path: Option<&str>,
+    line: Option<i64>,
 ) -> SymbolResolution {
     let mut candidates = resolve_symbol_candidates(conn, name, path);
+    if let Some(line) = line {
+        let in_range = |c: &CandidateRow| c.line_start <= line && line <= c.line_end;
+        if candidates.iter().any(in_range) {
+            candidates.retain(in_range);
+        }
+    }
     if candidates.is_empty() {
         SymbolResolution::NotFound
     } else if candidates.len() == 1 {

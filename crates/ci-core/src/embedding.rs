@@ -14,6 +14,12 @@ use rusqlite::Connection;
 /// True when the crate was built with the `embeddings` feature.
 pub const ENABLED: bool = cfg!(feature = "embeddings");
 
+/// The default embedding model id (matches `SemanticSearchConfig::default`).
+/// `Embedder::load` special-cases this id to use weights vendored into the
+/// binary (see `assets/potion-code-16m/`) instead of fetching from the
+/// HuggingFace Hub — kept as one constant so the two can't drift apart.
+pub const DEFAULT_MODEL_ID: &str = "minishlab/potion-code-16M";
+
 /// The text embedded for a symbol: name + signature + docstring. This is
 /// Layer 1 of semantic search — *symbol identity*. Layer 2 (`code_chunks` /
 /// `code_chunk_vecs`, populated by `indexer::chunker`) embeds the raw code
@@ -41,30 +47,46 @@ mod imp {
     use super::*;
     use model2vec_rs::model::StaticModel;
     use rayon::prelude::*;
+    use rusqlite::OptionalExtension;
 
     /// Create the KNN table for symbol embeddings (idempotent). Plain BLOB
     /// storage — nearest-neighbour search is an exact brute-force
-    /// cosine scan (see `knn`), not a vector-search extension.
-    pub fn create_embedding_table(conn: &Connection, _dim: usize) -> rusqlite::Result<()> {
+    /// cosine scan (see `knn`), not a vector-search extension. Self-heals a
+    /// stale dimension (see `heal_dimension_mismatch`) if the table already
+    /// holds vectors from a previous model/config.
+    pub fn create_embedding_table(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS embedding_vecs (
                 symbol_id INTEGER PRIMARY KEY,
                 embedding BLOB NOT NULL
             );",
-        )
+        )?;
+        heal_dimension_mismatch(conn, "embedding_vecs", dim, symbol_cache())
     }
 
     /// Create the Layer-2 KNN table for code-chunk embeddings (idempotent).
     /// Separate from `embedding_vecs` — chunk ids and symbol ids are
-    /// unrelated key spaces.
-    pub fn create_chunk_embedding_table(conn: &Connection, _dim: usize) -> rusqlite::Result<()> {
+    /// unrelated key spaces. Self-heals a stale dimension, same as
+    /// `create_embedding_table`.
+    pub fn create_chunk_embedding_table(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS code_chunk_vecs (
                 chunk_id INTEGER PRIMARY KEY,
                 embedding BLOB NOT NULL
             );",
-        )
+        )?;
+        heal_dimension_mismatch(conn, "code_chunk_vecs", dim, chunk_cache())
     }
+
+    /// Bytes for the default model, vendored into the repo (MIT-licensed;
+    /// `minishlab/potion-code-16M`, distilled from `nomic-ai/CodeRankEmbed`,
+    /// also MIT) and baked into the binary at compile time. Loading the
+    /// default model is then zero-I/O and zero-network — no HuggingFace Hub
+    /// round-trip on first run, which is otherwise required before semantic
+    /// search works (see `bootstrap_embeddings`).
+    static DEFAULT_CONFIG: &[u8] = include_bytes!("../assets/potion-code-16m/config.json");
+    static DEFAULT_TOKENIZER: &[u8] = include_bytes!("../assets/potion-code-16m/tokenizer.json");
+    static DEFAULT_WEIGHTS: &[u8] = include_bytes!("../assets/potion-code-16m/model.safetensors");
 
     /// A loaded static embedding model.
     pub struct Embedder {
@@ -73,12 +95,42 @@ mod imp {
     }
 
     impl Embedder {
-        /// Load `model_id` (a HuggingFace repo id or local path). Output is
-        /// L2-normalised so cosine distance behaves well.
+        /// Load `model_id`. The default model id (`DEFAULT_MODEL_ID`) loads
+        /// from the bytes vendored into the binary; any other id (a custom
+        /// model configured via `semantic_search.model`) still resolves via
+        /// `from_pretrained` — a local path, or a HuggingFace Hub download.
+        /// Output is L2-normalised so cosine distance behaves well.
+        ///
+        /// `dim` is only a hint (from `semantic_search.dimensions` in
+        /// config) — model2vec-rs exposes no API to query a loaded model's
+        /// native output width, so the real dimension is derived once here
+        /// by probing `encode_single` and used in place of the hint. A
+        /// stale/wrong config `dim` gets a loud warning here instead of
+        /// silently mislabeling every vector this `Embedder` ever produces.
         pub fn load(model_id: &str, dim: usize) -> anyhow::Result<Self> {
-            let model = StaticModel::from_pretrained(model_id, None, Some(true), None)
-                .map_err(|e| anyhow::anyhow!("load embedding model '{model_id}': {e}"))?;
-            Ok(Self { model, dim })
+            let model = if model_id == DEFAULT_MODEL_ID {
+                StaticModel::from_bytes(
+                    DEFAULT_TOKENIZER,
+                    DEFAULT_WEIGHTS,
+                    DEFAULT_CONFIG,
+                    Some(true),
+                )
+                .map_err(|e| anyhow::anyhow!("load vendored embedding model: {e}"))?
+            } else {
+                StaticModel::from_pretrained(model_id, None, Some(true), None)
+                    .map_err(|e| anyhow::anyhow!("load embedding model '{model_id}': {e}"))?
+            };
+            let real_dim = model.encode_single("x").len();
+            if real_dim != dim {
+                tracing::warn!(
+                    "embedding model '{model_id}' actually outputs {real_dim}-dim vectors, \
+                     not the {dim}-dim configured in semantic_search.dimensions — using {real_dim}"
+                );
+            }
+            Ok(Self {
+                model,
+                dim: real_dim,
+            })
         }
 
         pub fn dim(&self) -> usize {
@@ -132,6 +184,42 @@ mod imp {
         if let Some(path) = conn.path() {
             cache.lock().unwrap().remove(path);
         }
+    }
+
+    /// If `table` already has rows whose stored vectors don't match `dim`
+    /// (`semantic_search.model`/`dimensions` changed since the last index
+    /// run), clear them and invalidate `cache`. Without this, `knn` would
+    /// silently zip mismatched-length vectors together — a wrong-but-
+    /// plausible-looking cosine score, not an error — instead of failing
+    /// loudly the way the old `vec0 FLOAT[dim]` virtual table did on a
+    /// dimension-mismatched insert. Cheap: peeks exactly one row via
+    /// `LIMIT 1`, since every row in a table is written by the same
+    /// `Embedder` between creates.
+    fn heal_dimension_mismatch(
+        conn: &Connection,
+        table: &str,
+        dim: usize,
+        cache: &PathCache,
+    ) -> rusqlite::Result<()> {
+        let stored_dim: Option<usize> = conn
+            .query_row(&format!("SELECT embedding FROM {table} LIMIT 1"), [], |r| {
+                let blob = r.get_ref(0)?.as_blob().unwrap_or(&[]);
+                Ok(blob.len() / 4)
+            })
+            .optional()?;
+        if let Some(stored_dim) = stored_dim
+            && stored_dim != dim
+        {
+            tracing::warn!(
+                "{table}: stored vectors are {stored_dim}-dim but the current model \
+                 produces {dim}-dim (model/config changed since the last index run) — \
+                 clearing {table} to re-embed from scratch"
+            );
+            conn.execute(&format!("DELETE FROM {table}"), [])?;
+            invalidate(cache, conn);
+        }
+
+        Ok(())
     }
 
     pub fn store_embedding(conn: &Connection, symbol_id: i64, vec: &[f32]) -> rusqlite::Result<()> {
@@ -287,10 +375,23 @@ mod imp {
     }
 
     /// Data-parallel brute-force top-`k` by cosine distance (ascending —
-    /// smallest distance first) over already-decoded vectors.
+    /// smallest distance first) over already-decoded vectors. Defense in
+    /// depth: skips any vector whose length disagrees with `query` — should
+    /// never happen after `create_embedding_table`'s self-heal, but a
+    /// silently `zip`-truncated dot product (a wrong-but-plausible cosine
+    /// score) is worse than dropping the row and warning.
     fn top_k_by_cosine(vecs: &[(i64, Vec<f32>)], query: &[f32], k: usize) -> Vec<(i64, f64)> {
+        let dropped = vecs.iter().filter(|(_, v)| v.len() != query.len()).count();
+        if dropped > 0 {
+            tracing::warn!(
+                "knn: skipping {dropped} vector(s) whose dimension doesn't match the query \
+                 ({} dims) — stale data from a previous model/config",
+                query.len()
+            );
+        }
         let mut scored: Vec<(i64, f64)> = vecs
             .par_iter()
+            .filter(|(_, v)| v.len() == query.len())
             .map(|(id, v)| {
                 let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
                 (*id, (1.0 - dot) as f64)
@@ -375,6 +476,95 @@ mod tests {
             "run fn run() does a thing"
         );
         assert_eq!(symbol_doc("run", "", ""), "run");
+    }
+
+    /// Regression for the vendored default model (`include_bytes!` in
+    /// `Embedder::load`): loads with zero network, produces the right
+    /// dimensionality, and is L2-normalised. Catches a bad asset path, a
+    /// corrupted file, or an unexpected tensor layout at test time instead
+    /// of at first-run in production.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn default_model_loads_from_vendored_bytes() {
+        let embedder = Embedder::load(DEFAULT_MODEL_ID, 256).expect("vendored model must load");
+        let v = embedder.embed_one("fn parse_config(path: &str) -> Config");
+        assert_eq!(v.len(), 256);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "output should be L2-normalised, got {norm}"
+        );
+    }
+
+    /// Regression: `semantic_search.dimensions` in config.json can go stale
+    /// (wrong value, or left over after a model swap) — model2vec-rs has no
+    /// API to query a loaded model's real output width, so `Embedder::load`
+    /// must derive it itself instead of trusting the hint.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn load_overrides_wrong_configured_dim_with_real_model_dim() {
+        let embedder = Embedder::load(DEFAULT_MODEL_ID, 999).expect("vendored model must load");
+        assert_eq!(
+            embedder.dim(),
+            256,
+            "must report the model's real width, not the bad hint"
+        );
+        assert_eq!(embedder.embed_one("fn foo()").len(), 256);
+    }
+
+    /// Regression: previously (`vec0 FLOAT[dim]`) a dimension change was
+    /// caught immediately as an insert error. The plain-BLOB replacement
+    /// has no such enforcement, so `create_embedding_table` must detect and
+    /// clear stale-dimension rows itself instead of leaving mixed-length
+    /// vectors for `knn` to silently mis-score.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn create_embedding_table_clears_stale_dimension_rows() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        // Simulate a previous index run with a 3-dim model.
+        create_embedding_table(&conn, 3).unwrap();
+        store_embedding(&conn, 1, &[1.0, 0.0, 0.0]).unwrap();
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // Model/config changed to 5-dim — recreating the table for the new
+        // dim must clear the incompatible 3-dim row, not leave it mixed in.
+        create_embedding_table(&conn, 5).unwrap();
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_after, 0, "stale-dimension row must be cleared");
+
+        // And the table is left usable for fresh 5-dim data afterward.
+        store_embedding(&conn, 2, &[1.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
+        let hits = knn(&conn, &[1.0, 0.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 2);
+    }
+
+    /// Defense in depth for anything that manages to leave a mismatched-
+    /// length row in the table anyway (e.g. written outside
+    /// `create_embedding_table`'s heal path): `knn` must skip it, not feed
+    /// it to `zip` and report a wrong-but-plausible cosine score.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn knn_skips_vectors_with_mismatched_dimension() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_embedding_table(&conn, 3).unwrap();
+
+        store_embedding(&conn, 1, &[1.0, 0.0, 0.0]).unwrap();
+        store_embedding(&conn, 2, &[1.0, 0.0]).unwrap();
+
+        let hits = knn(&conn, &[1.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(hits.len(), 1, "the 2-dim row must be skipped, not scored");
+        assert_eq!(hits[0].0, 1);
     }
 
     #[cfg(feature = "embeddings")]

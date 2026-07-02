@@ -118,6 +118,8 @@ pub(crate) struct RememberParams {
     /// "auth-module-gotcha"). Calling `remember` again with the same topic
     /// overwrites its content — one note per topic, not an append log.
     pub(crate) topic: String,
+    /// The note's full text — replaces whatever was previously stored
+    /// under `topic`.
     pub(crate) content: String,
 }
 

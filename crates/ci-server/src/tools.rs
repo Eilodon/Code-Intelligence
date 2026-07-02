@@ -409,6 +409,54 @@ mod tests {
         );
     }
 
+    /// Regression: every Params field used to have no `///` doc comment, so
+    /// schemars emitted no `description` — an agent calling these tools had
+    /// no way to discover valid enum values (e.g. `locate`'s `depth`) short
+    /// of reading Rust source. Spot-checks the enum-like fields most likely
+    /// to be guessed wrong, not every field in every tool.
+    #[test]
+    fn key_enum_like_params_have_schema_descriptions() {
+        fn assert_described(tool_name: &str, tool: rmcp::model::Tool, field: &str) {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{tool_name}: input_schema has no properties object"));
+            let desc = props
+                .get(field)
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or_else(|| panic!("{tool_name}.{field}: missing schema description"));
+            assert!(
+                !desc.is_empty(),
+                "{tool_name}.{field}: schema description is empty"
+            );
+        }
+
+        assert_described("locate", CodeIntelligenceServer::locate_tool_attr(), "kind");
+        assert_described(
+            "locate",
+            CodeIntelligenceServer::locate_tool_attr(),
+            "depth",
+        );
+        assert_described("search", CodeIntelligenceServer::search_tool_attr(), "kind");
+        assert_described(
+            "understand",
+            CodeIntelligenceServer::understand_tool_attr(),
+            "kind",
+        );
+        assert_described(
+            "callers",
+            CodeIntelligenceServer::callers_tool_attr(),
+            "line",
+        );
+        assert_described(
+            "edit_context",
+            CodeIntelligenceServer::edit_context_tool_attr(),
+            "line",
+        );
+    }
+
     /// Regression: `get_info()` used to build `ServerInfo` with
     /// `..Default::default()`, which leaves `capabilities.tools` as `None`.
     /// A spec-compliant MCP client only calls `tools/list` when the server
@@ -575,6 +623,7 @@ mod tests {
         let output = server.symbol_info(SymbolInfoParams {
             symbol: "target".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         let by_conf = &v["health"]["caller_count_by_confidence"];
@@ -722,6 +771,150 @@ mod tests {
                 .iter()
                 .any(|r| r.as_str().unwrap().contains("signature modified")),
             "must not claim a signature change for a symbol with zero prior call sites, got: {reasons:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a parameter rename must not escalate risk to "high" —
+    /// line-overlap alone can't tell it apart from a real type/arity
+    /// change, but `is_signature_semantically_changed` can. `caller_count`
+    /// is high enough (>10) that risk would already be "high" on its own,
+    /// so this specifically isolates the "signature modified" escalation
+    /// reason, not just the overall level.
+    #[test]
+    fn diff_impact_parameter_rename_does_not_add_signature_changed_reason() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "embedding::create_embedding_table", "create_embedding_table", "function", "rust", "src/embedding.rs", 1i64, 5i64,
+                    "pub fn create_embedding_table(conn: &Connection, dim: usize) -> Result<()>", "", "create_embedding_table", 6i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/embedding.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Same shape as the real regression: only the parameter name changes.
+        let diff = "diff --git a/src/embedding.rs b/src/embedding.rs\n\
+                     --- a/src/embedding.rs\n\
+                     +++ b/src/embedding.rs\n\
+                     @@ -1,5 +1,5 @@\n\
+                     -pub fn create_embedding_table(conn: &Connection, _dim: usize) -> Result<()> {\n\
+                     +pub fn create_embedding_table(conn: &Connection, dim: usize) -> Result<()> {\n\
+                      body\n\
+                      body\n\
+                      body\n\
+                      }\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
+        let sym = &v["affected_symbols"][0];
+        assert_eq!(
+            sym["signature_changed"], false,
+            "a parameter rename must not register as a signature change, got: {sym}"
+        );
+        let reasons = sym["risk_assessment"]["reasons"].as_array().unwrap();
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("signature modified")),
+            "must not claim callers may need updating for a pure rename, got: {reasons:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `sig_end` used to be hard-capped at `line_start + 2`
+    /// (3 lines), so a change past line 3 of a longer real signature was
+    /// silently missed — verified for real against
+    /// `ci_core::analysis::cochange::compute_co_changes`, whose signature
+    /// genuinely spans 7 lines. This reproduces that exact shape: `dim`'s
+    /// type changes on line 6, well past the old cap, and must still be
+    /// caught now that `sig_end` is derived from the indexer's own
+    /// multi-line `signature` text instead of a fixed cap.
+    #[test]
+    fn diff_impact_catches_change_past_old_three_line_signature_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_longsig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            let signature = "pub fn compute_co_changes(\n    project_root: &Path,\n    target_path: &str,\n    since: &str,\n    min_co_changes: usize,\n    top_n: usize,\n) -> CoChangeResult {";
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "cochange::compute_co_changes", "compute_co_changes", "function", "rust", "src/cochange.rs", 1i64, 20i64,
+                    signature, "", "compute_co_changes", 6i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/cochange.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // `top_n`'s type changes on line 6 — 3 lines past the old cap of 3,
+        // but still within this signature's real 7-line span (1-7).
+        let diff = "diff --git a/src/cochange.rs b/src/cochange.rs\n\
+                     --- a/src/cochange.rs\n\
+                     +++ b/src/cochange.rs\n\
+                     @@ -1,7 +1,7 @@\n\
+                      pub fn compute_co_changes(\n\
+                          project_root: &Path,\n\
+                          target_path: &str,\n\
+                          since: &str,\n\
+                          min_co_changes: usize,\n\
+                     -    top_n: usize,\n\
+                     +    top_n: u32,\n\
+                      ) -> CoChangeResult {\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
+        let sym = &v["affected_symbols"][0];
+        assert_eq!(
+            sym["signature_changed"], true,
+            "a type change on line 6 of a 7-line signature must be caught, got: {sym}"
+        );
+        let reasons = sym["risk_assessment"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("signature modified")),
+            "expected a signature-modified reason, got: {reasons:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -943,6 +1136,7 @@ mod tests {
         let output = server.callers(CallersParams {
             symbol: "foo".into(),
             path: None,
+            line: None,
             transitive: false,
             max_depth: None,
         });
@@ -990,6 +1184,7 @@ mod tests {
         let output = server.callers(CallersParams {
             symbol: "a".into(),
             path: None,
+            line: None,
             transitive: true,
             max_depth: Some(5),
         });
@@ -1031,6 +1226,7 @@ mod tests {
         let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
@@ -1092,6 +1288,7 @@ mod tests {
         let output = server.edit_context(EditContextParams {
             symbol: "model_fn".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
@@ -1126,6 +1323,7 @@ mod tests {
         let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(
@@ -1167,6 +1365,7 @@ mod tests {
         let output = server.edit_context(EditContextParams {
             symbol: "a".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
@@ -1219,6 +1418,7 @@ mod tests {
         let _ = server.symbol_info(SymbolInfoParams {
             symbol: "foo".into(),
             path: None,
+            line: None,
         });
         let _ = server.file_overview(FileOverviewParams {
             path: "src/foo.rs".into(),
@@ -1455,11 +1655,80 @@ mod tests {
         let output = server.symbol_info(SymbolInfoParams {
             symbol: "method".into(),
             path: Some("src/multi.py".into()),
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(v["ambiguous"], true);
         assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `name` + `path` alone can't disambiguate two symbols with
+    /// the same name in the same file at *different* line ranges — the
+    /// common shape being `#[cfg(feature = "x")]` real impl vs. its
+    /// `#[cfg(not(feature = "x"))]` stub, both named identically (see
+    /// ci-core's own `embedding.rs`). `line` breaks the tie using exactly
+    /// the range an earlier `ambiguous` response would have echoed back.
+    #[test]
+    fn symbol_info_line_disambiguates_same_named_symbols_in_one_file() {
+        let dir = std::env::temp_dir().join(format!("ci_ambig_line_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qname, line_start, line_end) in [
+                ("real_impl::load", 10i64, 20i64),
+                ("stub_impl::load", 100i64, 105i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        qname, "load", "function", "rust", "src/embedding.rs", line_start, line_end, "fn load()",
+                        "", "load", 0i64, 0i64, 0i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // No line hint: stays ambiguous, same as before this feature existed.
+        let ambiguous = server.symbol_info(SymbolInfoParams {
+            symbol: "load".into(),
+            path: Some("src/embedding.rs".into()),
+            line: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&ambiguous).unwrap();
+        assert_eq!(
+            v["ambiguous"], true,
+            "no line hint must stay ambiguous: {v}"
+        );
+
+        // A line inside the real impl's range resolves to exactly that one.
+        let resolved = server.symbol_info(SymbolInfoParams {
+            symbol: "load".into(),
+            path: Some("src/embedding.rs".into()),
+            line: Some(15),
+        });
+        let v: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(v["qualified_name"], "real_impl::load", "got: {v}");
+
+        // A line hint matching neither candidate degrades to the unnarrowed
+        // (ambiguous) set rather than reporting NotFound.
+        let stale_hint = server.symbol_info(SymbolInfoParams {
+            symbol: "load".into(),
+            path: Some("src/embedding.rs".into()),
+            line: Some(9999),
+        });
+        let v: serde_json::Value = serde_json::from_str(&stale_hint).unwrap();
+        assert_eq!(
+            v["ambiguous"], true,
+            "stale line hint must fall back to ambiguous: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1495,6 +1764,8 @@ mod tests {
             to_symbol: "b".into(),
             from_path: None,
             to_path: None,
+            from_line: None,
+            to_line: None,
             max_hops: Some(10),
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1664,6 +1935,7 @@ mod tests {
         let output = server.source(SourceParams {
             symbol: "foo".into(),
             path: None,
+            line: None,
             include_metadata: false,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1698,6 +1970,7 @@ mod tests {
         let output = server.source(SourceParams {
             symbol: "foo".into(),
             path: None,
+            line: None,
             include_metadata: false,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1735,6 +2008,7 @@ mod tests {
         let output = server.source(SourceParams {
             symbol: "foo".into(),
             path: None,
+            line: None,
             include_metadata: false,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1972,6 +2246,7 @@ mod tests {
         let output = server.symbol_info(SymbolInfoParams {
             symbol: "my_fn".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
@@ -2023,6 +2298,7 @@ mod tests {
         let output = server.symbol_info(SymbolInfoParams {
             symbol: "my_fn2".into(),
             path: None,
+            line: None,
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 

@@ -55,13 +55,31 @@ and put this in the **Setup script** field:
 
 ```bash
 #!/bin/bash
-cd "$(dirname "$0")" 2>/dev/null || true
-cargo build --quiet -p ci-cli
+# Ensure cargo is in PATH — setup scripts run as non-login root shells,
+# so ~/.cargo/env is not sourced automatically.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+# Build the ci-cli binary. The `|| true` is CRITICAL: setup scripts that
+# exit non-zero prevent the session from starting entirely (confirmed in
+# the official docs). A failed build here is non-fatal — the MCP server
+# simply won't connect, which is recoverable; a dead session is not.
+cargo build --quiet -p ci-cli 2>&1 || true
 ```
 
-(Setup scripts run with the repo checked out as the working directory, so
-a plain `cargo build --quiet -p ci-cli` without the `cd` is equally fine —
-the `cd` guard above is only there in case that assumption ever changes.)
+**Why `|| true`:** Claude Code's cloud docs state: *"If the script exits
+non-zero, the session fails to start."* Without it, any build failure
+(transient network error downloading crates, a compile error on a dev
+branch, `cargo` not in `PATH`) kills the session outright — you get a
+generic "session failed to start" error with no way to debug. With
+`|| true`, a failed build degrades gracefully: the session starts, the
+MCP server just won't connect (same as before the Setup Script existed),
+and you can inspect the failure interactively.
+
+**Why `source ~/.cargo/env`:** Setup scripts run as **non-login, non-
+interactive** root shells. `cargo` is pre-installed at
+`/root/.cargo/bin/cargo`, but that path comes from `~/.cargo/env` which
+is only sourced by login shells. Without the explicit source, `cargo:
+command not found` → exit 127 → session dead (without `|| true`).
 
 This must build to the **same path** `.mcp.json` expects:
 `target/debug/ci` (debug, not `--release` — release compiles slower for no
@@ -83,6 +101,12 @@ per-server `timeout` field (that one bounds individual tool *calls* after
 connection, not the initial handshake). For cloud sessions, the
 equivalent lever is adding `MCP_TIMEOUT=120000` as an **environment
 variable** in the same environment settings dialog as the Setup Script.
+
+**Format:** In the environment variables field, add one line (no quotes):
+```
+MCP_TIMEOUT=120000
+```
+
 This is optional defense-in-depth (matters mainly for the very first
 session before any cache exists, or right after the ~7-day cache expiry)
 — the Setup Script is what actually fixes the steady state.

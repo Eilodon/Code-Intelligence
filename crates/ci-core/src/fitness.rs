@@ -2,6 +2,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::analysis::boundaries::{BoundaryRule, BoundaryViolation, check_boundaries};
 use crate::analysis::coverage::{CoverageData, normalize_path};
 use crate::analysis::dead_code::{
     compute_dead_code_confidence, is_private_symbol, scope_clear_for_language,
@@ -28,7 +29,23 @@ pub struct FitnessThresholds {
     pub max_dead_code_pct: f64,
     pub max_hotspot_risk: f64,
     pub min_edge_coverage_pct: f64,
+    /// % of function/method symbols whose McCabe cyclomatic complexity
+    /// exceeds `HIGH_COMPLEXITY_THRESHOLD`. Tier-0.5 languages (no real
+    /// parse tree) always report complexity 1, so they never count toward
+    /// the numerator — this dilutes the percentage as their share of the
+    /// codebase grows, a known limitation rather than a precision claim.
+    pub max_high_complexity_pct: f64,
+    /// Max allowed count of `import_edges` that match a declared `[[boundaries]]`
+    /// rule (see `load_boundary_rules`). Default 0 — any violation of a rule
+    /// you bothered to declare fails the gate; there's no "a few is fine"
+    /// case for an architecture boundary the way there is for e.g. dead code.
+    pub max_boundary_violations: i64,
 }
+
+/// Per-symbol cyclomatic complexity above this is "high" for
+/// `high_complexity_pct` — the conventional McCabe cutoff between
+/// "moderate" and "high" risk (1-10 simple, 11-20 moderate, 21+ high).
+pub const HIGH_COMPLEXITY_THRESHOLD: i64 = 10;
 
 impl Default for FitnessThresholds {
     fn default() -> Self {
@@ -39,6 +56,8 @@ impl Default for FitnessThresholds {
             max_dead_code_pct: 10.0,
             max_hotspot_risk: 0.75,
             min_edge_coverage_pct: 60.0,
+            max_high_complexity_pct: 15.0,
+            max_boundary_violations: 0,
         }
     }
 }
@@ -60,6 +79,28 @@ pub fn load_thresholds(config_path: Option<&Path>) -> anyhow::Result<FitnessThre
     Ok(FitnessThresholds::default())
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct BoundariesTomlFile {
+    #[serde(default)]
+    boundaries: Vec<BoundaryRule>,
+}
+
+/// Architecture boundary rules declared in the same `thresholds.toml` as
+/// `load_thresholds`, under a `[[boundaries]]` array — a separate parse of
+/// the same small file rather than folding into `FitnessThresholds` itself,
+/// since a rule list isn't a scalar threshold and `load_thresholds`'
+/// existing signature/callers shouldn't need to change for this.
+pub fn load_boundary_rules(config_path: Option<&Path>) -> anyhow::Result<Vec<BoundaryRule>> {
+    if let Some(path) = config_path
+        && path.exists()
+    {
+        let text = std::fs::read_to_string(path)?;
+        let parsed: BoundariesTomlFile = toml::from_str(&text)?;
+        return Ok(parsed.boundaries);
+    }
+    Ok(Vec::new())
+}
+
 // ---------------------------------------------------------------------------
 // Metrics collection
 // ---------------------------------------------------------------------------
@@ -72,6 +113,7 @@ pub struct FitnessMetrics {
     pub dead_code_pct: f64,
     pub hotspot_risk: f64,
     pub edge_coverage_pct: f64,
+    pub high_complexity_pct: f64,
 }
 
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
@@ -184,6 +226,27 @@ pub fn collect_metrics(
         0.0
     };
 
+    let total_functions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let high_complexity_pct = if total_functions > 0 {
+        let high_complexity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method') \
+                 AND cyclomatic_complexity > ?1",
+                rusqlite::params![HIGH_COMPLEXITY_THRESHOLD],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        100.0 * high_complexity_count as f64 / total_functions as f64
+    } else {
+        0.0
+    };
+
     Ok(FitnessMetrics {
         hub_count,
         hub_pct,
@@ -191,6 +254,7 @@ pub fn collect_metrics(
         dead_code_pct,
         hotspot_risk,
         edge_coverage_pct,
+        high_complexity_pct,
     })
 }
 
@@ -212,6 +276,9 @@ pub struct FitnessCheckResult {
     pub passed: bool,
     pub checks: Vec<FitnessCheckItem>,
     pub metrics: FitnessMetrics,
+    /// Full detail behind the `boundary_violations` check — empty whenever
+    /// that check passes (including when no rules are declared at all).
+    pub boundary_violations: Vec<BoundaryViolation>,
 }
 
 pub fn run_fitness_check(
@@ -219,8 +286,10 @@ pub fn run_fitness_check(
     thresholds: &FitnessThresholds,
     project_root: &Path,
     coverage: &CoverageData,
+    boundary_rules: &[BoundaryRule],
 ) -> rusqlite::Result<FitnessCheckResult> {
     let metrics = collect_metrics(conn, project_root, coverage)?;
+    let boundary_violations = check_boundaries(conn, boundary_rules)?;
     let mut checks = Vec::new();
 
     checks.push(FitnessCheckItem {
@@ -289,11 +358,42 @@ pub fn run_fitness_check(
         ),
     });
 
+    checks.push(FitnessCheckItem {
+        metric: "high_complexity_pct".into(),
+        value: metrics.high_complexity_pct,
+        threshold: thresholds.max_high_complexity_pct,
+        passed: metrics.high_complexity_pct <= thresholds.max_high_complexity_pct,
+        message: format!(
+            "High-complexity functions {:.1}% (max {:.1}%, complexity > {})",
+            metrics.high_complexity_pct,
+            thresholds.max_high_complexity_pct,
+            HIGH_COMPLEXITY_THRESHOLD
+        ),
+    });
+
+    checks.push(FitnessCheckItem {
+        metric: "boundary_violations".into(),
+        value: boundary_violations.len() as f64,
+        threshold: thresholds.max_boundary_violations as f64,
+        passed: boundary_violations.len() as i64 <= thresholds.max_boundary_violations,
+        message: format!(
+            "Architecture boundary violations {} (max {}){}",
+            boundary_violations.len(),
+            thresholds.max_boundary_violations,
+            if boundary_rules.is_empty() {
+                " — no [[boundaries]] rules declared"
+            } else {
+                ""
+            }
+        ),
+    });
+
     let passed = checks.iter().all(|c| c.passed);
     Ok(FitnessCheckResult {
         passed,
         checks,
         metrics,
+        boundary_violations,
     })
 }
 
@@ -493,6 +593,8 @@ mod tests {
         assert_eq!(t.max_dead_code_pct, 10.0);
         assert_eq!(t.max_hotspot_risk, 0.75);
         assert_eq!(t.min_edge_coverage_pct, 60.0);
+        assert_eq!(t.max_high_complexity_pct, 15.0);
+        assert_eq!(t.max_boundary_violations, 0);
     }
 
     #[test]
@@ -504,10 +606,11 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 6);
+        assert_eq!(result.checks.len(), 8);
     }
 
     #[test]
@@ -531,6 +634,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(!result.passed);
@@ -566,6 +670,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
 
@@ -613,6 +718,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         assert!(!result.passed);
@@ -712,6 +818,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
         )
         .unwrap();
         let check = result
@@ -720,6 +827,75 @@ mod tests {
             .find(|c| c.metric == "edge_coverage_pct")
             .unwrap();
         assert!(check.passed);
+    }
+
+    #[test]
+    fn test_high_complexity_pct_counts_only_functions_above_threshold() {
+        let conn = test_conn();
+        // Simple function (complexity 1, DB default) — not high.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.simple', 'simple', 'function', 'python', 'mod.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+        // Complex function above HIGH_COMPLEXITY_THRESHOLD.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.complex', 'complex', 'function', 'python', 'mod.py', 10, 50, 25, 0.0)",
+            [],
+        )
+        .unwrap();
+        // A class with high aggregate complexity must NOT count — only
+        // function/method kinds feed the metric.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.Big', 'Big', 'class', 'python', 'mod.py', 1, 100, 40, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert_eq!(
+            metrics.high_complexity_pct, 50.0,
+            "1 of 2 function/method symbols exceeds the threshold"
+        );
+    }
+
+    #[test]
+    fn test_high_complexity_pct_fail_gates_fitness_check() {
+        let conn = test_conn();
+        let thresholds = FitnessThresholds {
+            max_high_complexity_pct: 10.0,
+            ..Default::default()
+        };
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.complex', 'complex', 'function', 'python', 'mod.py', 1, 50, 30, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+        )
+        .unwrap();
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "high_complexity_pct")
+            .unwrap();
+        assert!(!check.passed);
+        assert_eq!(check.value, 100.0);
+        assert!(!result.passed);
     }
 
     #[test]
@@ -791,6 +967,105 @@ mod tests {
     fn test_load_thresholds_missing_file() {
         let thresholds = load_thresholds(Some(Path::new("/nonexistent/path.toml"))).unwrap();
         assert_eq!(thresholds.max_hub_count, 50);
+    }
+
+    #[test]
+    fn test_load_boundary_rules_from_same_toml_file() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[thresholds]\nmax_hub_count = 5\n\n\
+             [[boundaries]]\n\
+             from = \"crates/ci-core/\"\n\
+             to = \"crates/ci-server/\"\n\
+             reason = \"core must not depend on server\"\n\n\
+             [[boundaries]]\n\
+             from = \"a/\"\n\
+             to = \"b/\"\n"
+        )
+        .unwrap();
+
+        let rules = load_boundary_rules(Some(f.path())).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].from, "crates/ci-core/");
+        assert_eq!(rules[0].to, "crates/ci-server/");
+        assert_eq!(rules[0].reason, "core must not depend on server");
+        assert_eq!(rules[1].reason, "", "reason defaults to empty string");
+
+        // Same file, load_thresholds must still work independently.
+        let thresholds = load_thresholds(Some(f.path())).unwrap();
+        assert_eq!(thresholds.max_hub_count, 5);
+    }
+
+    #[test]
+    fn test_load_boundary_rules_missing_file_or_no_section() {
+        assert!(
+            load_boundary_rules(Some(Path::new("/nonexistent/path.toml")))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_boundary_rules(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_boundary_violations_fail_gates_fitness_check() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) \
+             VALUES ('crates/ci-core/src/x.rs', 'crates/ci-server/src/y.rs', 'y')",
+            [],
+        )
+        .unwrap();
+        let rules = vec![crate::analysis::boundaries::BoundaryRule {
+            from: "crates/ci-core/".into(),
+            to: "crates/ci-server/".into(),
+            reason: "core must not depend on server".into(),
+        }];
+
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &rules,
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "boundary_violations")
+            .unwrap();
+        assert!(!check.passed);
+        assert_eq!(check.value, 1.0);
+        assert!(!result.passed);
+        assert_eq!(result.boundary_violations.len(), 1);
+        assert_eq!(
+            result.boundary_violations[0].reason,
+            "core must not depend on server"
+        );
+    }
+
+    #[test]
+    fn test_no_boundary_rules_declared_passes_by_default() {
+        let conn = test_conn();
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "boundary_violations")
+            .unwrap();
+        assert!(check.passed);
+        assert!(result.boundary_violations.is_empty());
     }
 
     #[test]

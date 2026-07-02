@@ -17,6 +17,7 @@ pub struct Config {
     pub hotspots: HotspotsConfig,
     pub dependencies: DependenciesConfig,
     pub session: SessionConfig,
+    pub cochange: CoChangeConfig,
 }
 
 impl Default for Config {
@@ -50,6 +51,7 @@ impl Default for Config {
             hotspots: HotspotsConfig::default(),
             dependencies: DependenciesConfig::default(),
             session: SessionConfig::default(),
+            cochange: CoChangeConfig::default(),
         }
     }
 }
@@ -204,6 +206,31 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self { max_fetched: 200 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CoChangeConfig {
+    /// `git log --since` window mined for co-change pairs — same syntax as
+    /// `hotspots.default_since`, deliberately not shared with it: churn
+    /// (single-file risk) and co-change (cross-file coupling) are different
+    /// enough questions that a project may reasonably want different
+    /// windows for each.
+    pub since: String,
+    /// Minimum number of shared commits before a file is reported — filters
+    /// out one-off coincidences (e.g. a repo-wide reformat commit).
+    pub min_co_changes: usize,
+    pub top_n: usize,
+}
+
+impl Default for CoChangeConfig {
+    fn default() -> Self {
+        Self {
+            since: "6 months ago".into(),
+            min_co_changes: 3,
+            top_n: 5,
+        }
     }
 }
 

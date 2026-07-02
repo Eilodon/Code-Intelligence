@@ -4,7 +4,7 @@
 viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *hiểu* codebase thay vì chỉ
 grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
 cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
-cấp full-text + semantic search — tất cả phục vụ qua 16 MCP tools, chạy local, không gọi ra ngoài.
+cấp full-text + semantic search — tất cả phục vụ qua 18 MCP tools, chạy local, không gọi ra ngoài.
 
 ## Vì sao cần cái này?
 
@@ -84,6 +84,28 @@ agent: "tôi cần sửa hàm getUserByEmail"
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
 - **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
   khởi động; kết hợp với static analysis cho `dead_code_confidence`.
+- **Output sanitization** — `source`/`understand` redact credentials (PEM key, GitHub/AWS/Slack
+  token, JWT, password assignment...) trước khi trả về, và gắn cờ `content_warning` khi code chứa
+  văn bản giống prompt-injection (`"ignore previous instructions"`, fake `system:` marker...) —
+  không sửa nội dung code, chỉ cảnh báo, vì false positive ở đây sẽ làm hỏng code thật.
+- **Mandatory tools thật sự bắt buộc khi dùng Claude Code** — `.claude/hooks/ci-nudge.sh` (PreToolUse
+  hook, không phải chỉ quy ước trong docs) chặn cứng: `Edit` đầu tiên lên file code mỗi session bị từ
+  chối tới khi gọi `edit_context`; `git commit`/`git push` bị từ chối nếu có file đổi từ lần gọi
+  `diff_impact` gần nhất.
+- **Noise-penalty ranking** — `search`/`locate` hạ điểm (×0.6) kết quả nằm trong file test/generated/
+  example khi có kết quả tương đương ở code thật, để implementation thật lên trước thay vì bị chôn
+  dưới test file trùng tên.
+- **Memory tool (`remember`/`recall`)** — ghi chú diễn giải bền vững (quyết định kiến trúc, gotcha đã
+  gặp) theo topic, sống qua nhiều session/restart — khác `session_context` (chỉ track điều hướng
+  trong 1 session, mất khi server restart).
+- **Git co-change mining** — `edit_context` mine `git log` để tìm file hay đổi cùng lúc với file
+  đang sửa dù không có quan hệ import/call nào (VD model + migration) — tín hiệu coupling logic mà
+  call graph tĩnh không thấy được.
+- **MCP Prompts** — 3 prompt đóng gói sẵn workflow lặp lại nhiều (`review_symbol`, `debug_symbol`,
+  `onboard_area`), MCP client như Claude Code hiện chúng dưới dạng slash-command
+  (`/mcp__ci__review_symbol`). Lưu ý: prompt chỉ trả về 1 message hướng dẫn sẵn, không tự chạy tool
+  — agent vẫn tự gọi từng bước, khác `suggested_next` (gợi ý per-response) ở chỗ đóng gói cả workflow
+  thành 1 lệnh gọi trước khi agent bắt đầu.
 
 ## Cấu trúc Crates
 
@@ -91,7 +113,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 16 tools + incremental file watcher.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 18 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
@@ -109,7 +131,7 @@ ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
-## 16 MCP Tools cho AI agents
+## 18 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
 (mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
@@ -122,12 +144,23 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) |
-| Recover | `session_context` |
+| Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) — hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
+| Recover | `session_context`, `remember`, `recall` |
+
+### MCP Prompts — workflow đóng gói thành slash-command
+
+Khác primitive `tools` ở trên — MCP Prompts (`prompts/list`, `prompts/get`) trả về 1 message hướng
+dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới dạng slash-command:
+
+| Prompt | Argument | Workflow đóng gói |
+|---|---|---|
+| `review_symbol` | `symbol` | `locate` → `source` → `edit_context` (bắt buộc) → tóm tắt risk trước khi sửa |
+| `debug_symbol` | `symbol` | `understand` → `callers(max_depth=3)` → kiểm tra `test_files`/`dead_code_confidence` |
+| `onboard_area` | `path` | `repo_overview` → `file_overview`/`dependencies` → `hotspots` khoanh vùng path đó |
 
 ## Fitness Check — CI Gate
 
-`ci fitness-check` đo 6 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` đo 8 metrics và so sánh với ngưỡng trong `thresholds.toml`:
 
 | Metric | Mô tả | Ngưỡng mặc định |
 |---|---|---|
@@ -137,9 +170,26 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
 | `hotspot_risk` | Hotspot score cao nhất trong codebase | ≤ 0.75 |
 | `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
+| `high_complexity_pct` | % function/method có cyclomatic complexity > 10 (McCabe, đếm branch qua AST — chỉ 6 ngôn ngữ Tier-0 có parse tree thật; Tier-0.5 luôn báo complexity=1) | ≤ 15.0% |
+| `boundary_violations` | Số `import_edges` phạm luật kiến trúc khai báo trong `[[boundaries]]` | ≤ 0 |
 
 Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
 trend (delta so với ngày trước).
+
+### Architecture boundaries — `[[boundaries]]`
+
+Khai báo luật "module A không được import module B" ngay trong `thresholds.toml` (cùng file với
+`[thresholds]`), match theo path-prefix (không phải glob/regex):
+
+```toml
+[[boundaries]]
+from = "crates/ci-core/"
+to = "crates/ci-server/"
+reason = "core không được phụ thuộc server layer"
+```
+
+`ci fitness-check` báo từng vi phạm cụ thể (from/to path thật + rule + reason) khi chạy không kèm
+`--json`; mặc định `max_boundary_violations = 0` — khai báo luật nào là luật đó phải giữ đúng.
 
 ## Deployment
 

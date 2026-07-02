@@ -158,13 +158,20 @@ async fn main() -> Result<()> {
             let db_path = ci_server::default_db_path(&root);
 
             let thresholds = ci_core::fitness::load_thresholds(config.as_deref())?;
+            let boundary_rules = ci_core::fitness::load_boundary_rules(config.as_deref())?;
 
             let conn = rusqlite::Connection::open(&db_path)
                 .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
             ci_core::db::schema::init_db(&conn)?;
 
             let coverage = ci_core::analysis::coverage::load_coverage(&root);
-            let result = ci_core::fitness::run_fitness_check(&conn, &thresholds, &root, &coverage)?;
+            let result = ci_core::fitness::run_fitness_check(
+                &conn,
+                &thresholds,
+                &root,
+                &coverage,
+                &boundary_rules,
+            )?;
 
             // Record today's metrics for later trend comparison (edit_context's
             // `trend` field). Rounded to the day so repeated same-day CI runs
@@ -187,6 +194,21 @@ async fn main() -> Result<()> {
                 for check in &result.checks {
                     let status = if check.passed { "✓" } else { "✗" };
                     println!("  {status} {}", check.message);
+                }
+                if !result.boundary_violations.is_empty() {
+                    println!();
+                    println!("Boundary violations:");
+                    for v in &result.boundary_violations {
+                        let reason = if v.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", v.reason)
+                        };
+                        println!(
+                            "  {} -> {} (rule: {} -> {}){reason}",
+                            v.from_path, v.to_path, v.rule_from, v.rule_to
+                        );
+                    }
                 }
                 println!();
                 if result.passed {

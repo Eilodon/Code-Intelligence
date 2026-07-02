@@ -1472,15 +1472,30 @@ struct AffectedSymbolOutput {
     path: String,
     kind: String,
     signature_changed: bool,
+    /// True when this symbol didn't exist before the diff (new file, or a
+    /// pure-addition hunk covering its signature) — it has zero prior call
+    /// sites by definition, so `signature_changed` is always false for it
+    /// and risk is not escalated on "callers may need update" grounds.
+    symbol_is_new: bool,
     blast_radius: BlastRadiusOutput,
     risk_assessment: RiskAssessmentOutput,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct UnindexedFileOutput {
+    path: String,
+    /// "pending_scan" — a recognized source file the indexer hasn't scanned
+    /// yet; resolves itself once indexing catches up (check `indexing_status`).
+    /// "out_of_scope" — not a source file the indexer parses at all (docs,
+    /// config, etc.); will stay unindexed no matter how long you wait.
+    reason: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct DiffImpactOutput {
     files_changed: Vec<String>,
     affected_symbols: Vec<AffectedSymbolOutput>,
-    unindexed_files: Vec<String>,
+    unindexed_files: Vec<UnindexedFileOutput>,
     aggregate_risk: String,
     suggested_reviewers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2687,7 +2702,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let file_diffs = ci_core::analysis::diff_impact::parse_unified_diff(&diff_text);
             let files_changed: Vec<String> = file_diffs.iter().map(|f| f.path.clone()).collect();
 
-            let mut unindexed_files: Vec<String> = Vec::new();
+            let mut unindexed_files: Vec<UnindexedFileOutput> = Vec::new();
             let mut affected: Vec<std::collections::HashMap<String, serde_json::Value>> =
                 Vec::new();
 
@@ -2698,15 +2713,35 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                     Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
                 };
                 for fd in &file_diffs {
-                    let symbol_count: i64 = conn
+                    // file_index has one row per file the indexer has ever
+                    // scanned, independent of how many symbols it found — a
+                    // file with 0 symbols (e.g. a Rust `mod.rs` that's just
+                    // `pub mod` statements) is still fully indexed, just
+                    // empty, and must not be reported as "unindexed" (the old
+                    // `symbols`-only check couldn't tell the two apart).
+                    let scanned: i64 = conn
                         .query_row(
-                            "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                            "SELECT COUNT(*) FROM file_index WHERE path = ?1",
                             rusqlite::params![fd.path],
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
-                    if symbol_count == 0 {
-                        unindexed_files.push(fd.path.clone());
+                    if scanned == 0 {
+                        let ext = std::path::Path::new(&fd.path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        let reason = if ci_core::indexer::lang_constants::language_for_extension(ext)
+                            .is_some()
+                        {
+                            "pending_scan"
+                        } else {
+                            "out_of_scope"
+                        };
+                        unindexed_files.push(UnindexedFileOutput {
+                            path: fd.path.clone(),
+                            reason: reason.to_string(),
+                        });
                         continue;
                     }
 
@@ -2741,8 +2776,16 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                         }
 
                         let sig_end = line_start + (line_end - line_start).min(2);
-                        let signature_changed =
-                            ci_core::analysis::diff_impact::is_signature_changed(
+                        let is_new_symbol = ci_core::analysis::diff_impact::is_new_symbol(
+                            (line_start, sig_end),
+                            fd.is_new_file,
+                            &fd.added_lines,
+                        );
+                        // A symbol that didn't exist before this diff cannot have had
+                        // its signature "changed" — there is no prior signature to
+                        // compare against, and (by definition) no prior call sites.
+                        let signature_changed = !is_new_symbol
+                            && ci_core::analysis::diff_impact::is_signature_changed(
                                 (line_start, sig_end),
                                 &fd.hunks,
                             );
@@ -2755,12 +2798,18 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                             "low"
                         };
                         let mut reasons: Vec<String> = Vec::new();
-                        let level =
+                        let level = if is_new_symbol {
+                            reasons.push(
+                                "newly added symbol — no prior call sites to check; review its own correctness".to_string(),
+                            );
+                            base_level.to_string()
+                        } else {
                             ci_core::analysis::diff_impact::escalate_risk_if_signature_changed(
                                 signature_changed,
                                 base_level,
                                 &mut reasons,
-                            );
+                            )
+                        };
 
                         let mut m: std::collections::HashMap<String, serde_json::Value> =
                             std::collections::HashMap::new();
@@ -2772,6 +2821,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                             "signature_changed".into(),
                             serde_json::json!(signature_changed),
                         );
+                        m.insert("symbol_is_new".into(), serde_json::json!(is_new_symbol));
                         m.insert(
                             "blast_radius".into(),
                             serde_json::json!({"direct_callers": caller_count}),
@@ -2785,8 +2835,15 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 }
             }
 
-            let aggregate_risk =
-                ci_core::analysis::diff_impact::compute_aggregate_risk(&affected, &unindexed_files);
+            let pending_scan_paths: Vec<String> = unindexed_files
+                .iter()
+                .filter(|f| f.reason == "pending_scan")
+                .map(|f| f.path.clone())
+                .collect();
+            let aggregate_risk = ci_core::analysis::diff_impact::compute_aggregate_risk(
+                &affected,
+                &pending_scan_paths,
+            );
             const MAX_AFFECTED_SYMBOLS: usize = 20;
             ci_core::analysis::diff_impact::sort_affected_symbols(
                 &mut affected,
@@ -2813,7 +2870,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 }
             }
 
-            let sn = if !unindexed_files.is_empty() {
+            let sn = if !pending_scan_paths.is_empty() {
                 suggested("indexing_status", "Wait for index before treating as safe")
             } else if aggregate_risk == "critical" || aggregate_risk == "high" {
                 affected_symbols.first().map(|s| SuggestedNext {
@@ -3833,6 +3890,12 @@ mod tests {
                 ],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/foo.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
         }
 
         // Hunk touches only the body (lines 14-15), not the signature heuristic
@@ -3862,6 +3925,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: a brand-new function added to an *existing*, already-indexed
+    /// file must not be reported as "signature modified — all call sites may
+    /// need update" (it has zero prior call sites because it didn't exist
+    /// before this diff). Distinct from `diff_impact_unindexed_file_yields_unknown_risk`
+    /// below, which covers a new *file* that hasn't been indexed at all yet —
+    /// this one is already indexed, so it must land in `affected_symbols`.
+    #[test]
+    fn diff_impact_new_symbol_in_existing_file_is_not_flagged_as_signature_changed() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_new_symbol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "mod.brand_new", "brand_new", "function", "rust", "src/fitness.rs", 500i64, 505i64,
+                    "fn brand_new()", "", "brand_new", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/fitness.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Pure-insertion hunk (old_len=0) into an existing file — the new
+        // function's whole line range (500-505) sits inside it, so there is
+        // no "prior signature" for it to have changed.
+        let diff = "diff --git a/src/fitness.rs b/src/fitness.rs\n\
+                     --- a/src/fitness.rs\n\
+                     +++ b/src/fitness.rs\n\
+                     @@ -499,0 +500,6 @@ fn existing() {\n\
+                     +fn brand_new() {\n\
+                     +    1\n\
+                     +}\n\
+                     +\n\
+                     +fn another() {}\n\
+                     +\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v["unindexed_files"].as_array().unwrap().is_empty());
+        assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
+        let sym = &v["affected_symbols"][0];
+        assert_eq!(sym["qualified_name"], "mod.brand_new");
+        assert_eq!(
+            sym["symbol_is_new"], true,
+            "whole symbol range sits inside a pure-addition hunk"
+        );
+        assert_eq!(
+            sym["signature_changed"], false,
+            "a symbol that didn't exist before this diff cannot have a changed signature"
+        );
+        let reasons = sym["risk_assessment"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("newly added symbol")),
+            "expected a new-symbol reason, got: {reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("signature modified")),
+            "must not claim a signature change for a symbol with zero prior call sites, got: {reasons:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "pending_scan": a recognized source extension (.rs) with no file_index
+    /// row yet — the indexer just hasn't caught up. Must poison aggregate_risk
+    /// to "unknown" since we genuinely can't assess it.
     #[test]
     fn diff_impact_unindexed_file_yields_unknown_risk() {
         let dir =
@@ -3884,8 +4033,100 @@ mod tests {
         });
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
-        assert_eq!(v["unindexed_files"], serde_json::json!(["src/new.rs"]));
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "src/new.rs", "reason": "pending_scan"}])
+        );
         assert_eq!(v["aggregate_risk"], "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "out_of_scope": an extension the indexer never parses (docs, config,
+    /// ...) has no file_index row *by design*, not because it's pending — it
+    /// must be labeled differently from `pending_scan` and must NOT drag
+    /// aggregate_risk down to "unknown" (there's nothing to ever assess here).
+    #[test]
+    fn diff_impact_out_of_scope_file_does_not_poison_aggregate_risk() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_diff_impact_out_of_scope_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let diff = "diff --git a/README.md b/README.md\n\
+                     --- a/README.md\n\
+                     +++ b/README.md\n\
+                     @@ -1,1 +1,2 @@\n\
+                      Title\n\
+                     +New paragraph\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "README.md", "reason": "out_of_scope"}])
+        );
+        assert_eq!(
+            v["aggregate_risk"], "low",
+            "an out-of-scope file alone must not force aggregate_risk to unknown"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that *has* been scanned (file_index row present) but has zero
+    /// symbols (e.g. a Rust `mod.rs` that's only `pub mod` statements) must
+    /// not appear in `unindexed_files` at all — it is fully indexed, just
+    /// empty. Regression for the old `symbols`-only check, which could not
+    /// tell "not scanned yet" apart from "scanned, nothing there".
+    #[test]
+    fn diff_impact_scanned_but_symbol_less_file_is_not_unindexed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_diff_impact_empty_scanned_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/mod.rs', 'deadbeef', 'rust', 0, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let diff = "diff --git a/src/mod.rs b/src/mod.rs\n\
+                     --- a/src/mod.rs\n\
+                     +++ b/src/mod.rs\n\
+                     @@ -1,1 +1,2 @@\n\
+                      pub mod a;\n\
+                     +pub mod b;\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v["unindexed_files"].as_array().unwrap().is_empty());
+        assert!(v["affected_symbols"].as_array().unwrap().is_empty());
+        assert_eq!(
+            v["aggregate_risk"], "low",
+            "a scanned-but-empty file must not be treated as unindexed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

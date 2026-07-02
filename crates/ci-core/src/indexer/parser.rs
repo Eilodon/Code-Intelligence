@@ -499,6 +499,12 @@ pub struct RawCall {
     pub enclosing_class: Option<String>,
     pub callee: String,
     pub receiver: Option<String>,
+    /// True when `receiver` came from a `Type::method()` scoped-path call
+    /// (the path segment immediately before the last `::`) rather than a
+    /// `recv.method()` field access. `receiver` is then already the type
+    /// name itself — resolution must scope directly to that class, not go
+    /// through the variable→type lookup a `.`-receiver needs.
+    pub receiver_is_type_path: bool,
     pub line: usize,
 }
 
@@ -512,21 +518,44 @@ fn leading_ident(seg: &str) -> Option<String> {
     if ident.is_empty() { None } else { Some(ident) }
 }
 
-/// Split a callee expression into (immediate receiver, method/callee name).
+/// Split a callee expression into (immediate receiver, method/callee name,
+/// whether that receiver is a type-path segment rather than a variable).
 ///
-/// `self.method` → (Some("self"), "method"); `a.b.method` → (Some("b"), "method");
-/// `mod::func` / `func` → (None, "func").
-fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String)> {
+/// `self.method` → (Some("self"), "method", false);
+/// `a.b.method` → (Some("b"), "method", false);
+/// `HashMap::new` → (Some("HashMap"), "new", true) — the segment before the
+/// last `::` is kept (not discarded) when it looks like a type name, since
+/// that's the class an associated-function call like `Type::method()` must
+/// resolve against; `mod::func` → (None, "func", false) — a lowercase
+/// segment reads as a module, not a type (see `is_type_like`).
+fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
     if let Some(dot) = raw.rfind('.') {
         let (left, right) = raw.split_at(dot);
         let callee = leading_ident(&right[1..])?;
         // Immediate receiver = last segment of the left side.
         let recv = left.rsplit(['.', ':']).next().and_then(leading_ident);
-        Some((recv, callee))
+        Some((recv, callee, false))
+    } else if let Some(idx) = raw.rfind("::") {
+        let (left, right) = raw.split_at(idx);
+        let callee = leading_ident(&right[2..])?;
+        let recv = left.rsplit("::").next().and_then(leading_ident);
+        let is_type = recv.as_deref().is_some_and(is_type_like);
+        Some((if is_type { recv } else { None }, callee, is_type))
     } else {
-        let last = raw.rsplit("::").next().unwrap_or(raw);
-        Some((None, leading_ident(last)?))
+        Some((None, leading_ident(raw)?, false))
     }
+}
+
+/// Heuristic: a path segment is "type-like" when it starts with an uppercase
+/// letter, matching Rust/C#/Java/Kotlin/Swift convention for types/classes
+/// (vs. snake_case modules or lowerCamelCase namespaces/packages). Not
+/// perfect — code that doesn't follow the convention won't benefit — but a
+/// false negative here just falls back to the pre-existing unscoped
+/// resolution behavior, so the cost of missing one is low; a false positive
+/// (treating a module as a type) just means a class-scoped lookup that
+/// finds nothing, same as today.
+fn is_type_like(segment: &str) -> bool {
+    segment.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 /// Walk the AST collecting call sites, tracking the nearest enclosing function
@@ -559,7 +588,8 @@ fn walk_calls(
     if consts.call_node_types.contains(&node.kind())
         && let Some((enc_name, enc_line)) = &current
         && let Some(fn_node) = node.child_by_field_name(consts.call_function_field)
-        && let Some((receiver, callee)) = split_receiver_callee(&source[fn_node.byte_range()])
+        && let Some((receiver, callee, receiver_is_type_path)) =
+            split_receiver_callee(&source[fn_node.byte_range()])
     {
         out.push(RawCall {
             enclosing_name: enc_name.clone(),
@@ -567,6 +597,7 @@ fn walk_calls(
             enclosing_class: child_class.clone(),
             callee,
             receiver,
+            receiver_is_type_path,
             line: node.start_position().row + 1,
         });
     }
@@ -1689,5 +1720,56 @@ class Foo {
         let code = "def run\n  if true\n    puts 'x'\n  end\nend\n";
         let syms = extract_symbols_shallow(code, "ruby", "a.rb");
         assert!(syms.iter().all(|s| s.complexity == 1));
+    }
+
+    #[test]
+    fn test_split_receiver_callee_dot_receiver() {
+        assert_eq!(
+            split_receiver_callee("self.method"),
+            Some((Some("self".to_string()), "method".to_string(), false))
+        );
+        assert_eq!(
+            split_receiver_callee("a.b.method"),
+            Some((Some("b".to_string()), "method".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_split_receiver_callee_type_path_is_scoped() {
+        // Type::method() — uppercase segment before the last `::` is kept as
+        // a receiver AND flagged as a type path (not a variable to look up).
+        assert_eq!(
+            split_receiver_callee("HashMap::new"),
+            Some((Some("HashMap".to_string()), "new".to_string(), true))
+        );
+        // Module-qualified free function — lowercase segment is not type-like,
+        // so it is dropped exactly like before this fix (no behavior change).
+        assert_eq!(
+            split_receiver_callee("mod::func"),
+            Some((None, "func".to_string(), false))
+        );
+        // Multi-level module path to an associated function: only the segment
+        // immediately before the last `::` is kept (the type, not the module).
+        assert_eq!(
+            split_receiver_callee("std::collections::HashMap::new"),
+            Some((Some("HashMap".to_string()), "new".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn test_split_receiver_callee_bare_function() {
+        assert_eq!(
+            split_receiver_callee("func"),
+            Some((None, "func".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_is_type_like() {
+        assert!(is_type_like("HashMap"));
+        assert!(is_type_like("StructA"));
+        assert!(!is_type_like("mod"));
+        assert!(!is_type_like("helper"));
+        assert!(!is_type_like(""));
     }
 }

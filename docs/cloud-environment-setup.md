@@ -68,7 +68,7 @@ This must build to the **same path** `.mcp.json` expects:
 benefit here, since this binary is a local dev/dogfood tool, not a
 distributed artifact; keep this in sync with
 `.claude/hooks/session-start-build-ci.sh` and
-`.claude/hooks/ci-mcp-entrypoint.sh` if that ever changes).
+`scripts/mcp-launcher.sh` if that ever changes).
 
 Keep it under Claude Code's ~5-minute Setup Script budget — 59s measured
 leaves a wide margin.
@@ -89,9 +89,11 @@ session before any cache exists, or right after the ~7-day cache expiry)
 
 ## What's already handled in this repo (defense in depth, not a substitute)
 
-- `.claude/hooks/ci-mcp-entrypoint.sh` — `.mcp.json`'s actual entrypoint
-  now. Execs the pre-built binary directly if present (no `cargo`
-  involved, no risk of an unexpected rebuild reopening this exact race);
+- `scripts/mcp-launcher.sh` — `.mcp.json`'s actual entrypoint now (shared
+  across every MCP client, not just Claude Code; see
+  `docs/mcp-client-setup.md`). Execs an already-cached binary directly if
+  present (no `cargo` involved, no risk of an unexpected rebuild reopening
+  this exact race);
   only builds inline if the binary is missing outright.
 - `.claude/hooks/session-start-build-ci.sh` — still runs every session.
   Redundant with the Setup Script in the common case (no-op if `target/`

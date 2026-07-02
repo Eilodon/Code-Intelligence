@@ -177,6 +177,6 @@ Phase IV  Distribution                     ~3-5 ngày
 - [x] Phase I: `ci-core/src/indexer/` symbol extraction (6 ngôn ngữ, Cursor API), edge build → coreness → `is_hub`, nối `ci index`/`ci serve` *(commit 21d0459)*
 - [x] Phase II: `notify` watcher debounce + incremental hash-diff (`call_sites` + `rebuild_graph`) *(commit 11d5714)*
 - [x] Phase II hardening: alias-aware edges (`resolver::conservative`), live watcher integration test, debounce starvation fix *(commit 9cb40f4)*
-- [~] Phase IV: `release.yml` (musl x3), `Containerfile`, `compose.yaml`; `ci init` đã có sẵn *(đang verify build)*
+- [x] Phase IV: `release.yml` (musl x2 + macOS ARM, checksums, GHCR publish), `Containerfile`, `compose.yaml`, `ci init`; universal `scripts/mcp-launcher.sh` (Claude Code/Cursor/VS Code + Windsurf/JetBrains docs), `LICENSE` *(2026-07-02)*
 - [ ] Phase III embeddings — **HOÃN** (theo quyết định 2026-06-30)
 - [ ] Còn lại: `import_edges`, phase-ladder `edges_ready` gating runtime trong `ci serve`, mở rộng resolver alias→cross-file

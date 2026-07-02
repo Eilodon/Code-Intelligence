@@ -18,7 +18,7 @@
     "ci": {
       "type": "stdio",
       "command": "bash",
-      "args": [".claude/hooks/ci-mcp-entrypoint.sh"],
+      "args": ["scripts/mcp-launcher.sh"],
       "env": {}
     }
   }

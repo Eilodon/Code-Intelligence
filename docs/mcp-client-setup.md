@@ -1,0 +1,85 @@
+# Dùng "ci" MCP server với nhiều agent/IDE khác nhau
+
+`ci` không phải MCP server chỉ dành riêng cho Claude Code — `scripts/mcp-launcher.sh`
+là entrypoint dùng chung cho **mọi** client MCP nói stdio (Claude Code, Cursor,
+VS Code, Windsurf, JetBrains, hoặc bất kỳ tool nào có thể spawn một command).
+File này giải thích launcher hoạt động ra sao và cách trỏ từng client vào nó.
+
+## Launcher resolve binary theo 3 tầng
+
+`scripts/mcp-launcher.sh` luôn thử theo đúng thứ tự sau, dùng ngay binary đầu
+tiên tìm thấy:
+
+1. **Fast path** — binary đã có sẵn: `$CI_MCP_BIN` (override thủ công) →
+   `~/.cache/ci-mcp/<tag>/ci` (bản đã tải-và-verify từ lần trước) →
+   `target/release/ci` → `target/debug/ci` (build local đã có).
+2. **Verified download** — chỉ áp dụng cho Linux x86_64/aarch64, và **chỉ khi
+   `HEAD` đang đứng đúng một git tag đã release** (không bao giờ đoán mò
+   version). Tải asset đúng platform từ GitHub Release của tag đó, verify
+   SHA256 với `SHA256SUMS` đã publish kèm, rồi sanity-check `ci --version`
+   khớp với version mong đợi — xong hết mới cache lại và exec. Bất kỳ bước
+   nào thất bại (tải lỗi, sai checksum, sai version) đều rơi xuống tầng 3,
+   **không bao giờ** exec một binary chưa verify xong.
+3. **Build from source** — `cargo build -p ci-cli`, luôn hoạt động miễn có
+   Rust toolchain. Đây là đường duy nhất cho macOS/Windows, cho checkout
+   đang dev dở (không nằm đúng tag), hoặc môi trường không có mạng.
+
+Vì sao không mặc định lấy "latest release": nếu bạn đang dev trên `main`
+giữa hai lần release, tải "latest" sẽ âm thầm cài một binary **cũ hơn**
+source đang có trên máy — sai lệch này rất khó nhận ra. Launcher mặc định
+chỉ tải khi checkout đang đúng một tag (tag khớp source thì mới an toàn để
+tin tưởng); muốn ưu tiên khởi động nhanh và chấp nhận rủi ro lệch version đó
+thì set `CI_MCP_LAUNCHER_ALLOW_LATEST=1`.
+
+Nếu SHA256 sai (nghi ngờ download hỏng hoặc bị can thiệp), launcher **không
+exec** binary đó — log lỗi rõ ràng ra stderr rồi tự động build từ source
+thay vì dừng hẳn, để server vẫn luôn khởi động được.
+
+## Client đã có sẵn config trong repo
+
+Ba file sau đều trỏ vào `scripts/mcp-launcher.sh`, khác nhau ở tên field
+top-level:
+
+| Client | File (repo-level) | Field top-level |
+|---|---|---|
+| Claude Code | `.mcp.json` | `mcpServers` |
+| Cursor | `.cursor/mcp.json` | `mcpServers` |
+| VS Code | `.vscode/mcp.json` | `servers` (khác tên, cùng shape `command`/`args`) |
+
+Clone repo về là dùng được ngay với cả ba — không cần cấu hình thêm gì.
+
+## Windsurf (global config, không check-in được)
+
+Windsurf chỉ đọc config từ `~/.codeium/windsurf/mcp_config.json` (theo user,
+không có project-level) — không thể checkout kèm repo được, phải dán tay.
+Dán đoạn sau vào, thay `/absolute/path/to/Code-Intelligence` bằng đường dẫn
+thật nơi bạn clone repo này (khác với 3 config trên, path ở đây **phải là
+tuyệt đối** vì không có khái niệm "project root" cho một file config toàn
+cục):
+
+```json
+{
+  "mcpServers": {
+    "ci": {
+      "command": "bash",
+      "args": ["/absolute/path/to/Code-Intelligence/scripts/mcp-launcher.sh"]
+    }
+  }
+}
+```
+
+## JetBrains AI Assistant
+
+Cấu hình qua UI settings riêng của JetBrains (không phải file check-in vào
+repo) — trỏ command/args giống hệt snippet Windsurf ở trên (path tuyệt đối
+tới `scripts/mcp-launcher.sh`).
+
+## Liên quan: race điều kiện lúc cold-start trên Claude Code on the web
+
+`docs/cloud-environment-setup.md` giải thích một vấn đề khác, riêng cho
+Claude Code trên web: MCP client dial server **song song** với SessionStart
+hook, không đảm bảo thứ tự — nên `.claude/hooks/session-start-build-ci.sh`
+vẫn tồn tại độc lập với launcher này. Fast path (tầng 1) của launcher chỉ
+kiểm tra "binary đã tồn tại chưa", không kiểm tra binary có bị stale hay
+không (ví dụ đang sửa dở source của chính `ci`) — đó vẫn là vai trò riêng
+của SessionStart hook đó, không bị thay thế bởi launcher này.

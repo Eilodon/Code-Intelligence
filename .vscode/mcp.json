@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "ci": {
+      "command": "bash",
+      "args": ["scripts/mcp-launcher.sh"]
+    }
+  }
+}

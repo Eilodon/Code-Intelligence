@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "ci",
-    about = "Code Intelligence — MCP server for codebase analysis"
+    about = "Code Intelligence — MCP server for codebase analysis",
+    version
 )]
 struct Cli {
     #[command(subcommand)]

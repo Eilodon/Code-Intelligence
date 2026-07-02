@@ -27,7 +27,8 @@ __pycache__/
 # OS / editor
 .DS_Store
 Thumbs.db
-.vscode/
+.vscode/*
+!.vscode/mcp.json
 .idea/
 *.swp
 *.swo

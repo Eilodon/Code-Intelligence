@@ -32,19 +32,14 @@ ci index --project-root .
 ci serve --project-root .
 ```
 
-Tích hợp vào MCP client (ví dụ Claude Code) qua `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "ci": {
-      "type": "stdio",
-      "command": "ci",
-      "args": ["serve", "--project-root", "."]
-    }
-  }
-}
-```
+Repo đã có sẵn config cho Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`)
+và VS Code (`.vscode/mcp.json`) — cả ba đều trỏ vào `scripts/mcp-launcher.sh`,
+một launcher dùng chung: tự tìm binary đã build/cache, tải bản prebuilt đã
+verify checksum nếu đang ở đúng git tag, hoặc build từ source nếu không có
+gì sẵn — clone repo về là chạy được ngay, không cần build tay bước 1 ở trên
+trước. Xem [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) để biết
+cách dùng với Windsurf/JetBrains (config toàn cục, không check-in vào repo
+được) và chi tiết cách launcher hoạt động.
 
 > **Lưu ý**: `ci serve` tự động thêm `.codeindex/` vào `.gitignore` khi khởi động để tránh
 > commit DB vào repo.
@@ -194,8 +189,13 @@ reason = "core không được phụ thuộc server layer"
 ## Deployment
 
 - `cargo build --release` → binary tĩnh musl qua `.github/workflows/release.yml`, matrix:
-  `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`.
-- `Containerfile` multi-stage (`rust:alpine` → `scratch`), image ~10MB.
+  `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (kèm `SHA256SUMS`),
+  `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` tự tải + verify checksum bản
+  đúng platform khi checkout đang ở đúng git tag — xem
+  [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md).
+- `Containerfile` multi-stage (`rust:alpine` → `scratch`), image ~10MB, publish
+  lên `ghcr.io/eilodon/code-intelligence` (tag theo version + `latest`) mỗi khi
+  push git tag.
 - `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
   `mem_limit: 256m`).
 
@@ -216,4 +216,4 @@ Chi tiết resolver internals, ADR, migration plans nằm trong [`docs/`](docs/)
 
 ## License
 
-MIT
+[MIT](LICENSE)

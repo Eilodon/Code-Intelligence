@@ -409,6 +409,54 @@ mod tests {
         );
     }
 
+    /// Regression: every Params field used to have no `///` doc comment, so
+    /// schemars emitted no `description` — an agent calling these tools had
+    /// no way to discover valid enum values (e.g. `locate`'s `depth`) short
+    /// of reading Rust source. Spot-checks the enum-like fields most likely
+    /// to be guessed wrong, not every field in every tool.
+    #[test]
+    fn key_enum_like_params_have_schema_descriptions() {
+        fn assert_described(tool_name: &str, tool: rmcp::model::Tool, field: &str) {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{tool_name}: input_schema has no properties object"));
+            let desc = props
+                .get(field)
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or_else(|| panic!("{tool_name}.{field}: missing schema description"));
+            assert!(
+                !desc.is_empty(),
+                "{tool_name}.{field}: schema description is empty"
+            );
+        }
+
+        assert_described("locate", CodeIntelligenceServer::locate_tool_attr(), "kind");
+        assert_described(
+            "locate",
+            CodeIntelligenceServer::locate_tool_attr(),
+            "depth",
+        );
+        assert_described("search", CodeIntelligenceServer::search_tool_attr(), "kind");
+        assert_described(
+            "understand",
+            CodeIntelligenceServer::understand_tool_attr(),
+            "kind",
+        );
+        assert_described(
+            "callers",
+            CodeIntelligenceServer::callers_tool_attr(),
+            "line",
+        );
+        assert_described(
+            "edit_context",
+            CodeIntelligenceServer::edit_context_tool_attr(),
+            "line",
+        );
+    }
+
     /// Regression: `get_info()` used to build `ServerInfo` with
     /// `..Default::default()`, which leaves `capabilities.tools` as `None`.
     /// A spec-compliant MCP client only calls `tools/list` when the server
@@ -792,6 +840,81 @@ mod tests {
                 .iter()
                 .any(|r| r.as_str().unwrap().contains("signature modified")),
             "must not claim callers may need updating for a pure rename, got: {reasons:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `sig_end` used to be hard-capped at `line_start + 2`
+    /// (3 lines), so a change past line 3 of a longer real signature was
+    /// silently missed — verified for real against
+    /// `ci_core::analysis::cochange::compute_co_changes`, whose signature
+    /// genuinely spans 7 lines. This reproduces that exact shape: `dim`'s
+    /// type changes on line 6, well past the old cap, and must still be
+    /// caught now that `sig_end` is derived from the indexer's own
+    /// multi-line `signature` text instead of a fixed cap.
+    #[test]
+    fn diff_impact_catches_change_past_old_three_line_signature_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_longsig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            let signature = "pub fn compute_co_changes(\n    project_root: &Path,\n    target_path: &str,\n    since: &str,\n    min_co_changes: usize,\n    top_n: usize,\n) -> CoChangeResult {";
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "cochange::compute_co_changes", "compute_co_changes", "function", "rust", "src/cochange.rs", 1i64, 20i64,
+                    signature, "", "compute_co_changes", 6i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('src/cochange.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // `top_n`'s type changes on line 6 — 3 lines past the old cap of 3,
+        // but still within this signature's real 7-line span (1-7).
+        let diff = "diff --git a/src/cochange.rs b/src/cochange.rs\n\
+                     --- a/src/cochange.rs\n\
+                     +++ b/src/cochange.rs\n\
+                     @@ -1,7 +1,7 @@\n\
+                      pub fn compute_co_changes(\n\
+                          project_root: &Path,\n\
+                          target_path: &str,\n\
+                          since: &str,\n\
+                          min_co_changes: usize,\n\
+                     -    top_n: usize,\n\
+                     +    top_n: u32,\n\
+                      ) -> CoChangeResult {\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
+        let sym = &v["affected_symbols"][0];
+        assert_eq!(
+            sym["signature_changed"], true,
+            "a type change on line 6 of a 7-line signature must be caught, got: {sym}"
+        );
+        let reasons = sym["risk_assessment"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("signature modified")),
+            "expected a signature-modified reason, got: {reasons:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

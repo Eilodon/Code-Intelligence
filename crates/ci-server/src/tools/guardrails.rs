@@ -230,11 +230,11 @@ impl CodeIntelligenceServer {
 
                     let mut stmt = conn
                         .prepare(
-                            "SELECT qualified_name, name, kind, line_start, line_end, caller_count
+                            "SELECT qualified_name, name, kind, line_start, line_end, caller_count, signature
                              FROM symbols WHERE path = ?1",
                         )
                         .unwrap();
-                    let rows: Vec<(String, String, String, i64, i64, i64)> = stmt
+                    let rows: Vec<(String, String, String, i64, i64, i64, String)> = stmt
                         .query_map(rusqlite::params![fd.path], |row| {
                             Ok((
                                 row.get(0)?,
@@ -243,13 +243,16 @@ impl CodeIntelligenceServer {
                                 row.get(3)?,
                                 row.get(4)?,
                                 row.get(5)?,
+                                row.get(6)?,
                             ))
                         })
                         .unwrap()
                         .filter_map(|r| r.ok())
                         .collect();
 
-                    for (qualified_name, name, kind, line_start, line_end, caller_count) in rows {
+                    for (qualified_name, name, kind, line_start, line_end, caller_count, signature) in
+                        rows
+                    {
                         let overlaps = fd
                             .hunks
                             .iter()
@@ -258,7 +261,16 @@ impl CodeIntelligenceServer {
                             continue;
                         }
 
-                        let sig_end = line_start + (line_end - line_start).min(2);
+                        // The indexer's own signature extraction (parser.rs::walk_symbols)
+                        // already scans to the real body-opening `{` (or `:` for Python) —
+                        // its embedded newlines tell us exactly how many lines the real
+                        // signature spans, instead of guessing with a fixed line cap (which
+                        // silently missed changes past line 3 of a longer signature, e.g.
+                        // ci_core::analysis::cochange::compute_co_changes's 7-line one).
+                        // Clamped to line_end as a defensive bound, never exceeded in
+                        // practice since a signature can't outlive its own symbol.
+                        let sig_end =
+                            (line_start + signature.matches('\n').count() as i64).min(line_end);
                         let is_new_symbol = ci_core::analysis::diff_impact::is_new_symbol(
                             (line_start, sig_end),
                             fd.is_new_file,
@@ -415,7 +427,11 @@ pub(crate) fn error_json(code: &str, message: &str, recoverable: bool) -> String
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct EditContextParams {
+    /// Bare symbol name (not a `path::name` qualified name) — e.g. `load`,
+    /// not `crates/ci-core/src/embedding.rs::Embedder::load`.
     pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative, e.g. `crates/ci-core/src/embedding.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file (e.g. a
@@ -505,10 +521,19 @@ pub(crate) struct EditContextOutput {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct DiffImpactParams {
+    /// A raw unified diff (`git diff` output) to analyze directly, instead
+    /// of having this tool run git itself. Exactly one of `diff`, `staged`,
+    /// `commits` must be set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff: Option<String>,
+    /// `true` to analyze the staged diff (`git diff --cached`); `false` or
+    /// omitted analyzes the unstaged working-tree diff. Exactly one of
+    /// `diff`, `staged`, `commits` must be set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) staged: Option<bool>,
+    /// A commit range/rev understood by `git diff`, e.g. `HEAD~3..HEAD` or
+    /// a single commit SHA. Exactly one of `diff`, `staged`, `commits`
+    /// must be set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) commits: Option<String>,
 }

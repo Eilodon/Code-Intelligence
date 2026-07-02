@@ -356,7 +356,10 @@ impl CodeIntelligenceServer {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct CallersParams {
+    /// Bare symbol name (not a `path::name` qualified name).
     pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file — any line within
@@ -364,8 +367,14 @@ pub(crate) struct CallersParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// `true` to also do a multi-hop BFS (`transitive`/`transitive_count`
+    /// in the output) beyond direct callers. `false` (default) returns
+    /// only direct callers — cheaper.
     #[serde(default)]
     pub(crate) transitive: bool,
+    /// Max BFS depth when `transitive` is set. Clamped to
+    /// `callers.max_depth_cap` in config.json (4 out of the box); ignored
+    /// if `transitive` is `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_depth: Option<i64>,
 }
@@ -393,7 +402,10 @@ pub(crate) struct CallersOutput {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct CalleesParams {
+    /// Bare symbol name (not a `path::name` qualified name).
     pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file — any line within
@@ -401,8 +413,14 @@ pub(crate) struct CalleesParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// `true` to also do a multi-hop BFS (`transitive`/`transitive_count`
+    /// in the output) beyond direct callees. `false` (default) returns
+    /// only direct callees — cheaper.
     #[serde(default)]
     pub(crate) transitive: bool,
+    /// Max BFS depth when `transitive` is set. Clamped to
+    /// `callees.max_depth_cap` in config.json (4 out of the box); ignored
+    /// if `transitive` is `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_depth: Option<i64>,
 }
@@ -426,6 +444,8 @@ pub(crate) struct CalleesOutput {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct DependenciesParams {
+    /// Repo-relative path of the file whose imports/importers to list, e.g.
+    /// `crates/ci-core/src/embedding.rs`.
     pub(crate) path: String,
 }
 
@@ -459,10 +479,15 @@ pub(crate) struct DependenciesOutput {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct PathParams {
+    /// Bare name of the starting symbol (not a `path::name` qualified name).
     pub(crate) from_symbol: String,
+    /// Bare name of the target symbol to reach.
     pub(crate) to_symbol: String,
+    /// Narrows `from_symbol` to one file when the bare name is ambiguous
+    /// across the repo. Repo-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) from_path: Option<String>,
+    /// Same as `from_path`, for `to_symbol`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) to_path: Option<String>,
     /// Disambiguates a same-named `from_symbol` in the same file — any line
@@ -472,6 +497,9 @@ pub(crate) struct PathParams {
     /// Same as `from_line`, for `to_symbol`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) to_line: Option<i64>,
+    /// Max BFS depth to search before giving up. Defaults to
+    /// `path.default_max_hops` in config.json (8 out of the box), clamped
+    /// to `path.max_allowed_hops` (20 out of the box).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_hops: Option<i64>,
 }

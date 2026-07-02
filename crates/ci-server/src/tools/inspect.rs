@@ -252,7 +252,10 @@ impl CodeIntelligenceServer {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct SymbolInfoParams {
+    /// Bare symbol name (not a `path::name` qualified name).
     pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file — any line within
@@ -382,7 +385,10 @@ pub(crate) fn is_test_file(path: &str) -> bool {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct SourceParams {
+    /// Bare symbol name (not a `path::name` qualified name).
     pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file — any line within
@@ -390,6 +396,9 @@ pub(crate) struct SourceParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// `true` to also return `metadata` (signature, docstring,
+    /// caller_count, is_hub) alongside the source text. `false` (default)
+    /// omits it — plain source text only.
     #[serde(default)]
     pub(crate) include_metadata: bool,
 }
@@ -443,7 +452,12 @@ pub(crate) fn estimate_tokens(s: &str) -> i64 {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct UnderstandParams {
+    /// Symbol name or free text to look up — resolved via the same search
+    /// used by `locate`, but only the single best match is used.
     pub(crate) query: String,
+    /// One of `"symbol"` (default), `"text"`, or `"file"` — same meaning as
+    /// `locate`'s `kind`, minus `"semantic"`/`"hybrid"` (not supported
+    /// here). Any other value silently falls back to `"symbol"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
 }

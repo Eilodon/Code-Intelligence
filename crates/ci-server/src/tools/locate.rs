@@ -282,8 +282,14 @@ pub(crate) struct ErrorDetail {
 #[allow(dead_code)]
 pub(crate) struct SearchParams {
     pub(crate) query: String,
+    /// One of `"symbol"` (default, name/signature match), `"text"` (FTS
+    /// over code body), `"file"` (path match), `"semantic"` (embedding
+    /// KNN — needs the `embeddings` feature and a ready index), or
+    /// `"hybrid"` (RRF fusion of text + symbol-identity + code-chunk
+    /// vectors). Any other value silently falls back to `"symbol"`.
     #[serde(default = "default_symbol")]
     pub(crate) kind: String,
+    /// Max results to return. Default 10.
     #[serde(default = "default_limit")]
     pub(crate) limit: usize,
 }
@@ -330,6 +336,7 @@ pub(crate) struct SearchOutput {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct FileOverviewParams {
+    /// Repo-relative path, e.g. `crates/ci-core/src/embedding.rs`.
     pub(crate) path: String,
 }
 
@@ -409,10 +416,26 @@ pub(crate) fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> Fi
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct LocateParams {
     pub(crate) query: String,
+    /// Same values as `search`'s `kind` — `"symbol"` (default), `"text"`,
+    /// `"file"`, `"semantic"`, or `"hybrid"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
+    /// How much to enrich the top hit beyond `results`, in increasing
+    /// cost/token size:
+    /// - `"search_only"`: just `results` — cheapest, use when you only
+    ///   need the match list (e.g. checking existence, or `kind` is
+    ///   `"text"`/`"file"` where there's no symbol to enrich anyway).
+    /// - `"with_file"`: adds `file_overview` (every symbol in the top
+    ///   hit's file, with signatures) — can be large for a big file.
+    /// - `"with_symbol"` (default): adds both `file_overview` and
+    ///   `top_symbol` (full metadata for just the top hit).
+    ///
+    /// `kind` `"text"`/`"file"` auto-downgrades `"with_symbol"` to
+    /// `"with_file"` (reported via `depth_adjusted`) since a text/file
+    /// match has no single symbol to enrich.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) depth: Option<String>,
+    /// Max entries in `results`. Default 10.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<usize>,
 }

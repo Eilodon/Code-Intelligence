@@ -153,7 +153,7 @@ impl CodeIntelligenceServer {
 
     #[tool(
         name = "diff_impact",
-        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Provide exactly one of: diff, staged, commits."
+        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>."
     )]
     pub(crate) fn diff_impact(&self, #[tool(aggr)] p: DiffImpactParams) -> String {
         self.timed_tool("diff_impact", || {
@@ -161,10 +161,10 @@ impl CodeIntelligenceServer {
 
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
-            if input_count != 1 {
+            if input_count > 1 {
                 return error_json(
                     "INVALID_INPUT",
-                    "Exactly one of diff, staged, or commits must be provided",
+                    "At most one of diff, staged, or commits may be provided (omit all three for the unstaged working-tree diff)",
                     false,
                 );
             }
@@ -537,18 +537,19 @@ pub(crate) struct EditContextOutput {
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct DiffImpactParams {
     /// A raw unified diff (`git diff` output) to analyze directly, instead
-    /// of having this tool run git itself. Exactly one of `diff`, `staged`,
-    /// `commits` must be set.
+    /// of having this tool run git itself. At most one of `diff`, `staged`,
+    /// `commits` may be set — omitting all three analyzes the unstaged
+    /// working-tree diff (plain `git diff`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff: Option<String>,
     /// `true` to analyze the staged diff (`git diff --cached`); `false` or
-    /// omitted analyzes the unstaged working-tree diff. Exactly one of
-    /// `diff`, `staged`, `commits` must be set.
+    /// omitted analyzes the unstaged working-tree diff. At most one of
+    /// `diff`, `staged`, `commits` may be set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) staged: Option<bool>,
     /// A commit range/rev understood by `git diff`, e.g. `HEAD~3..HEAD` or
-    /// a single commit SHA. Exactly one of `diff`, `staged`, `commits`
-    /// must be set.
+    /// a single commit SHA. At most one of `diff`, `staged`, `commits`
+    /// may be set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) commits: Option<String>,
 }

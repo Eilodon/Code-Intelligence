@@ -76,10 +76,12 @@ pub fn get_git_diff(
     } else if let Some(range) = commits {
         vec!["diff".into(), "-M".into(), range.into()]
     } else {
-        return (
-            None,
-            Some("Provide exactly one of staged=true or commits=<range>.".into()),
-        );
+        // Neither staged nor a commit range: the unstaged working-tree diff
+        // (plain `git diff`, no `--cached`) — this is the documented default
+        // for `staged=false`/omitted, but was previously unimplemented here
+        // (this branch returned a hard error instead), contradicting the
+        // tool's own schema description.
+        vec!["diff".into(), "-M".into()]
     };
 
     match run_with_timeout("git", cmd_args, project_root, timeout_secs) {

@@ -1575,6 +1575,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: `diff_impact` with all three of `diff`/`staged`/`commits`
+    /// omitted must analyze the unstaged working-tree diff (plain `git
+    /// diff`), per the tool's own schema description — `get_git_diff`'s
+    /// "neither staged nor commits" branch used to return a hard error
+    /// instead of ever running plain `git diff`, so this exact case (the
+    /// most natural call shape — "just check my current uncommitted
+    /// changes") always failed.
+    #[test]
+    fn diff_impact_with_no_params_analyzes_unstaged_working_tree_diff() {
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_unstaged_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        run_git(&dir, &["config", "user.email", "test@example.com"]);
+        run_git(&dir, &["config", "user.name", "Test"]);
+
+        std::fs::write(dir.join("foo.rs"), "fn foo() {}\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+
+        // Uncommitted, unstaged change — not `git add`ed.
+        std::fs::write(dir.join("foo.rs"), "fn foo() {\n    1\n}\n").unwrap();
+
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        let output = server.diff_impact(DiffImpactParams {
+            diff: None,
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v.get("error").is_none(), "expected success, got error: {v}");
+        assert_eq!(v["files_changed"], serde_json::json!(["foo.rs"]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn session_context_tracks_tool_calls_and_explored_state() {
         let dir = std::env::temp_dir().join(format!("ci_session_ctx_{}", std::process::id()));

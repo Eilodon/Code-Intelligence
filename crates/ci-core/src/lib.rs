@@ -10,6 +10,8 @@ pub mod indexer;
 pub mod memory;
 pub mod resolver;
 pub mod sanitize;
+#[cfg(feature = "scip-overlay")]
+pub mod scip;
 pub mod search;
 pub mod types;
 pub mod walk;

@@ -190,6 +190,39 @@ fn resolve_name_node<'a>(
     }
 }
 
+/// Walks backward through contiguous same-kind comment siblings immediately
+/// preceding `node` — no blank-line gap between any two, nor between the
+/// last one and `node` itself — and joins them in source order. Line-
+/// comment doc conventions (Rust `///`, Go `//`, Shell/C `#`) parse each
+/// line as its *own* tree-sitter node, so taking only the single immediate
+/// `prev_named_sibling()` (the old behavior) silently captured just the
+/// *last* line of a multi-line doc comment and dropped the rest. Block-
+/// comment conventions (`/** */`) are already one node spanning every line,
+/// so they pass through unaffected — the loop just finds nothing above them
+/// to merge, same net result as before.
+///
+/// Adjacency check: a `line_comment` node's `end_position().row` already
+/// lands on the *following* line (tree-sitter's rust grammar folds the
+/// terminating newline into the token), so two nodes are immediately
+/// adjacent when `earlier.end_position().row == later.start_position().row`
+/// — no `+ 1` needed (confirmed by walking the real parse tree; an earlier
+/// version of this got that off by one and matched nothing).
+fn collect_doc_comment_lines(node: tree_sitter::Node, source: &str, doc_type: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = node.prev_named_sibling();
+    let mut expected_row = node.start_position().row;
+    while let Some(n) = current {
+        if n.kind() != doc_type || n.end_position().row != expected_row {
+            break;
+        }
+        lines.push(source[n.byte_range()].trim().to_string());
+        expected_row = n.start_position().row;
+        current = n.prev_named_sibling();
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
 /// Recursive symbol walk tracking the enclosing class/impl so methods record
 /// their `class_context`.
 fn walk_symbols(
@@ -217,11 +250,8 @@ fn walk_symbols(
                 let raw_doc = source[expr.byte_range()].trim();
                 docstring = raw_doc.trim_matches(|c| c == '"' || c == '\'').to_string();
             }
-        } else if let Some(prev) = node.prev_named_sibling()
-            && let Some(doc_type) = lc.docstring_type
-            && prev.kind() == doc_type
-        {
-            docstring = source[prev.byte_range()].trim().to_string();
+        } else if let Some(doc_type) = lc.docstring_type {
+            docstring = collect_doc_comment_lines(node, source, doc_type);
         }
 
         let sig_end = source[node.start_byte()..]
@@ -1316,6 +1346,58 @@ pub fn hello(a: i32, b: i32) -> i32 {
         assert_eq!(symbols[0].name, "hello");
         assert!(symbols[0].signature.contains("fn hello"));
         assert_eq!(symbols[0].docstring.trim(), "/// This is a docstring");
+    }
+
+    /// Regression: each `///` line parses as its own tree-sitter node, so
+    /// taking only the single immediate `prev_named_sibling()` silently
+    /// captured just the *last* line of a multi-line doc comment. Reproduces
+    /// the exact shape discovered live: `understand()`'s output for a real
+    /// symbol here (`apply_personalization_boost` in common.rs) returned
+    /// only its doc comment's last line, dropping the actual explanation.
+    #[test]
+    fn test_rust_multiline_docstring_captures_all_lines() {
+        let code = r#"
+/// First line of explanation.
+/// Second line with more detail.
+///
+/// A blank `///` line inside the block must still be included.
+pub fn hello(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#;
+        let symbols = extract_symbols(code, "rust", "test.rs").unwrap();
+        assert_eq!(symbols.len(), 1);
+        let doc = &symbols[0].docstring;
+        assert!(doc.contains("First line of explanation."), "got: {doc:?}");
+        assert!(
+            doc.contains("Second line with more detail."),
+            "got: {doc:?}"
+        );
+        assert!(
+            doc.contains("A blank `///` line inside the block must still be included."),
+            "got: {doc:?}"
+        );
+    }
+
+    /// A doc comment block separated from an *unrelated* comment above it by
+    /// a blank line must not merge the two — only the contiguous block
+    /// immediately touching the function belongs to its docstring.
+    #[test]
+    fn test_rust_docstring_stops_at_blank_line_gap() {
+        let code = r#"
+// Unrelated comment far above, not part of the docstring.
+
+/// Actual doc comment.
+pub fn hello() {}
+"#;
+        let symbols = extract_symbols(code, "rust", "test.rs").unwrap();
+        assert_eq!(symbols.len(), 1);
+        let doc = &symbols[0].docstring;
+        assert!(doc.contains("Actual doc comment."), "got: {doc:?}");
+        assert!(
+            !doc.contains("Unrelated comment far above"),
+            "must not merge across a blank-line gap, got: {doc:?}"
+        );
     }
 
     fn find<'a>(symbols: &'a [ParsedSymbol], name: &str) -> &'a ParsedSymbol {

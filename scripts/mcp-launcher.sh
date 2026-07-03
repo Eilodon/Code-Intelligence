@@ -7,7 +7,19 @@
 # Resolution order (first usable binary wins, no exceptions):
 #   1. Fast path   — an already-usable binary: $CI_MCP_BIN override, a
 #                     cached verified download, or a local dev build
-#                     (target/release/ci, target/debug/ci).
+#                     (target/release/ci, target/debug/ci) — the dev build
+#                     candidates are only trusted if `is_binary_fresh` says
+#                     they're at least as new as every source file (see that
+#                     function's comment for the incident this guards
+#                     against: a stale target/debug/ci silently served an
+#                     entire MCP session because nothing checked it against
+#                     the checked-out source before exec'ing it).
+#                     $CI_MCP_BIN and the cached download are NOT freshness-
+#                     checked here — one is an explicit override (the caller
+#                     is asserting "use exactly this"), the other is an
+#                     immutable, checksum-verified artifact for an exact
+#                     tagged commit (its own consistency check is the tag
+#                     match + `--version` check in download_and_verify).
 #   2. Verified download — Linux x86_64/aarch64 only, and only when HEAD is
 #                     exactly a released git tag (never guesses a version).
 #                     Downloads the matching GitHub Release asset, verifies
@@ -44,6 +56,37 @@ try_exec() {
   fi
 }
 
+# True if `bin` is at least as new as every tracked Rust source file in the
+# workspace — a cheap mtime check so the fast path never silently execs a
+# local dev build that predates the checked-out source. Deliberately mtime-
+# based, not git-commit-based: a git-SHA comparison would miss uncommitted
+# or unstaged edits (the exact scenario that caused the incident this
+# guards against — mid-session source edits with no new commit yet), and
+# `cargo build`'s own incremental system already uses mtimes for the same
+# reason. `find -newer` needs at least one existing candidate path per
+# `-o` branch or it errors, so this only runs when `crates/` exists — true
+# for any checkout that could have produced `bin` in the first place.
+is_binary_fresh() {
+  local bin="$1"
+  [ -d crates ] || return 0
+  local newer
+  newer=$(find crates Cargo.toml Cargo.lock -type f \
+    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+    -newer "$bin" 2>/dev/null | head -1)
+  [ -z "$newer" ]
+}
+
+try_exec_if_fresh() {
+  local bin="$1"
+  if [ -x "$bin" ]; then
+    if is_binary_fresh "$bin"; then
+      exec "$bin" "${serve_args[@]}"
+    else
+      log "found $bin but it predates the current source tree — rebuilding instead of using it stale"
+    fi
+  fi
+}
+
 workspace_version=$(grep -m1 '^version = ' Cargo.toml 2>/dev/null | sed -E 's/version = "(.*)"/\1/')
 resolved_tag=$(git describe --tags --exact-match 2>/dev/null || true)
 cache_key="${resolved_tag:-$workspace_version}"
@@ -51,8 +94,8 @@ cache_key="${resolved_tag:-$workspace_version}"
 # ---- Tier 1: fast path — already-usable binary ----
 [ -n "${CI_MCP_BIN:-}" ] && try_exec "$CI_MCP_BIN"
 [ -n "$cache_key" ] && try_exec "${CACHE_ROOT}/${cache_key}/ci"
-try_exec "target/release/ci"
-try_exec "target/debug/ci"
+try_exec_if_fresh "target/release/ci"
+try_exec_if_fresh "target/debug/ci"
 
 # ---- Tier 2: verified download (Linux only, tagged commit only unless opted in) ----
 download_and_verify() {

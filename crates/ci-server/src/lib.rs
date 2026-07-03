@@ -202,6 +202,25 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
     use ci_core::db::schema::init_db;
     use rusqlite::Connection;
 
+    println!("Build: {}", ci_core::BUILD_INFO);
+    match current_git_head_short(project_root) {
+        Some(head) if ci_core::BUILD_INFO.starts_with(&head) => {
+            println!("  matches current HEAD ({head}) — up to date");
+        }
+        Some(head) => {
+            println!(
+                "  \u{26a0} STALE — this binary was built from a different commit than \
+                 current HEAD ({head}). A running `ci serve` process keeps using whatever \
+                 was loaded at its own start, even after a fresh `cargo build` replaces \
+                 the file on disk — restart the server process to pick it up. \
+                 (`cargo build -p ci-cli` then restart, or reconnect your MCP client.)"
+            );
+        }
+        None => {
+            println!("  (not a git checkout, or git unavailable — can't check freshness)");
+        }
+    }
+
     let db_path = default_db_path(project_root);
 
     println!("Project root: {}", project_root.display());
@@ -255,4 +274,23 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
 
     println!("\nAll checks passed.");
     Ok(())
+}
+
+/// Short (12-char) git HEAD SHA for `project_root`, matching the format
+/// `ci_core::BUILD_INFO` uses (`git rev-parse --short=12 HEAD` at build
+/// time) so the two can be compared as plain strings. `None` when this
+/// isn't a git checkout or git isn't available — not an error, just means
+/// freshness can't be checked.
+fn current_git_head_short(project_root: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }

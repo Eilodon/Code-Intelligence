@@ -74,6 +74,18 @@ fn binary_runs(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `<bin> --version` output, trimmed, or `""` if it can't be run. Used as part
+/// of the overlay cache key — any version change invalidates the cache.
+pub fn binary_version(bin: &Path) -> String {
+    Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 /// `rustup which rust-analyzer` — resolves the toolchain-managed binary when
 /// it's not directly on `PATH`. Absent/failing `rustup` is not an error here;
 /// `binary_runs` is the real gate.

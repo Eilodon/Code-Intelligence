@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+crates/ci-core/tests/fixtures/rust_workspace/target/
 
 # Index database (per-project, generated)
 .codeindex/

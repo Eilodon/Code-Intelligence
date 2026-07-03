@@ -107,6 +107,18 @@ pub async fn serve_stdio_with_preset(
             if semantic.enabled {
                 bootstrap_embeddings(&conn, &semantic, &embedder, &embed_status);
             }
+
+            #[cfg(feature = "scip-overlay")]
+            if index_ok {
+                let rust_cfg = ci_core::config::load_config(&indexer_root)
+                    .map(|c| c.rust)
+                    .unwrap_or_default();
+                match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg) {
+                    Ok(n) if n > 0 => tracing::info!("SCIP overlay: {n} edges upgraded"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
+                }
+            }
         }
         // Watch for edits and incrementally reindex (and re-embed) until shutdown.
         watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct, watch_embedder);

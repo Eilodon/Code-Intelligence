@@ -25,6 +25,7 @@ tree-sitter-go = { workspace = true }
 stack-graphs = { workspace = true }
 tree-sitter-stack-graphs = { workspace = true }
 tree-sitter-stack-graphs-python = { workspace = true }
+tree-sitter-stack-graphs-typescript = { workspace = true }
 model2vec-rs = { version = "0.2.1", optional = true }
 tree-sitter-c       = { workspace = true, optional = true }
 tree-sitter-cpp     = { workspace = true, optional = true }

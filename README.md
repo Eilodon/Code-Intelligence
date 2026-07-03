@@ -87,7 +87,8 @@ agent: "tôi cần sửa hàm getUserByEmail"
   xuất symbol bằng line-scan regex; không có call-graph hay import resolution — built-in, không cần
   feature flag.
 - **Call graph có độ tin cậy** — mỗi edge được gắn nhãn `resolved` / `inferred` / `formal` /
-  `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python.
+  `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python
+  và TypeScript/TSX.
 - **Import graph** — file-level dependency graph cho tool `dependencies`.
 - **Graph metrics** — `coreness` (k-core) và `is_hub` để nhận diện symbol trung tâm trước khi sửa.
   `repo_overview.core_symbols` dùng lại chính `coreness` này để vẽ "khung xương kiến trúc" ngay từ

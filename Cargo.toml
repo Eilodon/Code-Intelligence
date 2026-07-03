@@ -37,6 +37,9 @@ tree-sitter-bash = "0.25"
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"
 tree-sitter-stack-graphs-python = "0.3"
+# =0.23.2 pin (tree-sitter-typescript) comes from this crate's own Cargo.toml —
+# already the exact version tree-sitter-typescript resolves to workspace-wide.
+tree-sitter-stack-graphs-typescript = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

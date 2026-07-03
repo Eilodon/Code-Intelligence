@@ -136,6 +136,13 @@ thử lại cho ngôn ngữ khác.
 - Việc hoàn thành Stack Graphs formal cho TS/JS/Java (đã note "Future" từ ADR-0002, chưa làm) nên
   đi **trước hoặc song song**, không phụ thuộc ADR này — rẻ hơn LSP nhiều bậc, tận dụng đúng
   investment đã có, đóng phần lớn gap accuracy cho 3/6 Tier-0 mà không đổi risk profile.
+  **Cập nhật 2026-07-03**: TypeScript đã xong (xem ADR-0002 Update) — rẻ và ít rủi ro đúng như dự
+  đoán, builtins upstream dùng thẳng được, không cần workaround. JavaScript và Java hoá ra khó hơn
+  Python/TypeScript đáng kể — builtins rỗng như Python nhưng cơ chế wiring khác hẳn (JS: builtins
+  gắn trực tiếp vào node `@prog` per-file, không qua file `<builtins>` fallback; Java: `stack-graphs.tsg`
+  không có bất kỳ khái niệm builtins nào cả) — cả hai cần đọc kỹ `.tsg` rules từ đầu trước khi viết
+  fix, không phải port nguyên `PYTHON_BUILTINS_STUB`. Vẫn rẻ hơn LSP, nhưng không rẻ đều như ADR này
+  từng giả định — cần đánh giá lại effort riêng cho JS/Java trước khi cam kết thời điểm.
 - Thêm một trục vận hành mới (subprocess LSP theo ngôn ngữ) cần giám sát riêng: leak process nếu
   server crash giữa chừng, version drift giữa gopls trên máy user và version đã test.
 - `stack-graphs` upstream đã archived (ADR-0002 Consequences) — rủi ro dài hạn cho formal tier

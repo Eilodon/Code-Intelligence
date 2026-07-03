@@ -31,6 +31,34 @@ for formal name resolution in Tier-0 languages.
 | `inferred` | Type-based inference (future) | 1 |
 | `textual` | Name-only match | 0 |
 
+## Update (2026-07-03)
+
+TypeScript implemented (`FormalResolver::load_typescript`, `crates/ci-core/src/resolver/formal.rs`):
+`tree-sitter-stack-graphs-typescript` 0.4.0, exact version match with the workspace's already-pinned
+`tree-sitter-typescript = 0.23.2` — zero dependency conflict. Covers both `.ts` and `.tsx` (separate
+`StackGraphLanguage`/builtins pair internally, dispatched by file extension — TSX is a distinct
+upstream grammar, not a superset). Unlike Python, upstream's `builtins.ts` is non-empty (~10KB) and
+resolves real ECMAScript globals (`Array`, `.isArray`, etc. — verified by test, not assumed) — no
+DEBT-005-style synthetic stub needed.
+
+JavaScript and Java remain **not implemented**, and are riskier than TypeScript was:
+- **JavaScript**: `builtins.js` ships empty upstream (same as Python originally), but the fix isn't a
+  drop-in DEBT-005-style stub — `stack-graphs.tsg` wires primitive-prototype builtins
+  (`builtins_number`, `builtins_string`, `builtins_Regex_prototype`, ...) as nodes generated per-file
+  on `@prog`'s own scope, not through the `<builtins>` file/`push_symbol` fallback edge Python and
+  TypeScript both use. Global *functions* (`parseInt`, `setTimeout`, ...) appear to have no fallback
+  path at all in the rules as written. Needs a from-scratch read of `stack-graphs.tsg` before any
+  stub is written, not a port of `PYTHON_BUILTINS_STUB`.
+- **Java**: `builtins.java` also ships empty, and `stack-graphs.tsg` has **zero** references to
+  "builtins" of any form — unclear whether/how `java.lang` auto-import (`String`, `Object`, `System`,
+  ...) is intended to resolve at all through this mechanism. Needs the deepest investigation of the
+  three before committing to an implementation approach.
+
+Dependency versions are otherwise ready whenever the above is resolved: `tree-sitter-stack-graphs-javascript`
+0.3.0 (needs `tree-sitter-javascript` pinned to exactly `0.23.1` — already the workspace's resolved
+version) and `tree-sitter-stack-graphs-java` 0.5.0 (needs `tree-sitter-java` pinned to exactly
+`0.23.4` — one patch below the workspace's current `0.23.5`, a safe Cargo-resolvable downgrade).
+
 ## Consequences
 
 - `stack-graphs` repo is archived by GitHub (Sept 2025) — crates work but receive

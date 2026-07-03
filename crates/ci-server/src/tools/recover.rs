@@ -82,6 +82,9 @@ impl CodeIntelligenceServer {
                     log.session_started_at.clone(),
                 )
             };
+            let mut files_pending_diff_impact = self.written_files_snapshot();
+            files_pending_diff_impact.sort();
+            let pending_diff_impact = !files_pending_diff_impact.is_empty();
 
             let edges_ready = self.edges_ready();
             let (frontier, frontier_degraded) = if !edges_ready
@@ -97,7 +100,15 @@ impl CodeIntelligenceServer {
                 (frontier, false)
             };
 
-            let sn = if !frontier.is_empty() {
+            let sn = if pending_diff_impact {
+                // Outranks frontier exploration — an unverified write is the
+                // more urgent gap regardless of client/host (this signal
+                // doesn't depend on the Claude-Code-only PreToolUse hook).
+                self.filter_sn(suggested(
+                    "diff_impact",
+                    "Files written since the last diff_impact — verify blast radius before continuing",
+                ))
+            } else if !frontier.is_empty() {
                 self.filter_sn(suggested_with_args(
                     "file_overview",
                     "Explore top frontier file",
@@ -128,6 +139,8 @@ impl CodeIntelligenceServer {
                 explored_files,
                 frontier,
                 frontier_degraded,
+                pending_diff_impact,
+                files_pending_diff_impact,
                 suggested_next: sn,
             })
             .unwrap_or_default()
@@ -224,6 +237,12 @@ pub(crate) struct SessionContextOutput {
     pub(crate) truncated: bool,
     pub(crate) frontier: Vec<FrontierEntry>,
     pub(crate) frontier_degraded: bool,
+    /// True when `edit_lines`/`edit_symbol` wrote a file since the last
+    /// `diff_impact` call — a host-agnostic version of the Claude-Code-only
+    /// PreToolUse hook's commit/push gate, visible to any MCP client.
+    pub(crate) pending_diff_impact: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) files_pending_diff_impact: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

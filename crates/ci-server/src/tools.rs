@@ -88,6 +88,13 @@ struct SessionLog {
     tool_calls: u64,
     explored_symbols: std::collections::HashMap<String, u64>,
     explored_files: std::collections::HashMap<String, u64>,
+    /// Paths written via `edit_lines`/`edit_symbol` since the last
+    /// `diff_impact` call — host-agnostic equivalent of the Claude-Code-only
+    /// `.claude/hooks/ci-nudge.sh` gate's `needs_diff_impact` flag, surfaced
+    /// through `session_context` (see `SessionContextOutput::pending_diff_impact`)
+    /// so any MCP client gets the same "you edited, verify blast radius"
+    /// signal without relying on a host-specific hook.
+    written_files: std::collections::HashSet<String>,
     session_started_at: String,
 }
 
@@ -97,6 +104,7 @@ impl Default for SessionLog {
             tool_calls: 0,
             explored_symbols: std::collections::HashMap::new(),
             explored_files: std::collections::HashMap::new(),
+            written_files: std::collections::HashSet::new(),
             session_started_at: utc_now_iso8601(),
         }
     }
@@ -147,7 +155,8 @@ impl CodeIntelligenceServer {
         hotspots,
         understand,
         remember,
-        recall
+        recall,
+        fitness_report
     });
 }
 
@@ -2386,6 +2395,7 @@ mod tests {
             "repo_overview",
             "locate",
             "hotspots",
+            "fitness_report",
             "source",
             "understand",
             "edit_context",
@@ -2405,9 +2415,36 @@ mod tests {
         }
         assert_eq!(
             tools.len(),
-            11,
-            "compound preset must have exactly 11 tools, got: {tools:?}"
+            12,
+            "compound preset must have exactly 12 tools, got: {tools:?}"
         );
+    }
+
+    /// Exposes `ci fitness-check`'s metrics as an MCP tool — an agent can
+    /// pulse-check repo health mid-session instead of only via a separate CI
+    /// gate. A fresh empty DB has no symbols at all, so every ratio-based
+    /// metric is 0 and the check trivially passes; this just verifies the
+    /// tool wires end-to-end and returns the expected shape.
+    #[test]
+    fn fitness_report_returns_metrics_and_checks_on_empty_db() {
+        let (dir, server) = test_server("fitness_report_empty");
+        let output = server.fitness_report();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["passed"], true, "{v}");
+        assert!(v["checks"].as_array().unwrap().len() >= 7, "{v}");
+        assert!(v["metrics"].get("hub_pct").is_some(), "{v}");
+        assert!(v["metrics"].get("dead_code_pct").is_some(), "{v}");
+        assert!(
+            v.get("boundary_violations").is_none(),
+            "empty by default, should be omitted: {v}"
+        );
+        assert!(
+            v.get("suggested_next").is_none(),
+            "passed=true means no suggested_next: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3129,6 +3166,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Host-agnostic equivalent of `.claude/hooks/ci-nudge.sh`'s
+    /// `needs_diff_impact` gate: a write via `edit_lines` must surface as
+    /// `pending_diff_impact`/`files_pending_diff_impact` in `session_context`
+    /// (visible to any MCP client, not just Claude Code's hook), and must
+    /// clear once `diff_impact` runs — even a `diff_impact` call unrelated
+    /// to the written path, matching the hook's own "any diff_impact call
+    /// resets it" semantics documented on `clear_written_files`.
+    #[test]
+    fn session_context_reports_and_clears_pending_diff_impact() {
+        let (dir, server) = test_server("session_ctx_pending_diff");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = ci_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        let before: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        assert_eq!(before["pending_diff_impact"], false);
+        assert!(before.get("files_pending_diff_impact").is_none());
+
+        server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+        });
+
+        let after_edit: serde_json::Value =
+            serde_json::from_str(&server.session_context()).unwrap();
+        assert_eq!(after_edit["pending_diff_impact"], true, "{after_edit}");
+        assert_eq!(
+            after_edit["files_pending_diff_impact"],
+            serde_json::json!(["a.py"])
+        );
+        assert_eq!(after_edit["suggested_next"]["tool"], "diff_impact");
+
+        // Any diff_impact call — even against unrelated raw diff text —
+        // clears the pending set.
+        server.diff_impact(DiffImpactParams {
+            diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
+            staged: None,
+            commits: None,
+        });
+
+        let after_verify: serde_json::Value =
+            serde_json::from_str(&server.session_context()).unwrap();
+        assert_eq!(after_verify["pending_diff_impact"], false, "{after_verify}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

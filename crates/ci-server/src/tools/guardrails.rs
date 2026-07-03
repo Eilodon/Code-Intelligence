@@ -157,6 +157,8 @@ impl CodeIntelligenceServer {
     )]
     pub(crate) fn diff_impact(&self, #[tool(aggr)] p: DiffImpactParams) -> String {
         self.timed_tool("diff_impact", || {
+            self.clear_written_files();
+
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count != 1 {

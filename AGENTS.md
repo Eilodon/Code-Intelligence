@@ -1,6 +1,6 @@
 # Code Intelligence MCP — Navigational Workflow v2.8
 
-> 20 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 21 tools. 8 stages. Every response carries `suggested_next` — follow it.
 
 ---
 
@@ -20,11 +20,12 @@
 
 **Goal**: Map the terrain before touching anything.
 
-**Tools**: `repo_overview` (always first), `hotspots` (find high-risk files)
+**Tools**: `repo_overview` (always first), `hotspots` (find high-risk files), `fitness_report` (repo-wide health snapshot — optional, not every session needs it)
 
 ```
 repo_overview()          # ALWAYS call first at session start — never skip
 hotspots(top_n=10)       # find files that break most often
+fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs thresholds — same checks as `ci fitness-check` in CI, queryable mid-session
 ```
 
 **Done when**: You know the languages, entry points, module structure, and highest-churn files. `suggested_next` points to `locate`.
@@ -33,6 +34,7 @@ hotspots(top_n=10)       # find files that break most often
 - `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor
 - `health_summary.hub_count > 0` → hub symbols exist in this repo; check `is_hub` before editing any symbol
 - `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
+- `fitness_report().passed == false` → repo-wide metric regressed past its threshold; `suggested_next` points to `hotspots` to localize it
 
 ---
 
@@ -177,7 +179,7 @@ diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 - `unindexed_files[].reason == "out_of_scope"` → not a source file (docs/config/etc.); permanent, harmless, does not affect `aggregate_risk`
 - `suggested_reviewers` present → notify these owners before merging
 
-**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call.
+**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call. Host-agnostic backup for any MCP client (not just Claude Code): `session_context`'s `pending_diff_impact`/`files_pending_diff_impact` report the same thing — files written via `edit_lines`/`edit_symbol` since the last `diff_impact` call — and its `suggested_next` points straight at `diff_impact` while any are pending.
 
 ---
 
@@ -201,6 +203,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 - `session_started_at` changed from your saved T₀ → server restarted; begin again at Stage 1
 - Starting work on an area you (or a prior session) may have left notes about → `recall(topic=...)` or `recall(query=...)` before assuming from scratch
 - You just learned a non-obvious WHY that the graph/AST can't capture (not derivable by re-running `edit_context`/`callers`) → `remember(topic, content)` before it's lost at session end
+- Not sure whether you already ran `diff_impact` after your latest edit → `session_context().pending_diff_impact` answers it directly, no need to remember for yourself
 
 **Signals**:
 - `frontier non-empty` → explore `frontier[0].path` with `file_overview`
@@ -214,7 +217,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 
 | Stage | Primary Tools | Replaces Native |
 |-------|--------------|-----------------|
-| 1 Orient | `repo_overview`, `hotspots` | Directory scanning, README reading |
+| 1 Orient | `repo_overview`, `hotspots`, `fitness_report` | Directory scanning, README reading |
 | 2 Locate | `locate`, `search`, `file_overview` | `grep`, file search |
 | 3 Inspect | `source`, `symbol_info`, `understand` | `cat` / full file read |
 | 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
@@ -242,10 +245,10 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 
 | Preset | Registered Tools | Use when |
 |--------|-----------------|----------|
-| `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `indexing_status` | Exploration only, no edits |
+| `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `fitness_report`, `indexing_status` | Exploration only, no edits |
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
 | `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status` | Code modification workflow |
-| `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 20 tools | Default; use when workflow spans multiple stages |
+| `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
+| `full` | All 21 tools | Default; use when workflow spans multiple stages |
 
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.

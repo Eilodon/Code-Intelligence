@@ -5,7 +5,7 @@ viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *h
 grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
 cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
 cấp full-text + semantic search + khả năng sửa file trực tiếp (hash-verified, risk-gated) — tất cả
-phục vụ qua 20 MCP tools, chạy local, không gọi ra ngoài.
+phục vụ qua 21 MCP tools, chạy local, không gọi ra ngoài.
 
 ## Vì sao cần cái này?
 
@@ -130,7 +130,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 20 tools + incremental file watcher.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 21 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
@@ -148,7 +148,7 @@ ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
-## 20 MCP Tools cho AI agents
+## 21 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
 (mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
@@ -157,11 +157,11 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 
 | Nhóm | Tools |
 |---|---|
-| Orient | `repo_overview`, `hotspots`, `indexing_status` |
+| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — cùng metrics với `ci fitness-check`, hỏi được giữa phiên), `indexing_status` |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
+| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh`; `session_context`'s `pending_diff_impact` là tín hiệu tương đương, hoạt động ở mọi MCP client chứ không riêng Claude Code |
 | Recover | `session_context`, `remember`, `recall` |
 
 ### MCP Prompts — workflow đóng gói thành slash-command

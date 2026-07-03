@@ -436,16 +436,37 @@ fn rebuild_graph(
     // CPU work independent per site, so it runs in parallel; the dedup merge
     // below stays sequential, walking sites in their original order so the
     // "first call site wins" line/confidence attribution is unchanged.
+    //
+    // Same-file preference: an unqualified call whose bare name ALSO has a
+    // matching definition in the caller's own file resolves to that
+    // definition, not to unrelated same-named symbols elsewhere — this is
+    // Rust's own scoping, not a heuristic. Without it, every same-named
+    // candidate anywhere in the repo gets an edge (private per-file helpers —
+    // test fixtures, local `fn new`/`run`/`setup_db` — fan out to every other
+    // file sharing that name), inflating blast_radius/caller_count for the
+    // most common private-helper pattern. This mirrors the fix already
+    // applied to the `receiver_is_type_path` branch above (which skips tier-1
+    // entirely to dodge the same fan-out for `Type::method()` calls) — that
+    // fix never covered this general by-name/by-name-class path, so the bug
+    // survived here. Only fan out globally when nothing in-file matches, and
+    // even then only up to MAX_CALLEE_CANDIDATES.
     let candidates: Vec<Vec<(String, String)>> = sites
         .par_iter()
-        .map(|(_, _, callee, _, _, target_class)| {
+        .map(|(from_path, _, callee, _, _, target_class)| {
             let targets = match target_class {
                 Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
                 None => by_name.get(callee),
             };
-            match targets {
-                Some(t) if t.len() <= MAX_CALLEE_CANDIDATES => t.clone(),
-                _ => Vec::new(),
+            let Some(t) = targets else {
+                return Vec::new();
+            };
+            let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
+            if !same_file.is_empty() {
+                same_file
+            } else if t.len() <= MAX_CALLEE_CANDIDATES {
+                t.clone()
+            } else {
+                Vec::new()
             }
         })
         .collect();
@@ -1350,6 +1371,129 @@ impl StructB {
             ),
             1,
             "caller must have exactly one outgoing edge total"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the free-function (non-method) analog of the fan-out
+    /// bug above: private same-named helpers in different files (the common
+    /// `fn test_conn()` / `fn setup_db()` test-fixture pattern) must not fan
+    /// out to each other just because they share a bare name — `by_name` in
+    /// `rebuild_graph` has no per-file scoping, so before the same-file
+    /// preference was added, every call to `helper()` got an edge to BOTH
+    /// files' `helper()`, not just its own. The `Type::method()` fix above
+    /// (`test_type_path_call_resolves_scoped_not_fanned_out`) never covered
+    /// this plain by-name path, so the identical bug survived here.
+    #[test]
+    fn test_bare_call_prefers_same_file_over_global_fan_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_barefanout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn helper() -> i32 {\n    1\n}\nfn caller_a() {\n    let _ = helper();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "fn helper() -> i32 {\n    2\n}\nfn caller_b() {\n    let _ = helper();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'a.rs')",
+            ),
+            1,
+            "caller_a's helper() must resolve to a.rs's own helper()"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'b.rs')",
+            ),
+            0,
+            "caller_a's helper() must NOT also fan out to b.rs's unrelated helper()"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_b') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'b.rs')",
+            ),
+            1,
+            "caller_b's helper() must resolve to b.rs's own helper()"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_b') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'a.rs')",
+            ),
+            0,
+            "caller_b's helper() must NOT also fan out to a.rs's unrelated helper()"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same fan-out bug, `by_name_class` variant: two unrelated types in
+    /// different files that happen to share both a type name AND a method
+    /// name (e.g. two local `struct Handler` in different modules, each with
+    /// their own `fn helper`) key into the exact same `by_name_class` slot —
+    /// `self.helper()` inside a.rs's `Handler::run` must resolve to a.rs's
+    /// own `Handler::helper`, not fan out to b.rs's unrelated one too.
+    #[test]
+    fn test_self_method_call_prefers_same_file_over_global_fan_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_selffanout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "struct Handler;\nimpl Handler {\n    fn helper(&self) -> i32 {\n        1\n    }\n    fn run(&self) -> i32 {\n        self.helper()\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "struct Handler;\nimpl Handler {\n    fn helper(&self) -> i32 {\n        2\n    }\n    fn run(&self) -> i32 {\n        self.helper()\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run' AND path = 'a.rs') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'a.rs')",
+            ),
+            1,
+            "a.rs's Handler::run must resolve self.helper() to a.rs's own Handler::helper"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run' AND path = 'a.rs') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'b.rs')",
+            ),
+            0,
+            "a.rs's Handler::run must NOT also fan out to b.rs's unrelated Handler::helper"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

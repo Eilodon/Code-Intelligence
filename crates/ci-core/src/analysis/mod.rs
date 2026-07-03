@@ -1,8 +1,10 @@
 pub mod boundaries;
 pub mod cochange;
 pub mod codeowners;
+pub mod config_drift;
 pub mod coverage;
 pub mod dead_code;
 pub mod diff_impact;
+pub mod doc_refs;
 pub mod git_log;
 pub mod hotspot;

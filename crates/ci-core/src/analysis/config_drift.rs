@@ -110,7 +110,11 @@ pub fn check_config_drift(
             }
         }
     }
-    findings.sort_by(|a, b| a.doc_path.cmp(&b.doc_path).then(a.reference.cmp(&b.reference)));
+    findings.sort_by(|a, b| {
+        a.doc_path
+            .cmp(&b.doc_path)
+            .then(a.reference.cmp(&b.reference))
+    });
     findings
 }
 
@@ -127,7 +131,10 @@ mod tests {
     }
 
     fn temp_project(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ci_config_drift_test_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ci_config_drift_test_{name}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -170,7 +177,11 @@ mod tests {
     fn does_not_flag_reference_to_real_file_short_suffix_form() {
         let dir = temp_project("real_suffix");
         write(&dir, "crates/ci-core/src/fitness.rs", "// stub\n");
-        write(&dir, "AGENTS.md", "See `fitness.rs` for the fitness gate.\n");
+        write(
+            &dir,
+            "AGENTS.md",
+            "See `fitness.rs` for the fitness gate.\n",
+        );
         let findings = check_config_drift(&dir, &["AGENTS.md".into()], &[]);
         assert!(findings.is_empty(), "got {findings:?}");
     }

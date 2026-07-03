@@ -19,7 +19,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Read|Edit|Write|Grep|Bash|mcp__ci__edit_context|mcp__ci__diff_impact",
+        "matcher": "Read|Edit|Write|Grep|Bash|mcp__ci__edit_context|mcp__ci__diff_impact|mcp__ci__edit_lines|mcp__ci__edit_symbol",
         "hooks": [
           {
             "type": "command",

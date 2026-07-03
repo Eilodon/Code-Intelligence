@@ -203,6 +203,7 @@ impl CodeIntelligenceServer {
         drop(_guard);
 
         self.track_file(path);
+        self.mark_written(path);
 
         let touched_symbols = {
             let conn = match self.make_read_conn() {

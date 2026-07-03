@@ -157,6 +157,8 @@ impl CodeIntelligenceServer {
     )]
     pub(crate) fn diff_impact(&self, #[tool(aggr)] p: DiffImpactParams) -> String {
         self.timed_tool("diff_impact", || {
+            self.clear_written_files();
+
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count != 1 {
@@ -218,12 +220,17 @@ impl CodeIntelligenceServer {
                         )
                         .unwrap_or(0);
                     if scanned == 0 {
-                        let ext = std::path::Path::new(&fd.path)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        let reason = if ci_core::indexer::lang_constants::language_for_extension(ext)
-                            .is_some()
+                        let path = std::path::Path::new(&fd.path);
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        // A recognized extension only means "pending_scan" if the
+                        // indexer would ever actually reach it — a .rs file under
+                        // a dotdir or IGNORE_DIRS (e.g. .claude/, target/) never
+                        // gets scanned no matter how long you wait, so it must be
+                        // "out_of_scope" too, not just files of an unrecognized
+                        // extension. See `ci_core::walk::path_has_ignored_dir_component`.
+                        let reason = if !ci_core::walk::path_has_ignored_dir_component(path)
+                            && ci_core::indexer::lang_constants::language_for_extension(ext)
+                                .is_some()
                         {
                             "pending_scan"
                         } else {
@@ -576,10 +583,14 @@ pub(crate) struct AffectedSymbolOutput {
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct UnindexedFileOutput {
     pub(crate) path: String,
-    /// "pending_scan" — a recognized source file the indexer hasn't scanned
-    /// yet; resolves itself once indexing catches up (check `indexing_status`).
-    /// "out_of_scope" — not a source file the indexer parses at all (docs,
-    /// config, etc.); will stay unindexed no matter how long you wait.
+    /// "pending_scan" — a recognized source file, in a path the indexer
+    /// actually walks, that just hasn't been scanned yet; resolves itself
+    /// once indexing catches up (check `indexing_status`).
+    /// "out_of_scope" — will stay unindexed no matter how long you wait:
+    /// either not a source extension the indexer parses at all (docs,
+    /// config, etc.), or it sits under a dotdir/`IGNORE_DIRS` path (e.g.
+    /// `.claude/`, `target/`) the walker categorically never descends into,
+    /// regardless of extension.
     pub(crate) reason: String,
 }
 

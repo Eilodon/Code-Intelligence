@@ -77,6 +77,9 @@ impl CodeIntelligenceServer {
     pub(crate) fn track_symbol(&self, qualified_name: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             let now = log.tool_calls;
+            if !log.explored_symbols.contains_key(qualified_name) {
+                log.last_progress_at = now;
+            }
             log.explored_symbols.insert(qualified_name.to_string(), now);
         }
     }
@@ -84,7 +87,40 @@ impl CodeIntelligenceServer {
     pub(crate) fn track_file(&self, path: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             let now = log.tool_calls;
+            if !log.explored_files.contains_key(path) {
+                log.last_progress_at = now;
+            }
             log.explored_files.insert(path.to_string(), now);
+        }
+    }
+
+    /// Records that `path` was written via `edit_lines`/`edit_symbol` — see
+    /// `SessionLog::written_files`. Call once per successful write.
+    pub(crate) fn mark_written(&self, path: &str) {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.written_files.insert(path.to_string());
+        }
+    }
+
+    /// Read-only snapshot of paths written since the last `diff_impact` call
+    /// — for `session_context` to report without clearing anything (only
+    /// `diff_impact` itself, via `clear_written_files`, does that).
+    pub(crate) fn written_files_snapshot(&self) -> Vec<String> {
+        self.session_log
+            .lock()
+            .map(|log| log.written_files.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Clears the written-files set — `diff_impact` calls this
+    /// unconditionally on every call (even for a caller-supplied raw
+    /// `diff`/`commits` range unrelated to these specific paths), since
+    /// attempting a blast-radius check at all is the signal that matters
+    /// here, matching the Claude-Code hook's own "reset every time
+    /// diff_impact runs" semantics for its (host-specific) equivalent gate.
+    pub(crate) fn clear_written_files(&self) {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.written_files.clear();
         }
     }
 
@@ -127,8 +163,7 @@ impl CodeIntelligenceServer {
             return false;
         }
 
-        let boosts =
-            compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
+        let boosts = compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
         if boosts.is_empty() {
             return false;
         }
@@ -265,6 +300,7 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "locate",
             "dependencies",
             "hotspots",
+            "fitness_report",
             "indexing_status",
         ]),
         "trace" => Some(&[
@@ -297,6 +333,7 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "repo_overview",
             "locate",
             "hotspots",
+            "fitness_report",
             "source",
             "understand",
             "edit_context",

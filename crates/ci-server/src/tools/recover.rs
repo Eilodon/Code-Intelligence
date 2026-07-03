@@ -73,15 +73,28 @@ impl CodeIntelligenceServer {
     pub(crate) fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
             // Release the lock before DB queries — avoid deadlock if db() is also contended.
-            let (tool_calls, explored_symbols, explored_files, session_started_at) = {
+            let (tool_calls, explored_symbols, explored_files, last_progress_at, session_started_at) = {
                 let log = self.session_log.lock().unwrap();
                 (
                     log.tool_calls,
                     log.explored_symbols.keys().cloned().collect::<Vec<_>>(),
                     log.explored_files.keys().cloned().collect::<Vec<_>>(),
+                    log.last_progress_at,
                     log.session_started_at.clone(),
                 )
             };
+            let mut files_pending_diff_impact = self.written_files_snapshot();
+            files_pending_diff_impact.sort();
+            let pending_diff_impact = !files_pending_diff_impact.is_empty();
+
+            // Purely informational — AGENTS.md already documents "10+ calls
+            // without convergence" as the cue to check session_context; this
+            // just makes that heuristic checkable instead of guessed. Never
+            // overrides suggested_next (pending_diff_impact/frontier still
+            // take priority below) — loop-breaking stays the host's call.
+            const STUCK_THRESHOLD: u64 = 10;
+            let calls_since_progress = tool_calls.saturating_sub(last_progress_at);
+            let possibly_stuck = calls_since_progress >= STUCK_THRESHOLD;
 
             let edges_ready = self.edges_ready();
             let (frontier, frontier_degraded) = if !edges_ready
@@ -97,7 +110,15 @@ impl CodeIntelligenceServer {
                 (frontier, false)
             };
 
-            let sn = if !frontier.is_empty() {
+            let sn = if pending_diff_impact {
+                // Outranks frontier exploration — an unverified write is the
+                // more urgent gap regardless of client/host (this signal
+                // doesn't depend on the Claude-Code-only PreToolUse hook).
+                self.filter_sn(suggested(
+                    "diff_impact",
+                    "Files written since the last diff_impact — verify blast radius before continuing",
+                ))
+            } else if !frontier.is_empty() {
                 self.filter_sn(suggested_with_args(
                     "file_overview",
                     "Explore top frontier file",
@@ -128,6 +149,10 @@ impl CodeIntelligenceServer {
                 explored_files,
                 frontier,
                 frontier_degraded,
+                pending_diff_impact,
+                files_pending_diff_impact,
+                calls_since_progress,
+                possibly_stuck,
                 suggested_next: sn,
             })
             .unwrap_or_default()
@@ -224,6 +249,18 @@ pub(crate) struct SessionContextOutput {
     pub(crate) truncated: bool,
     pub(crate) frontier: Vec<FrontierEntry>,
     pub(crate) frontier_degraded: bool,
+    /// True when `edit_lines`/`edit_symbol` wrote a file since the last
+    /// `diff_impact` call — a host-agnostic version of the Claude-Code-only
+    /// PreToolUse hook's commit/push gate, visible to any MCP client.
+    pub(crate) pending_diff_impact: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) files_pending_diff_impact: Vec<String>,
+    /// Tool calls since `explored_files`/`explored_symbols` last gained a
+    /// genuinely new entry — informational only, never enforced.
+    pub(crate) calls_since_progress: u64,
+    /// `calls_since_progress >= 10` — matches AGENTS.md's documented "after
+    /// 10+ calls without convergence" cue for calling this tool.
+    pub(crate) possibly_stuck: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

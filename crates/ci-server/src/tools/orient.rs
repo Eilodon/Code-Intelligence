@@ -95,6 +95,62 @@ impl CodeIntelligenceServer {
                 edges_ready: self.edges_ready(),
             };
 
+            // Count only, never content — deliberately not auto-surfacing note
+            // *text* here (that would be a passive-injection memory pattern;
+            // current agent-memory practice, e.g. Letta/MemGPT, favors the
+            // agent deciding for itself when to call `recall()` over having
+            // content pushed at it). This is just enough signal to make that
+            // decision cheaply instead of guessing whether any notes exist.
+            let memory_notes_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
+                .unwrap_or(0);
+
+            // "Repo-map" style architectural skeleton (inspired by Aider's
+            // PageRank-ranked repo map) — reuses `coreness` (k-core), which
+            // `edit_context`'s hub/risk-gating already computes, instead of
+            // standing up a second centrality metric just for this. Ranked
+            // by coreness (structural embeddedness in the densest connected
+            // subgraph), tie-broken by caller_count then qualified_name for
+            // deterministic output. `coreness > 0` on purpose: a symbol at
+            // baseline 0 is either isolated or edges aren't built yet, and
+            // isn't "core" by any reasonable reading of the word — an empty
+            // list is itself the honest answer in that case, not a bug.
+            // `is_test = 0` excludes test helpers for the same reason
+            // `hotspot::compute_hotspots` does: test code calls production
+            // code structurally, which would skew "architectural
+            // importance" toward test scaffolding rather than real design.
+            // Gated on `edges_ready` (same convention as `symbol_info`'s
+            // `coreness` field) so a not-yet-built graph reports honestly
+            // empty instead of a stale/partial ranking.
+            const CORE_SYMBOLS_LIMIT: usize = 15;
+            let core_symbols: Vec<CoreSymbolItem> = if self.edges_ready() {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT qualified_name, name, kind, path, coreness, caller_count, is_hub \
+                         FROM symbols \
+                         WHERE is_test = 0 AND coreness IS NOT NULL AND coreness > 0 \
+                         ORDER BY coreness DESC, caller_count DESC, qualified_name ASC \
+                         LIMIT ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![CORE_SYMBOLS_LIMIT as i64], |r| {
+                    Ok(CoreSymbolItem {
+                        qualified_name: r.get(0)?,
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        path: r.get(3)?,
+                        coreness: r.get(4)?,
+                        caller_count: r.get(5)?,
+                        is_hub: r.get::<_, i64>(6)? != 0,
+                    })
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+            } else {
+                Vec::new()
+            };
+
             let phase = self.phase_str();
             let embed_status = self.embed_status_str();
             let sn = if phase != "ready" {
@@ -116,13 +172,15 @@ impl CodeIntelligenceServer {
                 entry_points,
                 module_map,
                 health_summary,
+                memory_notes_count,
+                core_symbols,
                 workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
-1 ORIENT   : repo_overview (ALWAYS first) → hotspots
-2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid") | file_overview(path)
+1 ORIENT   : repo_overview (ALWAYS first) → hotspots, fitness_report (optional health snapshot)
+2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid"|"grep") | file_overview(path)
 3 INSPECT  : source(symbol) | understand(query) [= locate+source+callers in 1 call]
 4 TRACE    : callers / callees / path / dependencies — map blast radius
 5 PRE-EDIT : edit_context(symbol) — MANDATORY before ANY edit, never skip
-6 EDIT     : native file tools only
+6 EDIT     : edit_symbol/edit_lines (preferred — hash-verified, risk-gated) | native file tools (new/untracked files only)
 7 VERIFY   : diff_impact(staged=true) — MANDATORY before commit/push, never skip
 8 RECOVER  : session_context() after 10+ calls | indexing_status() when index unclear
 RULES: Never use native grep/read on project files. is_hub:true → extra caution. Follow suggested_next."#.into(),
@@ -187,6 +245,166 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             .unwrap_or_default()
         })
     }
+
+    #[tool(
+        name = "fitness_report",
+        description = "Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations) against configurable thresholds — the same checks `ci fitness-check` runs in CI, queryable mid-session instead of waiting on a pipeline. USE WHEN: you want a big-picture health pulse-check. NOT FOR: per-file/per-symbol risk (use hotspots/edit_context for that)."
+    )]
+    pub(crate) fn fitness_report(&self) -> String {
+        self.timed_tool("fitness_report", || {
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+
+            // Same discovery convention as `ci fitness-check --config
+            // thresholds.toml`, applied automatically here since an MCP
+            // tool call has no equivalent of a CLI flag — falls back to
+            // FitnessThresholds::default() when the file isn't present.
+            let config_path = {
+                let p = self.project_root.join("thresholds.toml");
+                p.exists().then_some(p)
+            };
+            let thresholds =
+                ci_core::fitness::load_thresholds(config_path.as_deref()).unwrap_or_default();
+            let boundary_rules =
+                ci_core::fitness::load_boundary_rules(config_path.as_deref()).unwrap_or_default();
+            let config_drift_doc_paths =
+                ci_core::fitness::load_config_drift_doc_paths(config_path.as_deref())
+                    .unwrap_or_default();
+
+            let result = match ci_core::fitness::run_fitness_check(
+                &conn,
+                &thresholds,
+                &self.project_root,
+                &self.coverage,
+                &boundary_rules,
+                &config_drift_doc_paths,
+            ) {
+                Ok(r) => r,
+                Err(e) => return format!(r#"{{"error": "fitness check failed: {e}"}}"#),
+            };
+
+            let sn = if result.passed {
+                None
+            } else {
+                suggested(
+                    "hotspots",
+                    "Fitness check failed — investigate via highest-risk files",
+                )
+            };
+
+            serde_json::to_string_pretty(&FitnessReportOutput {
+                passed: result.passed,
+                checks: result.checks.into_iter().map(Into::into).collect(),
+                metrics: result.metrics.into(),
+                boundary_violations: result
+                    .boundary_violations
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                config_drift: result.config_drift.into_iter().map(Into::into).collect(),
+                suggested_next: self.filter_sn(sn),
+            })
+            .unwrap_or_default()
+        })
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct FitnessCheckItemOutput {
+    pub(crate) metric: String,
+    pub(crate) value: f64,
+    pub(crate) threshold: f64,
+    pub(crate) passed: bool,
+    pub(crate) message: String,
+}
+
+impl From<ci_core::fitness::FitnessCheckItem> for FitnessCheckItemOutput {
+    fn from(c: ci_core::fitness::FitnessCheckItem) -> Self {
+        Self {
+            metric: c.metric,
+            value: c.value,
+            threshold: c.threshold,
+            passed: c.passed,
+            message: c.message,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct FitnessMetricsOutput {
+    pub(crate) hub_count: i64,
+    pub(crate) hub_pct: f64,
+    pub(crate) avg_coreness: f64,
+    pub(crate) dead_code_pct: f64,
+    pub(crate) hotspot_risk: f64,
+    pub(crate) edge_coverage_pct: f64,
+    pub(crate) high_complexity_pct: f64,
+}
+
+impl From<ci_core::fitness::FitnessMetrics> for FitnessMetricsOutput {
+    fn from(m: ci_core::fitness::FitnessMetrics) -> Self {
+        Self {
+            hub_count: m.hub_count,
+            hub_pct: m.hub_pct,
+            avg_coreness: m.avg_coreness,
+            dead_code_pct: m.dead_code_pct,
+            hotspot_risk: m.hotspot_risk,
+            edge_coverage_pct: m.edge_coverage_pct,
+            high_complexity_pct: m.high_complexity_pct,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct BoundaryViolationOutput {
+    pub(crate) from_path: String,
+    pub(crate) to_path: String,
+    pub(crate) rule_from: String,
+    pub(crate) rule_to: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) reason: String,
+}
+
+impl From<ci_core::analysis::boundaries::BoundaryViolation> for BoundaryViolationOutput {
+    fn from(v: ci_core::analysis::boundaries::BoundaryViolation) -> Self {
+        Self {
+            from_path: v.from_path,
+            to_path: v.to_path,
+            rule_from: v.rule_from,
+            rule_to: v.rule_to,
+            reason: v.reason,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ConfigDriftFindingOutput {
+    pub(crate) doc_path: String,
+    pub(crate) reference: String,
+}
+
+impl From<ci_core::analysis::config_drift::ConfigDriftFinding> for ConfigDriftFindingOutput {
+    fn from(f: ci_core::analysis::config_drift::ConfigDriftFinding) -> Self {
+        Self {
+            doc_path: f.doc_path,
+            reference: f.reference,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct FitnessReportOutput {
+    pub(crate) passed: bool,
+    pub(crate) checks: Vec<FitnessCheckItemOutput>,
+    pub(crate) metrics: FitnessMetricsOutput,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) boundary_violations: Vec<BoundaryViolationOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) config_drift: Vec<ConfigDriftFindingOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -220,9 +438,27 @@ pub(crate) struct RepoOverviewOutput {
     pub(crate) entry_points: Vec<EntryPointItem>,
     pub(crate) module_map: Vec<ModuleEntry>,
     pub(crate) health_summary: HealthSummary,
+    /// Count only, no content — see `recall()` to actually read them.
+    pub(crate) memory_notes_count: i64,
+    /// Top symbols by `coreness` (k-core) — an architectural skeleton of
+    /// this repo, empty until `health_summary.edges_ready`. See the
+    /// `core_symbols` query's comment above for why it's coreness-ranked,
+    /// `is_test`-excluded, and `coreness > 0`-floored.
+    pub(crate) core_symbols: Vec<CoreSymbolItem>,
     pub(crate) workflow_guide: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct CoreSymbolItem {
+    pub(crate) qualified_name: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) path: String,
+    pub(crate) coreness: i64,
+    pub(crate) caller_count: i64,
+    pub(crate) is_hub: bool,
 }
 
 // ---------------------------------------------------------------------------

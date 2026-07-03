@@ -1327,10 +1327,8 @@ mod tests {
     #[test]
     fn test_config_drift_fail_gates_fitness_check() {
         let conn = test_conn();
-        let dir = std::env::temp_dir().join(format!(
-            "ci_fitness_config_drift_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ci_fitness_config_drift_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("CONTRACTS.md"), "> **Owner:** server.py\n").unwrap();

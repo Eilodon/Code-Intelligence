@@ -5,7 +5,24 @@ viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *h
 grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
 cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
 cấp full-text + semantic search + khả năng sửa file trực tiếp (hash-verified, risk-gated) — tất cả
-phục vụ qua 20 MCP tools, chạy local, không gọi ra ngoài.
+phục vụ qua 21 MCP tools, chạy local, không gọi ra ngoài.
+
+## Triết lý
+
+`ci` không chỉ là một MCP server nhiều tool — nó được thiết kế như **bản đồ + trợ lý chủ động** cho
+chính agent đang cầm lái, không phải cho người vận hành đứng ngoài nhìn vào. Mọi response đều có
+`suggested_next` (chỉ đường từng bước, agent hiếm khi phải tự đoán lộ trình); những chỗ rủi ro thật
+sự cao (`edit_context` trước khi sửa, `diff_impact` trước khi commit) được hard-gate chứ không chỉ
+khuyến nghị suông; những chỗ còn lại chỉ nudge mềm, không chặn cứng, để agent vẫn giữ quyền tự
+quyết khi có lý do chính đáng. `fitness_report`, `session_context`'s `pending_diff_impact`/
+`possibly_stuck`, `repo_overview`'s `memory_notes_count` là các tín hiệu chủ động — agent không
+cần tự nhớ "mình đã diff_impact chưa" hay tự đếm "mình có đang loanh quanh không", `ci` tự trả lời
+trước khi được hỏi. Mục tiêu cuối: giảm tải nhận thức cho agent, để agent dồn sức vào phần việc tạo
+giá trị thật, thay vì tự quản lý trạng thái điều hướng.
+
+`ci` không phải công cụ duy nhất trong nhóm "code intelligence cho AI agent" — xem
+[`docs/comparison.md`](docs/comparison.md) để biết vị trí của `ci` so với các lựa chọn khác
+(Serena, CodeGraph, Sourcegraph/Cody, Cursor, Aider...), và khi nào nên/không nên chọn `ci`.
 
 ## Vì sao cần cái này?
 
@@ -73,6 +90,9 @@ agent: "tôi cần sửa hàm getUserByEmail"
   `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python.
 - **Import graph** — file-level dependency graph cho tool `dependencies`.
 - **Graph metrics** — `coreness` (k-core) và `is_hub` để nhận diện symbol trung tâm trước khi sửa.
+  `repo_overview.core_symbols` dùng lại chính `coreness` này để vẽ "khung xương kiến trúc" ngay từ
+  câu gọi đầu tiên (lấy cảm hứng từ repo-map PageRank của Aider, nhưng tận dụng metric đã có sẵn
+  thay vì tính riêng) — loại bỏ symbol trong test file, rỗng cho tới khi `edges_ready`.
 - **Incremental watcher** — chỉ re-parse file thay đổi (FNV-1a hash-diff), rebuild call graph tăng
   dần; parallel hoá bằng `rayon`. `ci serve` tự động chọn incremental reindex khi đã có index cũ.
 - **Full-text + semantic search** — FTS5 (BM25) kết hợp semantic embeddings (`model2vec-rs`,
@@ -114,10 +134,19 @@ agent: "tôi cần sửa hàm getUserByEmail"
   dưới test file trùng tên.
 - **Memory tool (`remember`/`recall`)** — ghi chú diễn giải bền vững (quyết định kiến trúc, gotcha đã
   gặp) theo topic, sống qua nhiều session/restart — khác `session_context` (chỉ track điều hướng
-  trong 1 session, mất khi server restart).
+  trong 1 session, mất khi server restart). `repo_overview.memory_notes_count` báo số lượng ghi chú
+  đang có (chỉ đếm, không kèm nội dung) — agent tự quyết định có đáng `recall()` hay không, thay vì
+  bị bơm nội dung note vào response một cách bị động.
 - **Git co-change mining** — `edit_context` mine `git log` để tìm file hay đổi cùng lúc với file
   đang sửa dù không có quan hệ import/call nào (VD model + migration) — tín hiệu coupling logic mà
   call graph tĩnh không thấy được.
+- **Session progress signal** — `session_context.possibly_stuck`/`calls_since_progress` báo agent
+  đang loanh quanh (10+ tool call không có file/symbol mới) — chỉ mang tính thông tin, không chặn;
+  quyết định dừng vòng lặp vẫn thuộc về host (VD Claude Code's `/goal`).
+- **Build freshness minh bạch** — `ci doctor` in git commit đã build binary (`ci_core::BUILD_INFO`)
+  và so với `HEAD` hiện tại của repo, cảnh báo rõ nếu lệch; `scripts/mcp-launcher.sh` tự kiểm tra
+  mtime của mọi source file trước khi tin một `target/{debug,release}/ci` có sẵn, rebuild nếu cũ hơn
+  thay vì âm thầm chạy binary lỗi thời.
 - **MCP Prompts** — 3 prompt đóng gói sẵn workflow lặp lại nhiều (`review_symbol`, `debug_symbol`,
   `onboard_area`), MCP client như Claude Code hiện chúng dưới dạng slash-command
   (`/mcp__ci__review_symbol`). Lưu ý: prompt chỉ trả về 1 message hướng dẫn sẵn, không tự chạy tool
@@ -130,7 +159,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 20 tools + incremental file watcher.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 21 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
@@ -148,7 +177,7 @@ ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
-## 20 MCP Tools cho AI agents
+## 21 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
 (mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
@@ -157,11 +186,11 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 
 | Nhóm | Tools |
 |---|---|
-| Orient | `repo_overview`, `hotspots`, `indexing_status` |
+| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — cùng metrics với `ci fitness-check`, hỏi được giữa phiên), `indexing_status` |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
+| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh`; `session_context`'s `pending_diff_impact` là tín hiệu tương đương, hoạt động ở mọi MCP client chứ không riêng Claude Code |
 | Recover | `session_context`, `remember`, `recall` |
 
 ### MCP Prompts — workflow đóng gói thành slash-command
@@ -177,11 +206,11 @@ dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới d
 
 ## Fitness Check — CI Gate
 
-`ci fitness-check` đo 8 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` đo 9 metrics và so sánh với ngưỡng trong `thresholds.toml`:
 
 | Metric | Mô tả | Ngưỡng mặc định |
 |---|---|---|
-| `hub_count` | Số symbols được phân loại là hub | ≤ 50 |
+| `hub_count` | Số symbols được phân loại là hub | ≤ 1000 |
 | `hub_pct` | % symbols là hub trên tổng symbol (scale-invariant) | ≤ 20.0% |
 | `avg_coreness` | Coreness trung bình (k-core) của graph | ≤ 15.0 |
 | `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
@@ -189,6 +218,7 @@ dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới d
 | `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
 | `high_complexity_pct` | % function/method có cyclomatic complexity > 10 (McCabe, đếm branch qua AST — chỉ 6 ngôn ngữ Tier-0 có parse tree thật; Tier-0.5 luôn báo complexity=1) | ≤ 15.0% |
 | `boundary_violations` | Số `import_edges` phạm luật kiến trúc khai báo trong `[[boundaries]]` | ≤ 0 |
+| `config_drift_count` | Số reference file-path trong doc (khai báo qua `[config_drift].doc_paths`) không trỏ tới file thật nào | ≤ 0 |
 
 Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
 trend (delta so với ngày trước).

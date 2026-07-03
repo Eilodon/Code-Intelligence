@@ -1,6 +1,6 @@
-# Code Intelligence MCP — Navigational Workflow v2.7.2
+# Code Intelligence MCP — Navigational Workflow v2.8
 
-> 18 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 21 tools. 8 stages. Every response carries `suggested_next` — follow it.
 
 ---
 
@@ -20,11 +20,12 @@
 
 **Goal**: Map the terrain before touching anything.
 
-**Tools**: `repo_overview` (always first), `hotspots` (find high-risk files)
+**Tools**: `repo_overview` (always first), `hotspots` (find high-risk files), `fitness_report` (repo-wide health snapshot — optional, not every session needs it)
 
 ```
 repo_overview()          # ALWAYS call first at session start — never skip
 hotspots(top_n=10)       # find files that break most often
+fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs thresholds — same checks as `ci fitness-check` in CI, queryable mid-session
 ```
 
 **Done when**: You know the languages, entry points, module structure, and highest-churn files. `suggested_next` points to `locate`.
@@ -33,6 +34,9 @@ hotspots(top_n=10)       # find files that break most often
 - `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor
 - `health_summary.hub_count > 0` → hub symbols exist in this repo; check `is_hub` before editing any symbol
 - `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
+- `memory_notes_count > 0` → prior notes exist for this repo (count only, no content) — worth a `recall()` if you're about to touch an area a past session may have left a gotcha about
+- `core_symbols` non-empty → architectural skeleton of the repo (top symbols by `coreness`), ranked, `is_test`-excluded; empty until `health_summary.edges_ready` — a quick "what actually matters here" without a separate `hotspots`/`locate` round trip
+- `fitness_report().passed == false` → repo-wide metric regressed past its threshold; `suggested_next` points to `hotspots` to localize it
 
 ---
 
@@ -40,11 +44,12 @@ hotspots(top_n=10)       # find files that break most often
 
 **Goal**: Find the symbol or file you need.
 
-**Tools**: `locate` (preferred — 3-in-1), `search` (result list only), `file_overview` (when you already have a path)
+**Tools**: `locate` (preferred — 3-in-1), `search` (result list only, 6 kinds), `file_overview` (when you already have a path)
 
 ```
 locate("getUserByEmail")                    # search + file_overview + symbol_info in 1 call
 search("auth handler", kind="hybrid")       # broadest recall when embeddings ready
+search("TODO(sec)", kind="grep")            # real regex+glob scan on disk (case_insensitive, context)
 file_overview("src/auth/login.ts")          # when you already have a path
 ```
 
@@ -55,6 +60,7 @@ file_overview("src/auth/login.ts")          # when you already have a path
 - `top_result.symbol.dead_code_confidence == "high"` → verify with `callers` before deleting
 - `top_result.symbol.ambiguous == true` → call `symbol_info(name, path=candidate.path)` to disambiguate
 - Empty results with `kind="symbol"` → retry with `kind="hybrid"`
+- Need a literal/regex match, or the target might be a file the parser never touches (`Cargo.toml`, `docs/*.md`, config) → `search(kind="grep")` walks the real filesystem (honors `.gitignore`), so it covers those too — this is the closest native-`grep` equivalent, closer than `hybrid`
 
 ---
 
@@ -117,6 +123,8 @@ edit_context("getUserByEmail")
 
 **Done when**: You have the confidence-ordered callers list, callees list, `risk_assessment`, and `index_freshness`. `suggested_next` always points to `diff_impact`.
 
+`edit_context`'s `range_checksum` (whole-symbol content hash) feeds directly into Stage 6's `edit_symbol(expected_hash=range_checksum, ...)` — no extra round trip to learn the hash.
+
 **Signals**:
 - `risk_assessment.level == "critical"` or `"high"` → review ALL callers before proceeding
 - `index_freshness.stale_callers: true` → file changed since last index; results may lag
@@ -124,15 +132,26 @@ edit_context("getUserByEmail")
 - `callers[].edge_confidence == "textual"` → may be false positives AND missed real callers
 - `co_changed_files` non-empty → these files have no import/call relationship to the one you're editing, but historically changed together with it in the same commit — a coupling signal the call graph cannot see (e.g. a model + its migration). Consider whether they need updating too.
 
-**Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced, not just convention: the first `Edit` of a source-code file each session is denied until `edit_context` has been called at least once that session.
+**Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced for native `Edit`, not just convention: the first `Edit` of a source-code file each session is denied until `edit_context` has been called at least once that session. `edit_symbol`/`edit_lines` (Stage 6) aren't gated this way since they already refuse a hub/high-risk touch per-call without `confirm:true` — reading `edit_context` first is still how you find out *why* before deciding to pass it.
 
 ---
 
 ## Stage 6 — Edit
 
-**Goal**: Make the code change using native tools.
+**Goal**: Make the code change.
 
-After `edit_context` confirms you understand the blast radius, use native file editing tools to make your changes. When done, proceed immediately to Stage 7.
+**Tools**: `edit_symbol` / `edit_lines` (ci's own write path — preferred for any tracked file), native `Edit`/`Write` (fallback)
+
+```
+edit_symbol("getUserByEmail", expected_hash=<range_checksum from edit_context>, new_text="...")
+  # confirm:true required if risk_assessment=="high" or is_hub — edit_context already told you which
+edit_lines(path="Cargo.toml", edits=[{start_line, end_line, new_text}])
+  # for anything outside a parsed symbol body — imports, config, docs; edit_symbol only covers symbols
+```
+
+After `edit_context` confirms you understand the blast radius, make the change:
+- **Prefer `edit_symbol`/`edit_lines`** for any file `ci` tracks. They validate syntax before writing (refuse rather than write a parse error), refuse a hub/high-risk touch without `confirm:true` (the same signal `edit_context` just showed you, enforced per-edit instead of once-per-session), write atomically, and reindex immediately — `diff_impact` right after sees a fresh index instead of waiting on the file watcher.
+- **Fall back to native `Edit`/`Write`** only for a brand-new file (no symbol exists yet to resolve a hash against) or a path `ci` doesn't index at all (dotdirs, `target/`, `node_modules/`, `dist/`, `build/`, `__pycache__/`, `venv/`, `legacy/` — see `crates/ci-core/src/walk.rs::IGNORE_DIRS`).
 
 **Rules**:
 - Update ALL call sites flagged in `edit_context.callers[]` in the same change
@@ -162,7 +181,7 @@ diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 - `unindexed_files[].reason == "out_of_scope"` → not a source file (docs/config/etc.); permanent, harmless, does not affect `aggregate_risk`
 - `suggested_reviewers` present → notify these owners before merging
 
-**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call.
+**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call. Host-agnostic backup for any MCP client (not just Claude Code): `session_context`'s `pending_diff_impact`/`files_pending_diff_impact` report the same thing — files written via `edit_lines`/`edit_symbol` since the last `diff_impact` call — and its `suggested_next` points straight at `diff_impact` while any are pending.
 
 ---
 
@@ -186,12 +205,14 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 - `session_started_at` changed from your saved T₀ → server restarted; begin again at Stage 1
 - Starting work on an area you (or a prior session) may have left notes about → `recall(topic=...)` or `recall(query=...)` before assuming from scratch
 - You just learned a non-obvious WHY that the graph/AST can't capture (not derivable by re-running `edit_context`/`callers`) → `remember(topic, content)` before it's lost at session end
+- Not sure whether you already ran `diff_impact` after your latest edit → `session_context().pending_diff_impact` answers it directly, no need to remember for yourself
 
 **Signals**:
 - `frontier non-empty` → explore `frontier[0].path` with `file_overview`
 - `frontier empty` → call `repo_overview` to refresh the map
 - `embeddings_status == "failed"` → call `indexing_status(retry_embeddings=true)`
 - `recall` returns `notes: []` → nothing recorded yet, not an error; proceed normally
+- `possibly_stuck == true` (`calls_since_progress >= 10`) → purely informational, not enforced; confirms the "10+ calls without convergence" cue above actually applies right now instead of you having to count
 
 ---
 
@@ -199,12 +220,12 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 
 | Stage | Primary Tools | Replaces Native |
 |-------|--------------|-----------------|
-| 1 Orient | `repo_overview`, `hotspots` | Directory scanning, README reading |
+| 1 Orient | `repo_overview`, `hotspots`, `fitness_report` | Directory scanning, README reading |
 | 2 Locate | `locate`, `search`, `file_overview` | `grep`, file search |
 | 3 Inspect | `source`, `symbol_info`, `understand` | `cat` / full file read |
 | 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
 | 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
-| 6 Edit | native editor tools | — |
+| 6 Edit | `edit_symbol`, `edit_lines` (preferred) | native `Edit`/`Write` (fallback for new/untracked files) |
 | 7 Verify | `diff_impact` | *(no native equivalent)* |
 | 8 Recover | `session_context`, `indexing_status`, `remember`, `recall` | *(no native equivalent)* |
 
@@ -213,9 +234,9 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 ## Mandatory Rules (non-negotiable)
 
 1. **`repo_overview` first** — always at session start, never skip
-2. **`edit_context` before edit** — mandatory, no exceptions, never skip. Hook-enforced under Claude Code (see `.claude/hooks/ci-nudge.sh`): the first `Edit` of a source file each session is denied until this is called.
-3. **`diff_impact` after edit** — mandatory before any commit or push. Hook-enforced under Claude Code: `git commit`/`git push` is denied if a file changed since the last `diff_impact` call.
-4. **Never use native Read/grep on project files** when index tools are available
+2. **`edit_context` before edit** — mandatory, no exceptions, never skip. Hook-enforced under Claude Code (see `.claude/hooks/ci-nudge.sh`) for native `Edit`: the first `Edit` of a source file each session is denied until this is called. `edit_symbol`/`edit_lines` are not gated the same way — they carry their own per-call risk gate instead (Stage 6), which is stricter (every touch, not just the first).
+3. **`diff_impact` after edit** — mandatory before any commit or push, whether the edit was made via `edit_symbol`/`edit_lines` or native `Edit`/`Write`. Hook-enforced under Claude Code: `git commit`/`git push` is denied if a file changed via any of those four tools since the last `diff_impact` call.
+4. **Never use native Read/grep on project files** when index tools are available — `search(kind="grep")` extends this to files the parser doesn't touch (docs, config, lockfiles), so this holds even outside indexed source
 5. **Follow `suggested_next`** — it is computed per-response with full context; override only with explicit reason
 6. **Hub symbols need extra caution** — `is_hub: true` + low `caller_count` = bridge hub; editing breaks cross-module integration
 7. **`textual` edges are uncertain** — do not treat absence of textual callers as safe; may be false negatives
@@ -227,10 +248,10 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 
 | Preset | Registered Tools | Use when |
 |--------|-----------------|----------|
-| `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `indexing_status` | Exploration only, no edits |
+| `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `fitness_report`, `indexing_status` | Exploration only, no edits |
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
-| `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `diff_impact`, `indexing_status` | Code modification workflow |
-| `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 18 tools | Default; use when workflow spans multiple stages |
+| `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status` | Code modification workflow |
+| `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
+| `full` | All 21 tools | Default; use when workflow spans multiple stages |
 
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.

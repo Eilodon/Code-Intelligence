@@ -77,12 +77,17 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
-/// In-memory session tracking — tool call count and the set of symbols/files
-/// touched, for the `session_context` tool. Reset only when the server restarts.
+/// In-memory session tracking — tool call count and the symbols/files
+/// touched, for the `session_context` tool. Reset only when the server
+/// restarts. Values are the `tool_calls` count at the most recent touch (not
+/// a boolean "seen"): `apply_personalization_boost` uses that to decay a
+/// result's proximity boost by how long ago (in tool-calls, not wall-clock)
+/// the connecting file/symbol was last explored — a re-touch refreshes it,
+/// same "attention" semantics as re-reading something brings it back to mind.
 struct SessionLog {
     tool_calls: u64,
-    explored_symbols: std::collections::HashSet<String>,
-    explored_files: std::collections::HashSet<String>,
+    explored_symbols: std::collections::HashMap<String, u64>,
+    explored_files: std::collections::HashMap<String, u64>,
     session_started_at: String,
 }
 
@@ -90,8 +95,8 @@ impl Default for SessionLog {
     fn default() -> Self {
         Self {
             tool_calls: 0,
-            explored_symbols: std::collections::HashSet::new(),
-            explored_files: std::collections::HashSet::new(),
+            explored_symbols: std::collections::HashMap::new(),
+            explored_files: std::collections::HashMap::new(),
             session_started_at: utc_now_iso8601(),
         }
     }
@@ -2466,6 +2471,112 @@ mod tests {
         assert_eq!(
             sn["tool"], "symbol_info",
             "locate should suggest symbol_info for ambiguous name, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_boosts_result_near_recently_explored_file() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "helper_fn", "mod::helper_fn", "function", "rust", "b.rs",
+                    1i64, 5i64, "fn helper_fn()", "", "helper fn",
+                    0i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            // a.rs imports b.rs — tracking a.rs should boost a search hit in b.rs.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+                [],
+            ).unwrap();
+        }
+
+        let params = || LocateParams {
+            query: "helper_fn".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        };
+
+        let baseline = server.locate(params());
+        let bv: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(
+            bv["personalized"], false,
+            "a session that hasn't explored anything must not personalize"
+        );
+        let baseline_score = bv["results"][0]["score"].as_f64().unwrap();
+
+        server.track_file("a.rs");
+
+        let boosted = server.locate(params());
+        let boostv: serde_json::Value = serde_json::from_str(&boosted).unwrap();
+        assert_eq!(boostv["personalized"], true);
+        let boosted_score = boostv["results"][0]["score"].as_f64().unwrap();
+
+        // track_file ran between two `locate` calls (each a tool call, so
+        // tool_calls is now 2); a.rs was touched at tool_calls=1 — distance 1,
+        // decay 1/(1+1)=0.5, default personalization_weight=0.15.
+        let expected_delta = 0.15 * 0.5;
+        assert!(
+            (boosted_score - baseline_score - expected_delta).abs() < 1e-9,
+            "expected +{expected_delta}, got baseline={baseline_score} boosted={boosted_score}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_personalization_weight_zero_disables_boost() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"search": {"personalization_weight": 0.0}}"#,
+        )
+        .unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "helper_fn", "mod::helper_fn", "function", "rust", "b.rs",
+                    1i64, 5i64, "fn helper_fn()", "", "helper fn",
+                    0i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+                [],
+            ).unwrap();
+        }
+
+        server.track_file("a.rs");
+        let output = server.locate(LocateParams {
+            query: "helper_fn".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            v["personalized"], false,
+            "personalization_weight=0.0 must fully disable boosting"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -105,6 +105,15 @@ pub struct SearchConfig {
     pub text_chunk_context_lines: usize,
     pub text_max_chunk_lines: usize,
     pub rrf_k: usize,
+    /// Additive weight applied to the session-journey proximity boost (see
+    /// `CodeIntelligenceServer::apply_personalization_boost`) before
+    /// re-ranking `search`/`locate` results — a result whose file is
+    /// import/call-adjacent to something this session recently explored
+    /// gets `score += personalization_weight * boost` (`boost` in `(0, 1]`).
+    /// Additive-only by construction: it can nudge ordering among
+    /// close-scoring results but a low default keeps it from overriding a
+    /// strong text/semantic match. `0.0` disables personalization entirely.
+    pub personalization_weight: f64,
 }
 
 impl Default for SearchConfig {
@@ -113,6 +122,7 @@ impl Default for SearchConfig {
             text_chunk_context_lines: 10,
             text_max_chunk_lines: 50,
             rrf_k: 20,
+            personalization_weight: 0.15,
         }
     }
 }

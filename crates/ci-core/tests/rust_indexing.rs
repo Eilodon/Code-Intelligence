@@ -64,3 +64,18 @@ fn crate_relative_import_resolves() {
         .unwrap();
     assert_eq!(to_path.as_deref(), Some("core/src/engine.rs"));
 }
+
+#[test]
+fn trait_method_declaration_is_a_symbol() {
+    let conn = index_fixture();
+    // The trait method `Runner::run` (declaration only, no body) must be indexed,
+    // qualified by its trait, so "who declares run" / trait API is queryable.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM symbols \
+             WHERE qualified_name = 'core/src/lib.rs::Runner::run' AND kind = 'method'",
+        ),
+        1
+    );
+}

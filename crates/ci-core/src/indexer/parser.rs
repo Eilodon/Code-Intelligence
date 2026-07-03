@@ -291,9 +291,18 @@ fn walk_symbols(
         });
     }
 
-    // Entering a class/impl sets the context for its descendants.
+    // Entering a class/impl sets the context for its descendants. Rust's
+    // `trait_item` names itself via field `name` (a `type_identifier`) — it
+    // does not share `impl_item`'s `class_name_field` ("type", the Self
+    // type) — so the field to read can't come from the single
+    // per-language `class_name_field` constant alone for this node kind.
     let child_class = if lc.class_node_types.contains(&node.kind()) {
-        node.child_by_field_name(lc.class_name_field)
+        let name_field = if node.kind() == "trait_item" {
+            "name"
+        } else {
+            lc.class_name_field
+        };
+        node.child_by_field_name(name_field)
             .map(|n| source[n.byte_range()].to_string())
             .or_else(|| enclosing_class.clone())
     } else {

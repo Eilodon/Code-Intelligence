@@ -24,12 +24,18 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             class_name_field: "name",
         }),
         "rust" => Some(LangConstants {
-            function_node_types: &["function_item", "struct_item", "trait_item", "impl_item"],
+            function_node_types: &[
+                "function_item",
+                "function_signature_item",
+                "struct_item",
+                "trait_item",
+                "impl_item",
+            ],
             name_field: "name",
             docstring_type: Some("line_comment"),
             call_node_types: &["call_expression"],
             call_function_field: "function",
-            class_node_types: &["impl_item"],
+            class_node_types: &["impl_item", "trait_item"],
             class_name_field: "type",
         }),
         "go" => Some(LangConstants {

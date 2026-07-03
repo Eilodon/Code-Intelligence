@@ -47,7 +47,20 @@ CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/ci-mcp"
 
 log() { printf '[mcp-launcher] %s\n' "$*" >&2; }
 
+# Default to "." (this repo) unless the caller already passed their own
+# --project-root, as either "--project-root /path" or "--project-root=/path"
+# — both forms count as the same flag to clap, which is a single-value arg
+# (not appendable) and rejects it being passed twice. An external consumer
+# wiring this script into another project's client config supplies their
+# own --project-root; without this check it collides with the hardcoded
+# default below and `ci serve` always fails with "cannot be used multiple
+# times".
 serve_args=(serve --project-root . "$@")
+for arg in "$@"; do
+  case "$arg" in
+    --project-root|--project-root=*) serve_args=(serve "$@"); break ;;
+  esac
+done
 
 try_exec() {
   local bin="$1"

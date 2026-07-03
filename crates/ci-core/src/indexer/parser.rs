@@ -1137,10 +1137,12 @@ fn detect_shell(s: &str) -> Option<(String, SymbolKind)> {
         let name = ident_at_start(rest.trim_start())?;
         return Some((name, SymbolKind::Function));
     }
-    // `name() {` or `name () {`
+    // `name() {` or `name () {` — but not `name=(...)` / `name=$(...)`
+    // (array or command-substitution assignment), which also has a `(`
+    // with no space before it. Same guard `detect_c_cpp` already applies.
     if let Some(paren_pos) = s.find('(') {
         let before = s[..paren_pos].trim_end();
-        if !before.contains(' ') && !before.is_empty() {
+        if !before.contains(' ') && !before.contains('=') && !before.is_empty() {
             let name = ident_at_start(before)?;
             return Some((name, SymbolKind::Function));
         }
@@ -1707,6 +1709,90 @@ public class FooTest {
     }
 
     // ---------------------------------------------------------------
+    // Tier-0.5 grammar ABI guards — each optional tree-sitter grammar's
+    // "language version" (ABI) must stay within this workspace's pinned
+    // `tree-sitter` core's supported range (MIN_COMPATIBLE_LANGUAGE_VERSION
+    // ..= LANGUAGE_VERSION), or `parser.set_language()` fails at runtime —
+    // silently, since `parse_tree()` swallows the error via `.ok()?` and
+    // `extract_file_data` treats a `None` tree as "no grammar for this
+    // language", falling back to the much weaker shallow line-scan
+    // extractor with zero calls/imports. This previously went unnoticed for
+    // shell/php/csharp/c (all pinned to a version whose grammar reported
+    // ABI 15 against a core that only supports up to 14) because no test
+    // exercised `parse_tree`/`extract_symbols` for these languages — every
+    // existing Tier-0.5 test called `extract_symbols_shallow` directly,
+    // bypassing the real path entirely. These guards fail loudly the moment
+    // a `cargo update` (or a well-meaning version-constraint relaxation)
+    // reintroduces an ABI-incompatible grammar version.
+    #[test]
+    #[cfg(feature = "lang-ruby")]
+    fn test_tier0_5_grammar_loads_ruby() {
+        assert!(parse_tree("def foo\nend\n", "ruby").is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-php")]
+    fn test_tier0_5_grammar_loads_php() {
+        assert!(parse_tree("<?php\nfunction foo() {}\n", "php").is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-csharp")]
+    fn test_tier0_5_grammar_loads_csharp() {
+        assert!(parse_tree("class Foo { void Bar() {} }\n", "csharp").is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-shell")]
+    fn test_tier0_5_grammar_loads_shell() {
+        assert!(parse_tree("foo() {\n echo hi\n}\n", "shell").is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-c")]
+    fn test_tier0_5_grammar_loads_c() {
+        assert!(parse_tree("int foo() { return 0; }\n", "c").is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-cpp")]
+    fn test_tier0_5_grammar_loads_cpp() {
+        assert!(parse_tree("int foo() { return 0; }\n", "cpp").is_some());
+    }
+
+    /// Regression test for the shell-specific bug this guard suite was born
+    /// from: with a working grammar, a `NAME=$(...)` / `NAME=(...)` variable
+    /// assignment must never be reported as a function symbol, and a real
+    /// call between two shell functions must produce a call edge (both were
+    /// silently wrong under the Tier-0.5 shallow fallback, which never
+    /// exercised the AST at all).
+    #[test]
+    #[cfg(feature = "lang-shell")]
+    fn test_shell_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "os=$(uname -s)\narr=(a b c)\nfoo() {\n  echo hi\n}\nbar() {\n  if foo; then\n    echo ok\n  fi\n}\n";
+        let symbols = extract_symbols(code, "shell", "a.sh").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            !names.contains(&"os"),
+            "variable assignment must not be a symbol"
+        );
+        assert!(
+            !names.contains(&"arr"),
+            "array assignment must not be a symbol"
+        );
+        assert!(names.contains(&"foo"));
+        assert!(names.contains(&"bar"));
+
+        let calls = extract_calls(code, "shell", "a.sh").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "bar" && c.callee == "foo"),
+            "bar calling foo must produce a call edge"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Tier-0.5 shallow extraction tests
     // ---------------------------------------------------------------
 
@@ -1781,6 +1867,21 @@ public class FooTest {
             "should detect function keyword style"
         );
         assert!(names.contains(&"build"), "should detect paren style");
+    }
+
+    #[test]
+    fn test_shallow_shell_does_not_misdetect_assignments_as_functions() {
+        let code = "os=$(uname -s)\nserve_args=(serve --project-root . \"$@\")\n";
+        let syms = extract_symbols_shallow(code, "shell", "a.sh");
+        let names = shallow_names(&syms);
+        assert!(
+            !names.contains(&"os"),
+            "command-substitution assignment must not be detected as a function"
+        );
+        assert!(
+            !names.contains(&"serve_args"),
+            "array assignment must not be detected as a function"
+        );
     }
 
     #[test]

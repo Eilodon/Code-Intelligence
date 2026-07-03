@@ -27,7 +27,13 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
         "python" => &["import_statement", "import_from_statement"],
         "rust" => &["use_declaration"],
         "go" => &["import_spec"],
-        "javascript" | "typescript" => &["import_statement"],
+        // `variable_declarator` also catches CommonJS `require()` — see
+        // `parse_js_require`. It's the same node kind `assignment_nodes()`
+        // (resolver/lang_constants.rs) already walks for alias tracking; the
+        // two extractions look for different shapes in the same nodes and
+        // don't conflict (alias tracking wants a bare-identifier RHS,
+        // `parse_js_require` wants a `require(...)` call RHS).
+        "javascript" | "typescript" => &["import_statement", "variable_declarator"],
         "java" => &["import_declaration"],
         _ => &[],
     }
@@ -199,6 +205,10 @@ fn parse_go_import(text: &str) -> Option<ParsedImport> {
 }
 
 fn parse_js_import(text: &str) -> Option<ParsedImport> {
+    parse_js_esm_import(text).or_else(|| parse_js_require(text))
+}
+
+fn parse_js_esm_import(text: &str) -> Option<ParsedImport> {
     // import { a, b as c } from 'mod';  import x from 'mod';  import * as ns from 'mod';
     let (clause, module) = text.split_once(" from ")?;
     let module = module
@@ -221,6 +231,47 @@ fn parse_js_import(text: &str) -> Option<ParsedImport> {
     } else if !head.is_empty() && !head.starts_with('{') && !head.starts_with('*') {
         names.extend(ident(head));
     }
+    Some(ParsedImport {
+        module_name: module,
+        imported_names: names,
+    })
+}
+
+/// CommonJS `require()`, still common in real Node.js code (older packages,
+/// TypeScript compiled to CommonJS) but structurally a call expression, not
+/// an `import_statement` — this is fed `variable_declarator` text instead
+/// (`NAME = require(...)` or `{ a, b as c } = require(...)`, no trailing
+/// `;`, no `const`/`let`/`var` keyword — that's the parent node).
+///
+/// Only a literal string argument resolves to a module — `require(path)`
+/// with a computed argument can't be statically attributed, so it's left
+/// unresolved (`None`) rather than guessed at.
+fn parse_js_require(text: &str) -> Option<ParsedImport> {
+    let (lhs, rhs) = text.split_once('=')?;
+    let after_require = rhs.trim().strip_prefix("require(")?.trim_start();
+    let quote = after_require.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &after_require[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    let module = rest[..end].to_string();
+    if module.is_empty() {
+        return None;
+    }
+
+    let lhs = lhs.trim();
+    let mut names = Vec::new();
+    if let Some(start) = lhs.find('{')
+        && let Some(end) = lhs.find('}')
+    {
+        for seg in lhs[start + 1..end].split(',') {
+            names.extend(bound_name(seg));
+        }
+    } else {
+        names.extend(ident(lhs));
+    }
+
     Some(ParsedImport {
         module_name: module,
         imported_names: names,
@@ -297,6 +348,43 @@ mod tests {
         let i = one("import { a, b as c } from './mod';\n", "javascript");
         assert_eq!(i.module_name, "./mod");
         assert_eq!(i.imported_names, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn js_require_default() {
+        let i = one("const foo = require('./foo');\n", "javascript");
+        assert_eq!(i.module_name, "./foo");
+        assert_eq!(i.imported_names, vec!["foo"]);
+    }
+
+    #[test]
+    fn ts_require_double_quoted() {
+        let i = one("const foo = require(\"./foo\");\n", "typescript");
+        assert_eq!(i.module_name, "./foo");
+        assert_eq!(i.imported_names, vec!["foo"]);
+    }
+
+    #[test]
+    fn js_require_destructure() {
+        let i = one("const { a, b: c } = require('./mod');\n", "javascript");
+        assert_eq!(i.module_name, "./mod");
+        assert_eq!(i.imported_names, vec!["a", "c"]);
+    }
+
+    /// A computed argument can't be statically attributed to a module —
+    /// must not guess (see `parse_js_require`'s literal-only contract).
+    #[test]
+    fn js_require_with_computed_path_yields_no_import() {
+        let v = extract_imports("const x = require(somePath);\n", "javascript");
+        assert!(v.is_empty(), "expected no import, got {v:?}");
+    }
+
+    /// A plain (non-`require`) assignment must not be mistaken for an
+    /// import now that `variable_declarator` is walked for JS/TS.
+    #[test]
+    fn js_plain_assignment_yields_no_import() {
+        let v = extract_imports("const x = 5;\n", "javascript");
+        assert!(v.is_empty(), "expected no import, got {v:?}");
     }
 
     #[test]

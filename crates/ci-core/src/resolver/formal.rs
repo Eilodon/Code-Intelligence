@@ -28,6 +28,19 @@ struct FormalLanguageConfig {
     builtins: StackGraph,
     #[allow(dead_code)]
     no_similar_paths_in_file: bool,
+    /// `.tsx` uses a different `StackGraphLanguage`/builtins pair than plain
+    /// `.ts` (separate grammar variant upstream — `tree-sitter-typescript`
+    /// ships `LANGUAGE_TYPESCRIPT` and `LANGUAGE_TSX` as distinct grammars).
+    /// `ci`'s language string for both is the single `"typescript"`
+    /// (`lang_constants.rs`), so the split is resolved here, keyed off
+    /// `file_path`'s extension, rather than by adding a second top-level
+    /// `configs` entry no caller would know to ask for.
+    tsx: Option<TsxVariant>,
+}
+
+struct TsxVariant {
+    sgl: StackGraphLanguage,
+    builtins: StackGraph,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +279,37 @@ impl FormalResolver {
                 sgl: lc.sgl,
                 builtins,
                 no_similar_paths_in_file: lc.no_similar_paths_in_file,
+                tsx: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// TypeScript formal resolution, covering both `.ts` and `.tsx`.
+    /// Unlike Python (`load_python`), upstream's bundled builtins source
+    /// (`tree-sitter-stack-graphs-typescript`'s `src/builtins.ts`, ~10KB) is
+    /// non-empty, so `lc.builtins` is used directly — no synthetic stub graph
+    /// needed here (see `PYTHON_BUILTINS_STUB` for why Python needed one).
+    pub fn load_typescript(&mut self) -> anyhow::Result<()> {
+        let lc_ts = tree_sitter_stack_graphs_typescript::try_language_configuration_typescript(
+            cancellation_flag(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to load TypeScript stack-graphs config: {e}"))?;
+        let lc_tsx = tree_sitter_stack_graphs_typescript::try_language_configuration_tsx(
+            cancellation_flag(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to load TSX stack-graphs config: {e}"))?;
+
+        self.configs.insert(
+            "typescript".to_string(),
+            FormalLanguageConfig {
+                sgl: lc_ts.sgl,
+                builtins: lc_ts.builtins,
+                no_similar_paths_in_file: lc_ts.no_similar_paths_in_file,
+                tsx: Some(TsxVariant {
+                    sgl: lc_tsx.sgl,
+                    builtins: lc_tsx.builtins,
+                }),
             },
         );
         Ok(())
@@ -282,6 +326,14 @@ impl FormalResolver {
             .get(language)
             .ok_or_else(|| anyhow::anyhow!("No formal resolver for language: {language}"))?;
 
+        // `.tsx` swaps in the TSX-specific `StackGraphLanguage`/builtins pair
+        // (see `FormalLanguageConfig::tsx`) — every other caller (plain `.ts`,
+        // Python, ...) falls through to the primary `sgl`/`builtins` below.
+        let (sgl, builtins) = match &config.tsx {
+            Some(tsx) if file_path.ends_with(".tsx") => (&tsx.sgl, &tsx.builtins),
+            _ => (&config.sgl, &config.builtins),
+        };
+
         // Fresh per-file deadlines for both the TSG graph build and the
         // path-stitching stages — see `RESOLVE_TIMEOUT`.
         let tsg_deadline = TsgCancelAfterDuration::new(RESOLVE_TIMEOUT);
@@ -296,7 +348,7 @@ impl FormalResolver {
         // builtins' files/nodes/edges in and returns their new file handles,
         // which also need indexing into `db` below so they're stitchable.
         let builtin_files = graph
-            .add_from_graph(&config.builtins)
+            .add_from_graph(builtins)
             .map_err(|h| anyhow::anyhow!("Duplicate builtin file: {}", &graph[h]))?;
 
         let file = graph.get_or_create_file(file_path);
@@ -306,9 +358,7 @@ impl FormalResolver {
             .add("FILE_PATH".into(), file_path.into())
             .map_err(|_| anyhow::anyhow!("Failed to set FILE_PATH global"))?;
 
-        config
-            .sgl
-            .build_stack_graph_into(&mut graph, file, source, &globals, &tsg_deadline)
+        sgl.build_stack_graph_into(&mut graph, file, source, &globals, &tsg_deadline)
             .map_err(|e| anyhow::anyhow!("Stack graph build error: {e:?}"))?;
 
         let mut partials = PartialPaths::new();
@@ -587,6 +637,147 @@ def use_class():
         assert!(
             has_class_edge,
             "Should resolve MyClass() to class definition. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_typescript() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+        assert!(resolver.has_language("typescript"));
+    }
+
+    #[test]
+    fn test_resolve_simple_typescript_def_ref() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+        let source = r#"
+function foo() {}
+
+function bar() {
+    foo();
+}
+"#;
+        let edges = resolver
+            .resolve_file("typescript", "test.ts", source)
+            .unwrap();
+        let has_foo_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "foo" || e.reference_symbol == "foo");
+        assert!(
+            has_foo_edge,
+            "Should resolve foo() call to foo definition. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_typescript_class() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+        let source = r#"
+class MyClass {
+    method(): void {}
+}
+
+function useClass() {
+    const obj = new MyClass();
+}
+"#;
+        let edges = resolver
+            .resolve_file("typescript", "test.ts", source)
+            .unwrap();
+        let has_class_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "MyClass" || e.reference_symbol == "MyClass");
+        assert!(
+            has_class_edge,
+            "Should resolve MyClass() to class definition. Edges: {edges:?}"
+        );
+    }
+
+    /// `.tsx` must resolve through the TSX-specific `sgl`/builtins pair, not
+    /// silently fall through to the plain `.ts` one (which would fail to
+    /// parse JSX syntax and produce zero edges instead of erroring loudly).
+    #[test]
+    fn test_resolve_tsx_def_ref() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+        let source = r#"
+function Foo() {
+    return <div>hi</div>;
+}
+
+function Bar() {
+    return Foo();
+}
+"#;
+        let edges = resolver
+            .resolve_file("typescript", "test.tsx", source)
+            .unwrap();
+        let has_foo_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "Foo" || e.reference_symbol == "Foo");
+        assert!(
+            has_foo_edge,
+            "Should resolve Foo() call to Foo definition in a .tsx file. Edges: {edges:?}"
+        );
+    }
+
+    /// Unlike Python (DEBT-005), TypeScript's bundled builtins source is
+    /// non-empty upstream, so `load_typescript` uses `lc.builtins` as-is
+    /// (no synthetic stub). This locks in that global built-ins actually
+    /// resolve through it rather than assuming so from source file size.
+    ///
+    /// Asserts on `Array`/`isArray`, not `console` — `console` is a host
+    /// (DOM/Node) global, not part of core ECMAScript, so it's correctly
+    /// absent from `builtins.ts` (confirmed empirically: an earlier version
+    /// of this test asserted on `console` and failed, while `Array`/
+    /// `isArray` resolved in the same run).
+    #[test]
+    fn test_resolve_file_resolves_typescript_builtins() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "typescript",
+                "test.ts",
+                "function useBuiltins() {\n    return Array.isArray([1, 2, 3]);\n}\n",
+            )
+            .unwrap();
+
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "Array" && e.definition_symbol == "Array"),
+            "Array must resolve through the formal tier. Edges: {edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "isArray" && e.definition_symbol == "isArray"),
+            "Array.isArray must resolve through the formal tier. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_typescript_does_not_resolve_undefined_name() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_typescript().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "typescript",
+                "test.ts",
+                "function useUndefined() {\n    return totallyUndefinedXyz();\n}\n",
+            )
+            .unwrap();
+
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.reference_symbol == "totallyUndefinedXyz"),
+            "a genuinely undefined name must not resolve. Edges: {edges:?}"
         );
     }
 }

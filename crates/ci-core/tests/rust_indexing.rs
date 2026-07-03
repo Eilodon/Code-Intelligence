@@ -33,3 +33,34 @@ fn pub_use_reexport_is_indexed() {
         "pub use re-export must be recorded as an import edge"
     );
 }
+
+#[test]
+fn cross_crate_import_resolves_to_path() {
+    let conn = index_fixture();
+    // `use demo_core::{...}` in app/src/main.rs must resolve to the demo-core crate.
+    // Item imports resolve to the crate root file (lib.rs) that re-exports them.
+    let to_path: Option<String> = conn
+        .query_row(
+            "SELECT to_path FROM import_edges \
+             WHERE from_path = 'app/src/main.rs' AND module_name = 'demo_core'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(to_path.as_deref(), Some("core/src/lib.rs"));
+}
+
+#[test]
+fn crate_relative_import_resolves() {
+    let conn = index_fixture();
+    // `pub use engine::Engine;` in core/src/lib.rs -> engine module -> core/src/engine.rs
+    let to_path: Option<String> = conn
+        .query_row(
+            "SELECT to_path FROM import_edges \
+             WHERE from_path = 'core/src/lib.rs' AND module_name = 'engine'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(to_path.as_deref(), Some("core/src/engine.rs"));
+}

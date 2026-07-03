@@ -382,6 +382,7 @@ fn persist_file(
 fn rebuild_graph(
     tx: &rusqlite::Transaction,
     hub_config: &crate::config::HubThresholdConfig,
+    crate_map: &crate::indexer::crate_map::CrateMap,
 ) -> rusqlite::Result<()> {
     // name → [(qn, path)] for tier-1; (name, class) → [(qn, path)] for tier-2.
     let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -498,7 +499,7 @@ fn rebuild_graph(
             (SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE to_symbol = symbols.qualified_name)",
         [],
     )?;
-    resolve_import_targets(tx)?;
+    resolve_import_targets(tx, crate_map)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     Ok(())
@@ -507,7 +508,10 @@ fn rebuild_graph(
 /// Best-effort resolution of `import_edges.to_path` against indexed files, so the
 /// `dependencies` tool's `imported_by` direction works for in-project imports.
 /// External modules (no matching file) keep `to_path = NULL`.
-fn resolve_import_targets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+fn resolve_import_targets(
+    tx: &rusqlite::Transaction,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
         stmt.query_map([], |r| r.get::<_, String>(0))?
@@ -530,7 +534,7 @@ fn resolve_import_targets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     // `known` set, so it runs in parallel; the UPDATE loop stays sequential.
     let targets: Vec<Option<String>> = rows
         .par_iter()
-        .map(|(_, from_path, module)| resolve_module_to_path(from_path, module, &known))
+        .map(|(_, from_path, module)| resolve_module_to_path(from_path, module, &known, crate_map))
         .collect();
 
     let mut ustmt = tx.prepare("UPDATE import_edges SET to_path = ?1 WHERE id = ?2")?;
@@ -542,16 +546,115 @@ fn resolve_import_targets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Resolve a Rust `use` module path to an indexed file, using the workspace
+/// crate map. Handles `crate::`, `self::`, an external crate-name prefix, and a
+/// best-effort `super::`. Returns `None` for paths that leave the workspace
+/// (std, third-party crates) — those correctly keep `to_path = NULL`.
+///
+/// `super::` climbs one directory per `super` from the importing file's dir.
+/// This is exact for `foo.rs`-style modules and off-by-one for `foo/mod.rs`
+/// modules; the residual is covered by the optional SCIP overlay, so a miss
+/// here simply falls back to today's NULL, never a wrong edge.
+fn resolve_rust_module(
+    from_path: &str,
+    module: &str,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+    known: &HashSet<String>,
+) -> Option<String> {
+    let segs: Vec<&str> = module.split("::").filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let from_dir = std::path::Path::new(from_path)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+
+    // (base directory to resolve the remaining segments under, remaining segments)
+    let (base_dir, rest): (String, &[&str]) = match segs[0] {
+        "crate" => {
+            let (_, root) = crate_map.crate_of_file(from_path)?;
+            (root.to_string(), &segs[1..])
+        }
+        "self" => (from_dir.clone(), &segs[1..]),
+        "super" => {
+            let mut dir = from_dir.clone();
+            let mut i = 0;
+            while i < segs.len() && segs[i] == "super" {
+                dir = parent_of(&dir);
+                i += 1;
+            }
+            (dir, &segs[i..])
+        }
+        other => {
+            // Rust's "uniform paths": an unprefixed leading segment in a `use`
+            // is looked up as an external crate name first; if it isn't one,
+            // the path is implicitly relative to the *importing file's own*
+            // crate root (e.g. `use engine::Engine;` inside that crate's own
+            // `lib.rs` means the same as `use crate::engine::Engine;`).
+            match crate_map.root_of(&other.replace('-', "_")) {
+                Some(root) => (root.to_string(), &segs[1..]),
+                None => {
+                    let (_, root) = crate_map.crate_of_file(from_path)?;
+                    (root.to_string(), segs.as_slice())
+                }
+            }
+        }
+    };
+
+    // Try the full remaining path and, for item imports (`use a::b::Item`), its
+    // parent — plus `mod.rs` / crate-root conventions.
+    let joined = rest.join("/");
+    let mut bases: Vec<String> = Vec::new();
+    if joined.is_empty() {
+        bases.push(base_dir.clone());
+    } else {
+        bases.push(join_rel(&base_dir, &joined));
+        if let Some((parent, _)) = joined.rsplit_once('/') {
+            bases.push(join_rel(&base_dir, parent));
+        } else {
+            // Single trailing item (`crate::Item`) → the crate root file itself.
+            bases.push(base_dir.clone());
+        }
+    }
+
+    for base in &bases {
+        let base = base.trim_start_matches('/');
+        for cand in [
+            format!("{base}.rs"),
+            format!("{base}/mod.rs"),
+            format!("{base}/lib.rs"),
+        ] {
+            if known.contains(&cand) {
+                return Some(cand);
+            }
+        }
+        if known.contains(base) {
+            return Some(base.to_string());
+        }
+    }
+    None
+}
+
 /// Map a module/path string to an indexed file path, trying the conventions of
 /// all six languages (dotted, scoped, and JS-relative) plus common index files.
 fn resolve_module_to_path(
     from_path: &str,
     module: &str,
     known: &HashSet<String>,
+    crate_map: &crate::indexer::crate_map::CrateMap,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
         return None;
+    }
+    // Rust: use the crate-map-aware resolver first; fall through to the generic
+    // convention scan only if it finds nothing (keeps single-crate repos working
+    // even when the crate map is empty).
+    if from_path.ends_with(".rs")
+        && let Some(hit) = resolve_rust_module(from_path, m, crate_map, known)
+    {
+        return Some(hit);
     }
 
     // Build candidate base paths (without extension), forward-slash normalised.
@@ -730,7 +833,8 @@ pub fn run_indexing_pipeline(
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
-    rebuild_graph(&tx, &config.hub_threshold)?;
+    let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
+    rebuild_graph(&tx, &config.hub_threshold, &crate_map)?;
     tx.commit()?;
 
     *phase.write().unwrap() = IndexingPhase::Ready;
@@ -841,7 +945,8 @@ pub fn reindex_changed(
     }
 
     if !summary.is_noop() {
-        rebuild_graph(&tx, &config.hub_threshold)?;
+        let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
+        rebuild_graph(&tx, &config.hub_threshold, &crate_map)?;
     }
     tx.commit()?;
     Ok(summary)

@@ -31,6 +31,37 @@ of this repo's setup relied on that hook alone and believed it had fixed
 the problem; it hadn't — it had just usually won the race, until a session
 where it didn't.
 
+## A stronger layer: a binary already sitting in the checkout
+
+Everything below this point (Setup Script, `MCP_TIMEOUT`) works by trying
+to *win* a race against the MCP client's dial attempt. There's a way to
+avoid the race entirely: `.ci-bin/x86_64-unknown-linux-musl/ci`, a
+prebuilt binary committed to the repo via Git LFS and kept current by
+[`.github/workflows/prebuild-mcp-binary.yml`](../.github/workflows/prebuild-mcp-binary.yml)
+on every push to `main`. `scripts/mcp-launcher.sh` execs it directly
+(subject to the same `is_binary_fresh` staleness check as a local
+`target/debug/ci`) — if it's there, there is no compile step for the MCP
+dial to race against, because the checkout itself (which necessarily
+completes before Claude Code can even read `.mcp.json`) already contains a
+working binary.
+
+**This is not a certainty, only a strong improvement**, for two concrete
+reasons:
+
+- It depends on the cloud checkout mechanism actually resolving the Git
+  LFS pointer to real content (running the smudge filter) rather than
+  leaving a ~130-byte text stub in place. `scripts/mcp-launcher.sh` detects
+  an unresolved pointer and falls through safely instead of crashing (see
+  `is_lfs_pointer`'s comment for why that needed an explicit check — a
+  plain `exec` on a pointer stub does *not* fail gracefully), but a
+  fallthrough here still means you're back to racing the Setup Script
+  against a cold build.
+- It only covers `x86_64-unknown-linux-musl` today. A different sandbox
+  architecture falls through to the tiers below, unaffected either way.
+
+Keep the Setup Script below as defense-in-depth regardless — it's the only
+one of the two that's a guaranteed fix rather than a "very likely" one.
+
 ## The actual fix: a Cloud environment Setup Script
 
 Setup Scripts and `SessionStart` hooks look similar but solve different
@@ -113,6 +144,9 @@ session before any cache exists, or right after the ~7-day cache expiry)
 
 ## What's already handled in this repo (defense in depth, not a substitute)
 
+- `.ci-bin/x86_64-unknown-linux-musl/ci` — see the section above. The one
+  layer that can eliminate the race outright rather than just narrowing it,
+  when it applies.
 - `scripts/mcp-launcher.sh` — `.mcp.json`'s actual entrypoint now (shared
   across every MCP client, not just Claude Code; see
   `docs/mcp-client-setup.md`). Execs an already-cached binary directly if

@@ -1,0 +1,55 @@
+name: Prebuild MCP binary
+
+# Keeps a ready-to-run `ci` binary committed at .ci-bin/x86_64-unknown-linux-musl/ci
+# (via Git LFS) so scripts/mcp-launcher.sh has it the instant a fresh clone
+# happens — no compile, no download, no tagged-release requirement. This is
+# what closes the Claude-Code-on-the-web cold-start race that a Setup
+# Script/SessionStart hook can only race, never structurally win — see
+# docs/cloud-environment-setup.md.
+#
+# `paths-ignore: ['.ci-bin/**']` is load-bearing: without it, this workflow's
+# own commit back to main would retrigger itself.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.ci-bin/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-unknown-linux-musl-prebuild
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: cross build --release --bin ci --target x86_64-unknown-linux-musl
+
+      - name: Commit prebuilt binary
+        run: |
+          mkdir -p .ci-bin/x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/ci .ci-bin/x86_64-unknown-linux-musl/ci
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .ci-bin/x86_64-unknown-linux-musl/ci
+          if git diff --cached --quiet; then
+            echo "Binary unchanged, nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore(ci-bin): update prebuilt ci binary for $(git rev-parse --short HEAD)"
+          git push

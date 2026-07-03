@@ -7,6 +7,23 @@ cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symb
 cấp full-text + semantic search + khả năng sửa file trực tiếp (hash-verified, risk-gated) — tất cả
 phục vụ qua 21 MCP tools, chạy local, không gọi ra ngoài.
 
+## Triết lý
+
+`ci` không chỉ là một MCP server nhiều tool — nó được thiết kế như **bản đồ + trợ lý chủ động** cho
+chính agent đang cầm lái, không phải cho người vận hành đứng ngoài nhìn vào. Mọi response đều có
+`suggested_next` (chỉ đường từng bước, agent hiếm khi phải tự đoán lộ trình); những chỗ rủi ro thật
+sự cao (`edit_context` trước khi sửa, `diff_impact` trước khi commit) được hard-gate chứ không chỉ
+khuyến nghị suông; những chỗ còn lại chỉ nudge mềm, không chặn cứng, để agent vẫn giữ quyền tự
+quyết khi có lý do chính đáng. `fitness_report`, `session_context`'s `pending_diff_impact`/
+`possibly_stuck`, `repo_overview`'s `memory_notes_count` là các tín hiệu chủ động — agent không
+cần tự nhớ "mình đã diff_impact chưa" hay tự đếm "mình có đang loanh quanh không", `ci` tự trả lời
+trước khi được hỏi. Mục tiêu cuối: giảm tải nhận thức cho agent, để agent dồn sức vào phần việc tạo
+giá trị thật, thay vì tự quản lý trạng thái điều hướng.
+
+`ci` không phải công cụ duy nhất trong nhóm "code intelligence cho AI agent" — xem
+[`docs/comparison.md`](docs/comparison.md) để biết vị trí của `ci` so với các lựa chọn khác
+(Serena, CodeGraph, Sourcegraph/Cody, Cursor, Aider...), và khi nào nên/không nên chọn `ci`.
+
 ## Vì sao cần cái này?
 
 Khi một AI agent sửa code mà không biết ai đang gọi hàm nó sắp đổi, nó dễ:
@@ -114,10 +131,19 @@ agent: "tôi cần sửa hàm getUserByEmail"
   dưới test file trùng tên.
 - **Memory tool (`remember`/`recall`)** — ghi chú diễn giải bền vững (quyết định kiến trúc, gotcha đã
   gặp) theo topic, sống qua nhiều session/restart — khác `session_context` (chỉ track điều hướng
-  trong 1 session, mất khi server restart).
+  trong 1 session, mất khi server restart). `repo_overview.memory_notes_count` báo số lượng ghi chú
+  đang có (chỉ đếm, không kèm nội dung) — agent tự quyết định có đáng `recall()` hay không, thay vì
+  bị bơm nội dung note vào response một cách bị động.
 - **Git co-change mining** — `edit_context` mine `git log` để tìm file hay đổi cùng lúc với file
   đang sửa dù không có quan hệ import/call nào (VD model + migration) — tín hiệu coupling logic mà
   call graph tĩnh không thấy được.
+- **Session progress signal** — `session_context.possibly_stuck`/`calls_since_progress` báo agent
+  đang loanh quanh (10+ tool call không có file/symbol mới) — chỉ mang tính thông tin, không chặn;
+  quyết định dừng vòng lặp vẫn thuộc về host (VD Claude Code's `/goal`).
+- **Build freshness minh bạch** — `ci doctor` in git commit đã build binary (`ci_core::BUILD_INFO`)
+  và so với `HEAD` hiện tại của repo, cảnh báo rõ nếu lệch; `scripts/mcp-launcher.sh` tự kiểm tra
+  mtime của mọi source file trước khi tin một `target/{debug,release}/ci` có sẵn, rebuild nếu cũ hơn
+  thay vì âm thầm chạy binary lỗi thời.
 - **MCP Prompts** — 3 prompt đóng gói sẵn workflow lặp lại nhiều (`review_symbol`, `debug_symbol`,
   `onboard_area`), MCP client như Claude Code hiện chúng dưới dạng slash-command
   (`/mcp__ci__review_symbol`). Lưu ý: prompt chỉ trả về 1 message hướng dẫn sẵn, không tự chạy tool
@@ -177,11 +203,11 @@ dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới d
 
 ## Fitness Check — CI Gate
 
-`ci fitness-check` đo 8 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` đo 9 metrics và so sánh với ngưỡng trong `thresholds.toml`:
 
 | Metric | Mô tả | Ngưỡng mặc định |
 |---|---|---|
-| `hub_count` | Số symbols được phân loại là hub | ≤ 50 |
+| `hub_count` | Số symbols được phân loại là hub | ≤ 1000 |
 | `hub_pct` | % symbols là hub trên tổng symbol (scale-invariant) | ≤ 20.0% |
 | `avg_coreness` | Coreness trung bình (k-core) của graph | ≤ 15.0 |
 | `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
@@ -189,6 +215,7 @@ dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới d
 | `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
 | `high_complexity_pct` | % function/method có cyclomatic complexity > 10 (McCabe, đếm branch qua AST — chỉ 6 ngôn ngữ Tier-0 có parse tree thật; Tier-0.5 luôn báo complexity=1) | ≤ 15.0% |
 | `boundary_violations` | Số `import_edges` phạm luật kiến trúc khai báo trong `[[boundaries]]` | ≤ 0 |
+| `config_drift_count` | Số reference file-path trong doc (khai báo qua `[config_drift].doc_paths`) không trỏ tới file thật nào | ≤ 0 |
 
 Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
 trend (delta so với ngày trước).

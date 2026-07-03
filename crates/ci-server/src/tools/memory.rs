@@ -29,9 +29,22 @@ impl CodeIntelligenceServer {
                 return format!(r#"{{"error": "write failed: {e}"}}"#);
             }
 
+            // Best-effort: capture which real files this note references, so
+            // a later `recall` can tell if they've changed since — a failure
+            // here shouldn't fail the note itself, which is already saved.
+            let ignore_patterns = ci_core::config::load_config(&self.project_root)
+                .map(|c| c.ignore)
+                .unwrap_or_default();
+            let refs = ci_core::memory::capture_refs(&self.project_root, &ignore_patterns, content);
+            let refs_captured = refs.len();
+            if let Err(e) = ci_core::memory::store_refs(&conn, topic, &refs) {
+                tracing::error!("remember: failed to store refs for topic {topic}: {e}");
+            }
+
             serde_json::to_string_pretty(&RememberOutput {
                 topic: topic.to_string(),
                 updated_at: now,
+                refs_captured,
                 suggested_next: self.filter_sn(suggested("recall", "Verify the note was saved")),
             })
             .unwrap_or_default()
@@ -91,7 +104,29 @@ impl CodeIntelligenceServer {
             };
 
             let truncated = notes.len() as i64 > RECALL_LIMIT;
-            let notes: Vec<MemoryNote> = notes.into_iter().take(RECALL_LIMIT as usize).collect();
+            let mut notes: Vec<MemoryNote> = notes.into_iter().take(RECALL_LIMIT as usize).collect();
+
+            // Per note: "unchecked" (no file-path refs were ever captured for
+            // it — either the content had none, or none resolved at
+            // `remember` time) stays the `memory_note_row` default; otherwise
+            // diff captured refs against the live files.
+            for note in &mut notes {
+                let has_refs = ci_core::memory::ref_count(&conn, &note.topic).unwrap_or(0) > 0;
+                if !has_refs {
+                    continue;
+                }
+                let stale =
+                    ci_core::memory::check_staleness(&conn, &self.project_root, &note.topic)
+                        .unwrap_or_default();
+                note.staleness = if stale.is_empty() {
+                    "fresh"
+                } else if stale.iter().any(|s| s.status == "deleted") {
+                    "gone"
+                } else {
+                    "stale"
+                };
+                note.stale_refs = stale.into_iter().map(StaleRefOutput::from).collect();
+            }
 
             let sn = if notes.is_empty() {
                 suggested(
@@ -127,6 +162,11 @@ pub(crate) struct RememberParams {
 pub(crate) struct RememberOutput {
     pub(crate) topic: String,
     pub(crate) updated_at: String,
+    /// Count of file-path-like references found in `content` that resolved
+    /// to a real file and got snapshotted for later staleness checks (see
+    /// `MemoryNote::staleness`) — 0 just means the note didn't mention any
+    /// file, not that anything went wrong.
+    pub(crate) refs_captured: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -147,10 +187,34 @@ pub(crate) struct RecallParams {
 }
 
 #[derive(Serialize, JsonSchema)]
+pub(crate) struct StaleRefOutput {
+    pub(crate) reference: String,
+    /// "changed" (file still exists but its content hash no longer matches
+    /// what `remember` captured) or "deleted" (file no longer exists).
+    pub(crate) status: String,
+}
+
+impl From<ci_core::memory::StaleRef> for StaleRefOutput {
+    fn from(s: ci_core::memory::StaleRef) -> Self {
+        Self {
+            reference: s.reference,
+            status: s.status.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
 pub(crate) struct MemoryNote {
     pub(crate) topic: String,
     pub(crate) content: String,
     pub(crate) updated_at: String,
+    /// "unchecked" (no file refs were ever captured for this note — nothing
+    /// to compare), "fresh" (all captured refs still match), "stale" (a
+    /// referenced file changed since this note was written), or "gone" (a
+    /// referenced file was deleted) — set by `recall`, not `memory_note_row`.
+    pub(crate) staleness: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) stale_refs: Vec<StaleRefOutput>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -166,6 +230,8 @@ pub(crate) fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNot
         topic: row.get(0)?,
         content: row.get(1)?,
         updated_at: row.get(2)?,
+        staleness: "unchecked",
+        stale_refs: Vec::new(),
     })
 }
 

@@ -2756,6 +2756,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn remember_note_with_no_file_refs_recalls_unchecked() {
+        let (dir, server) = test_server("remember_no_refs");
+
+        let out = server.remember(RememberParams {
+            topic: "philosophy".into(),
+            content: "prefer additive fixes over rewrites".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["refs_captured"], 0);
+
+        let out = server.recall(RecallParams {
+            topic: Some("philosophy".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "unchecked");
+        assert!(v["notes"][0]["stale_refs"].as_array().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_note_referencing_real_file_recalls_fresh() {
+        let (dir, server) = test_server("remember_fresh");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+
+        let out = server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["refs_captured"], 1);
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_reports_stale_when_referenced_file_changes() {
+        let (dir, server) = test_server("recall_stale");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+        server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+
+        std::fs::write(dir.join("resolver.py"), "def resolve(): return None  # v2\n").unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "stale");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["reference"], "resolver.py");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "changed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_reports_gone_when_referenced_file_deleted() {
+        let (dir, server) = test_server("recall_gone");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+        server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+
+        std::fs::remove_file(dir.join("resolver.py")).unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "gone");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_upsert_replaces_stale_ref_set_not_appends() {
+        let (dir, server) = test_server("remember_upsert_refs");
+        std::fs::write(dir.join("a.py"), "# a\n").unwrap();
+        std::fs::write(dir.join("b.py"), "# b\n").unwrap();
+
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "see `a.py`".into(),
+        });
+        // Re-`remember`ing the same topic with different content must
+        // replace the old ref set, not accumulate it — deleting a.py
+        // afterward must not make this note "gone" via a stale a.py ref.
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "see `b.py`".into(),
+        });
+        std::fs::remove_file(dir.join("a.py")).unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("gotcha".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------
     // edit_lines / edit_symbol
     // -----------------------------------------------------------------

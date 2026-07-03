@@ -123,6 +123,21 @@ CREATE TABLE IF NOT EXISTS project_memory (
     updated_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_project_memory_topic ON project_memory(topic);
+
+-- File-path references extracted from a `project_memory.content` note at
+-- `remember` time, each paired with that file's content hash *then* — lets
+-- `recall` detect a note that's gone stale (the file it discusses has since
+-- changed, or disappeared) without any NLP, just a hash re-check against the
+-- live file. One row per (topic, ref_path); `remember` replaces the full set
+-- for a topic on every call, mirroring how it replaces `content` itself.
+CREATE TABLE IF NOT EXISTS project_memory_refs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic       TEXT NOT NULL,
+    ref_path    TEXT NOT NULL,
+    ref_hash    TEXT NOT NULL,
+    UNIQUE(topic, ref_path)
+);
+CREATE INDEX IF NOT EXISTS idx_project_memory_refs_topic ON project_memory_refs(topic);
 ";
 
 const FTS5_SQL: &str = "

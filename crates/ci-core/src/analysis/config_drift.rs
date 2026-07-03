@@ -33,16 +33,13 @@ pub struct ConfigDriftFinding {
 /// declared doc doesn't exist — this check only judges references *inside*
 /// docs that are present, mirroring `check_boundaries`' "no rules declared"
 /// pass-by-default behavior.
-pub fn check_config_drift(
-    project_root: &Path,
-    doc_paths: &[String],
-    ignore_patterns: &[String],
-) -> Vec<ConfigDriftFinding> {
-    if doc_paths.is_empty() {
-        return Vec::new();
-    }
-
-    let mut real_paths: HashSet<String> = HashSet::new();
+/// Every repo-relative file path under `project_root`, gitignore-aware —
+/// shared groundwork for both `check_config_drift` (does this reference
+/// resolve at all?) and `crate::memory`'s ref-capture (which real path did a
+/// short-form reference resolve to?), so both pay the walk cost once and
+/// agree on what "real" means.
+pub fn build_real_path_index(project_root: &Path, ignore_patterns: &[String]) -> HashSet<String> {
+    let mut real_paths = HashSet::new();
     for entry in crate::walk::build_walker(project_root, ignore_patterns) {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -56,21 +53,44 @@ pub fn check_config_drift(
             .replace('\\', "/");
         real_paths.insert(rel);
     }
+    real_paths
+}
 
-    let resolves = |reference: &str| -> bool {
-        // Direct filesystem check first: covers dot-directories
-        // (`.github/workflows/x.yml`, `.claude/hooks/y.sh`) that the
-        // gitignore-aware walk below deliberately excludes (same exclusion
-        // `search`'s grep walker relies on to skip `.git`), so real docs
-        // that reference tooling config would otherwise all misfire.
-        if project_root.join(reference).exists() {
-            return true;
-        }
-        real_paths.contains(reference)
-            || real_paths
-                .iter()
-                .any(|p| p.ends_with(&format!("/{reference}")))
-    };
+/// Resolves a file-path-like reference to the repo-relative path it names,
+/// or `None` if it doesn't correspond to any real file. Tries, in order: (1)
+/// a direct filesystem check — covers dot-directories
+/// (`.github/workflows/x.yml`, `.claude/hooks/y.sh`) that `real_paths`
+/// deliberately excludes, same exclusion `search`'s grep walker relies on to
+/// skip `.git`; (2) exact match in `real_paths`; (3) suffix match after a
+/// `/` boundary, so a doc can write the short form `fitness.rs` instead of
+/// the full `crates/ci-core/src/fitness.rs`.
+pub fn resolve_reference(
+    project_root: &Path,
+    real_paths: &HashSet<String>,
+    reference: &str,
+) -> Option<String> {
+    if project_root.join(reference).exists() {
+        return Some(reference.to_string());
+    }
+    if real_paths.contains(reference) {
+        return Some(reference.to_string());
+    }
+    real_paths
+        .iter()
+        .find(|p| p.ends_with(&format!("/{reference}")))
+        .cloned()
+}
+
+pub fn check_config_drift(
+    project_root: &Path,
+    doc_paths: &[String],
+    ignore_patterns: &[String],
+) -> Vec<ConfigDriftFinding> {
+    if doc_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let real_paths = build_real_path_index(project_root, ignore_patterns);
 
     let mut findings = Vec::new();
     for doc_path in doc_paths {
@@ -82,7 +102,7 @@ pub fn check_config_drift(
         refs.sort();
         refs.dedup();
         for r in refs {
-            if !resolves(&r) {
+            if resolve_reference(project_root, &real_paths, &r).is_none() {
                 findings.push(ConfigDriftFinding {
                     doc_path: doc_path.clone(),
                     reference: r,

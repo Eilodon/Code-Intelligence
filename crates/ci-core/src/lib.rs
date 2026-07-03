@@ -7,6 +7,7 @@ pub mod fitness;
 pub mod gitignore;
 pub mod graph;
 pub mod indexer;
+pub mod memory;
 pub mod resolver;
 pub mod sanitize;
 pub mod search;

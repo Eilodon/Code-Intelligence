@@ -157,6 +157,8 @@ async fn main() -> Result<()> {
 
             let thresholds = ci_core::fitness::load_thresholds(config.as_deref())?;
             let boundary_rules = ci_core::fitness::load_boundary_rules(config.as_deref())?;
+            let config_drift_doc_paths =
+                ci_core::fitness::load_config_drift_doc_paths(config.as_deref())?;
 
             let conn = rusqlite::Connection::open(&db_path)
                 .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
@@ -169,6 +171,7 @@ async fn main() -> Result<()> {
                 &root,
                 &coverage,
                 &boundary_rules,
+                &config_drift_doc_paths,
             )?;
 
             // Record today's metrics for later trend comparison (edit_context's
@@ -206,6 +209,13 @@ async fn main() -> Result<()> {
                             "  {} -> {} (rule: {} -> {}){reason}",
                             v.from_path, v.to_path, v.rule_from, v.rule_to
                         );
+                    }
+                }
+                if !result.config_drift.is_empty() {
+                    println!();
+                    println!("Config drift (doc references to files that no longer exist):");
+                    for f in &result.config_drift {
+                        println!("  {}: references \"{}\"", f.doc_path, f.reference);
                     }
                 }
                 println!();

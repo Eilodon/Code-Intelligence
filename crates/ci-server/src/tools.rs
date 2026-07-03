@@ -77,12 +77,17 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
-/// In-memory session tracking — tool call count and the set of symbols/files
-/// touched, for the `session_context` tool. Reset only when the server restarts.
+/// In-memory session tracking — tool call count and the symbols/files
+/// touched, for the `session_context` tool. Reset only when the server
+/// restarts. Values are the `tool_calls` count at the most recent touch (not
+/// a boolean "seen"): `apply_personalization_boost` uses that to decay a
+/// result's proximity boost by how long ago (in tool-calls, not wall-clock)
+/// the connecting file/symbol was last explored — a re-touch refreshes it,
+/// same "attention" semantics as re-reading something brings it back to mind.
 struct SessionLog {
     tool_calls: u64,
-    explored_symbols: std::collections::HashSet<String>,
-    explored_files: std::collections::HashSet<String>,
+    explored_symbols: std::collections::HashMap<String, u64>,
+    explored_files: std::collections::HashMap<String, u64>,
     session_started_at: String,
 }
 
@@ -90,8 +95,8 @@ impl Default for SessionLog {
     fn default() -> Self {
         Self {
             tool_calls: 0,
-            explored_symbols: std::collections::HashSet::new(),
-            explored_files: std::collections::HashSet::new(),
+            explored_symbols: std::collections::HashMap::new(),
+            explored_files: std::collections::HashMap::new(),
             session_started_at: utc_now_iso8601(),
         }
     }
@@ -2471,6 +2476,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn locate_boosts_result_near_recently_explored_file() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "helper_fn", "mod::helper_fn", "function", "rust", "b.rs",
+                    1i64, 5i64, "fn helper_fn()", "", "helper fn",
+                    0i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            // a.rs imports b.rs — tracking a.rs should boost a search hit in b.rs.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+                [],
+            ).unwrap();
+        }
+
+        let params = || LocateParams {
+            query: "helper_fn".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        };
+
+        let baseline = server.locate(params());
+        let bv: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(
+            bv["personalized"], false,
+            "a session that hasn't explored anything must not personalize"
+        );
+        let baseline_score = bv["results"][0]["score"].as_f64().unwrap();
+
+        server.track_file("a.rs");
+
+        let boosted = server.locate(params());
+        let boostv: serde_json::Value = serde_json::from_str(&boosted).unwrap();
+        assert_eq!(boostv["personalized"], true);
+        let boosted_score = boostv["results"][0]["score"].as_f64().unwrap();
+
+        // track_file ran between two `locate` calls (each a tool call, so
+        // tool_calls is now 2); a.rs was touched at tool_calls=1 — distance 1,
+        // decay 1/(1+1)=0.5, default personalization_weight=0.15.
+        let expected_delta = 0.15 * 0.5;
+        assert!(
+            (boosted_score - baseline_score - expected_delta).abs() < 1e-9,
+            "expected +{expected_delta}, got baseline={baseline_score} boosted={boosted_score}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_personalization_weight_zero_disables_boost() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"search": {"personalization_weight": 0.0}}"#,
+        )
+        .unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "helper_fn", "mod::helper_fn", "function", "rust", "b.rs",
+                    1i64, 5i64, "fn helper_fn()", "", "helper fn",
+                    0i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+                [],
+            ).unwrap();
+        }
+
+        server.track_file("a.rs");
+        let output = server.locate(LocateParams {
+            query: "helper_fn".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            v["personalized"], false,
+            "personalization_weight=0.0 must fully disable boosting"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 15: `session_context` had no config knob bounding
     /// `explored_symbols`/`explored_files` — a long session dumped an
     /// unbounded list into every call.
@@ -2752,6 +2863,124 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["notes"].as_array().unwrap().len(), 0);
         assert!(v.get("error").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_note_with_no_file_refs_recalls_unchecked() {
+        let (dir, server) = test_server("remember_no_refs");
+
+        let out = server.remember(RememberParams {
+            topic: "philosophy".into(),
+            content: "prefer additive fixes over rewrites".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["refs_captured"], 0);
+
+        let out = server.recall(RecallParams {
+            topic: Some("philosophy".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "unchecked");
+        assert!(v["notes"][0]["stale_refs"].as_array().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_note_referencing_real_file_recalls_fresh() {
+        let (dir, server) = test_server("remember_fresh");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+
+        let out = server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["refs_captured"], 1);
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_reports_stale_when_referenced_file_changes() {
+        let (dir, server) = test_server("recall_stale");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+        server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+
+        std::fs::write(dir.join("resolver.py"), "def resolve(): return None  # v2\n").unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "stale");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["reference"], "resolver.py");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "changed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_reports_gone_when_referenced_file_deleted() {
+        let (dir, server) = test_server("recall_gone");
+        std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
+        server.remember(RememberParams {
+            topic: "resolver-note".into(),
+            content: "see `resolver.py` for the tiering logic".into(),
+        });
+
+        std::fs::remove_file(dir.join("resolver.py")).unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-note".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "gone");
+        assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_upsert_replaces_stale_ref_set_not_appends() {
+        let (dir, server) = test_server("remember_upsert_refs");
+        std::fs::write(dir.join("a.py"), "# a\n").unwrap();
+        std::fs::write(dir.join("b.py"), "# b\n").unwrap();
+
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "see `a.py`".into(),
+        });
+        // Re-`remember`ing the same topic with different content must
+        // replace the old ref set, not accumulate it — deleting a.py
+        // afterward must not make this note "gone" via a stale a.py ref.
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "see `b.py`".into(),
+        });
+        std::fs::remove_file(dir.join("a.py")).unwrap();
+
+        let out = server.recall(RecallParams {
+            topic: Some("gotcha".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"][0]["staleness"], "fresh");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::analysis::boundaries::{BoundaryRule, BoundaryViolation, check_boundaries};
+use crate::analysis::config_drift::{ConfigDriftFinding, check_config_drift};
 use crate::analysis::coverage::{CoverageData, normalize_path};
 use crate::analysis::dead_code::{
     compute_dead_code_confidence, is_private_symbol, scope_clear_for_language,
@@ -51,6 +52,12 @@ pub struct FitnessThresholds {
     /// you bothered to declare fails the gate; there's no "a few is fine"
     /// case for an architecture boundary the way there is for e.g. dead code.
     pub max_boundary_violations: i64,
+    /// Max allowed count of file-path-like references inside declared
+    /// `[config_drift].doc_paths` docs that don't resolve to any real file
+    /// (see `check_config_drift`). Default 0, same reasoning as
+    /// `max_boundary_violations` — this only fires at all once a project
+    /// opts in by declaring `doc_paths`.
+    pub max_config_drift_count: i64,
 }
 
 /// Per-symbol cyclomatic complexity above this is "high" for
@@ -69,6 +76,7 @@ impl Default for FitnessThresholds {
             min_edge_coverage_pct: 60.0,
             max_high_complexity_pct: 15.0,
             max_boundary_violations: 0,
+            max_config_drift_count: 0,
         }
     }
 }
@@ -108,6 +116,34 @@ pub fn load_boundary_rules(config_path: Option<&Path>) -> anyhow::Result<Vec<Bou
         let text = std::fs::read_to_string(path)?;
         let parsed: BoundariesTomlFile = toml::from_str(&text)?;
         return Ok(parsed.boundaries);
+    }
+    Ok(Vec::new())
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConfigDriftTomlFile {
+    #[serde(default)]
+    config_drift: ConfigDriftSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ConfigDriftSection {
+    doc_paths: Vec<String>,
+}
+
+/// Doc files to scan for stale file-path references, declared in the same
+/// `thresholds.toml` as `load_thresholds`/`load_boundary_rules`, under a
+/// `[config_drift]` table with a `doc_paths` array — e.g.
+/// `[config_drift]\ndoc_paths = ["AGENTS.md", "CONTRACTS.md"]`. Empty
+/// (opt-in, nothing scanned) when absent, matching `load_boundary_rules`.
+pub fn load_config_drift_doc_paths(config_path: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    if let Some(path) = config_path
+        && path.exists()
+    {
+        let text = std::fs::read_to_string(path)?;
+        let parsed: ConfigDriftTomlFile = toml::from_str(&text)?;
+        return Ok(parsed.config_drift.doc_paths);
     }
     Ok(Vec::new())
 }
@@ -337,6 +373,9 @@ pub struct FitnessCheckResult {
     /// Full detail behind the `boundary_violations` check — empty whenever
     /// that check passes (including when no rules are declared at all).
     pub boundary_violations: Vec<BoundaryViolation>,
+    /// Full detail behind the `config_drift_count` check — empty whenever
+    /// that check passes (including when no `doc_paths` are declared at all).
+    pub config_drift: Vec<ConfigDriftFinding>,
 }
 
 pub fn run_fitness_check(
@@ -345,9 +384,14 @@ pub fn run_fitness_check(
     project_root: &Path,
     coverage: &CoverageData,
     boundary_rules: &[BoundaryRule],
+    config_drift_doc_paths: &[String],
 ) -> rusqlite::Result<FitnessCheckResult> {
     let metrics = collect_metrics(conn, project_root, coverage)?;
     let boundary_violations = check_boundaries(conn, boundary_rules)?;
+    let ignore_patterns = crate::config::load_config(project_root)
+        .map(|c| c.ignore)
+        .unwrap_or_default();
+    let config_drift = check_config_drift(project_root, config_drift_doc_paths, &ignore_patterns);
     let mut checks = Vec::new();
 
     checks.push(FitnessCheckItem {
@@ -446,12 +490,30 @@ pub fn run_fitness_check(
         ),
     });
 
+    checks.push(FitnessCheckItem {
+        metric: "config_drift_count".into(),
+        value: config_drift.len() as f64,
+        threshold: thresholds.max_config_drift_count as f64,
+        passed: config_drift.len() as i64 <= thresholds.max_config_drift_count,
+        message: format!(
+            "Doc references to nonexistent files {} (max {}){}",
+            config_drift.len(),
+            thresholds.max_config_drift_count,
+            if config_drift_doc_paths.is_empty() {
+                " — no config_drift.doc_paths declared"
+            } else {
+                ""
+            }
+        ),
+    });
+
     let passed = checks.iter().all(|c| c.passed);
     Ok(FitnessCheckResult {
         passed,
         checks,
         metrics,
         boundary_violations,
+        config_drift,
     })
 }
 
@@ -653,6 +715,7 @@ mod tests {
         assert_eq!(t.min_edge_coverage_pct, 60.0);
         assert_eq!(t.max_high_complexity_pct, 15.0);
         assert_eq!(t.max_boundary_violations, 0);
+        assert_eq!(t.max_config_drift_count, 0);
     }
 
     #[test]
@@ -665,10 +728,11 @@ mod tests {
             &std::env::temp_dir(),
             &CoverageData::none(),
             &[],
+            &[],
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 8);
+        assert_eq!(result.checks.len(), 9);
     }
 
     #[test]
@@ -692,6 +756,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
             &[],
         )
         .unwrap();
@@ -728,6 +793,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
             &[],
         )
         .unwrap();
@@ -786,6 +852,7 @@ mod tests {
             &std::env::temp_dir(),
             &CoverageData::none(),
             &[],
+            &[],
         )
         .unwrap();
 
@@ -825,6 +892,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
             &[],
         )
         .unwrap();
@@ -925,6 +993,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
             &[],
         )
         .unwrap();
@@ -1036,6 +1105,7 @@ mod tests {
             &thresholds,
             &std::env::temp_dir(),
             &CoverageData::none(),
+            &[],
             &[],
         )
         .unwrap();
@@ -1180,6 +1250,7 @@ mod tests {
             &std::env::temp_dir(),
             &CoverageData::none(),
             &rules,
+            &[],
         )
         .unwrap();
 
@@ -1207,6 +1278,7 @@ mod tests {
             &std::env::temp_dir(),
             &CoverageData::none(),
             &[],
+            &[],
         )
         .unwrap();
 
@@ -1217,6 +1289,96 @@ mod tests {
             .unwrap();
         assert!(check.passed);
         assert!(result.boundary_violations.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_drift_doc_paths_from_toml() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[thresholds]\nmax_hub_count = 5\n\n\
+             [config_drift]\n\
+             doc_paths = [\"AGENTS.md\", \"CONTRACTS.md\"]\n"
+        )
+        .unwrap();
+
+        let doc_paths = load_config_drift_doc_paths(Some(f.path())).unwrap();
+        assert_eq!(doc_paths, vec!["AGENTS.md", "CONTRACTS.md"]);
+
+        // Same file, load_thresholds must still work independently.
+        let thresholds = load_thresholds(Some(f.path())).unwrap();
+        assert_eq!(thresholds.max_hub_count, 5);
+    }
+
+    #[test]
+    fn test_load_config_drift_doc_paths_missing_file_or_no_section() {
+        assert!(
+            load_config_drift_doc_paths(Some(Path::new("/nonexistent/path.toml")))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_config_drift_doc_paths(None).unwrap().is_empty());
+    }
+
+    /// End-to-end: a doc referencing a file that doesn't exist must fail the
+    /// `config_drift_count` gate — the same signal that would catch a
+    /// CONTRACTS.md still describing a pre-rewrite Python layout.
+    #[test]
+    fn test_config_drift_fail_gates_fitness_check() {
+        let conn = test_conn();
+        let dir = std::env::temp_dir().join(format!(
+            "ci_fitness_config_drift_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CONTRACTS.md"), "> **Owner:** server.py\n").unwrap();
+
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &dir,
+            &CoverageData::none(),
+            &[],
+            &["CONTRACTS.md".to_string()],
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "config_drift_count")
+            .unwrap();
+        assert!(!check.passed);
+        assert_eq!(check.value, 1.0);
+        assert!(!result.passed);
+        assert_eq!(result.config_drift.len(), 1);
+        assert_eq!(result.config_drift[0].reference, "server.py");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_no_doc_paths_declared_passes_by_default() {
+        let conn = test_conn();
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "config_drift_count")
+            .unwrap();
+        assert!(check.passed);
+        assert!(result.config_drift.is_empty());
     }
 
     #[test]

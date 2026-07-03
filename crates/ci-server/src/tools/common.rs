@@ -76,14 +76,78 @@ impl CodeIntelligenceServer {
 
     pub(crate) fn track_symbol(&self, qualified_name: &str) {
         if let Ok(mut log) = self.session_log.lock() {
-            log.explored_symbols.insert(qualified_name.to_string());
+            let now = log.tool_calls;
+            log.explored_symbols.insert(qualified_name.to_string(), now);
         }
     }
 
     pub(crate) fn track_file(&self, path: &str) {
         if let Ok(mut log) = self.session_log.lock() {
-            log.explored_files.insert(path.to_string());
+            let now = log.tool_calls;
+            log.explored_files.insert(path.to_string(), now);
         }
+    }
+
+    /// Additive, session-scoped relevance boost for `search`/`locate`
+    /// results: a result whose file is import/call-adjacent to something
+    /// this session recently explored gets nudged up, so results lean
+    /// toward the current work context without ever overriding a strong
+    /// text/semantic match. Mutates `results[i].score` in place and re-sorts
+    /// — never touches `symbols.is_hub`/`coreness` or any other
+    /// DB-persisted, cross-session-shared ranking signal. Returns `true`
+    /// when personalization actually adjusted anything, so callers can
+    /// report it transparently rather than silently.
+    ///
+    /// Guaranteed no-op (identical results, in identical order) when this
+    /// session hasn't explored anything yet, or `personalization_weight` is
+    /// configured to `0.0` — the common case for a session's first calls.
+    pub(crate) fn apply_personalization_boost(
+        &self,
+        conn: &rusqlite::Connection,
+        results: &mut [ci_core::search::SearchResult],
+    ) -> bool {
+        if results.is_empty() {
+            return false;
+        }
+        let weight = ci_core::config::load_config(&self.project_root)
+            .map(|c| c.search.personalization_weight)
+            .unwrap_or(0.15);
+        if weight <= 0.0 {
+            return false;
+        }
+        let (explored_files, explored_symbols, tool_calls) = {
+            let log = self.session_log.lock().unwrap();
+            (
+                log.explored_files.clone(),
+                log.explored_symbols.clone(),
+                log.tool_calls,
+            )
+        };
+        if explored_files.is_empty() && explored_symbols.is_empty() {
+            return false;
+        }
+
+        let boosts =
+            compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
+        if boosts.is_empty() {
+            return false;
+        }
+
+        let mut adjusted = false;
+        for r in results.iter_mut() {
+            if let Some(&boost) = boosts.get(&r.path) {
+                r.score += weight * boost;
+                adjusted = true;
+            }
+        }
+        if adjusted {
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        adjusted
     }
 
     /// A handle the background indexer uses to advance the phase as it works.
@@ -508,6 +572,158 @@ pub(crate) fn query_paths_chunked(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Personalization boost helper (for search/locate)
+// ---------------------------------------------------------------------------
+
+/// Runs `{sql_prefix} (?, ?, ...){sql_suffix}` in chunks of ≤999 to stay
+/// within SQLite's SQLITE_LIMIT_VARIABLE_NUMBER, accumulating `(a, b)` row
+/// pairs — the two-column counterpart to `query_paths_chunked` above, needed
+/// here because `compute_proximity_boosts` must know *which* explored anchor
+/// a candidate connects to (to look up that anchor's own recency), not just
+/// whether one exists.
+fn query_pairs_chunked(
+    conn: &rusqlite::Connection,
+    sql_prefix: &str,
+    sql_suffix: &str,
+    params: &[String],
+    out: &mut Vec<(String, String)>,
+) {
+    const CHUNK: usize = 999;
+    for chunk in params.chunks(CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{sql_prefix} ({placeholders}){sql_suffix}");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        out.push(r);
+                    }
+                });
+        }
+    }
+}
+
+/// Same as `query_pairs_chunked` but the second column (`call_edges.from_path`/
+/// `to_path`) is nullable — a call edge's enclosing file isn't always known.
+fn query_symbol_path_pairs_chunked(
+    conn: &rusqlite::Connection,
+    sql_prefix: &str,
+    params: &[String],
+    out: &mut Vec<(String, Option<String>)>,
+) {
+    const CHUNK: usize = 999;
+    for chunk in params.chunks(CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{sql_prefix} ({placeholders})");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        out.push(r);
+                    }
+                });
+        }
+    }
+}
+
+/// Per-path proximity boost in `(0.0, 1.0]`, derived from this session's
+/// explored files/symbols: a candidate path gets the *best* (most recent)
+/// connection found among —
+/// - files adjacent to an explored file via `import_edges`, either direction
+/// - files containing a caller of an explored symbol, via `call_edges`
+///
+/// Weight decays with `now - last_touch` (in tool-calls, not wall-clock) via
+/// `1.0 / (1.0 + distance)`, so a file explored on the immediately preceding
+/// call outweighs one from 20 calls ago. Paths with no connection at all are
+/// simply absent from the result (implicit boost 0), not zero-valued
+/// entries — callers should use `.get(path)` and treat a miss as no boost.
+fn compute_proximity_boosts(
+    conn: &rusqlite::Connection,
+    explored_files: &std::collections::HashMap<String, u64>,
+    explored_symbols: &std::collections::HashMap<String, u64>,
+    now: u64,
+) -> std::collections::HashMap<String, f64> {
+    let mut boosts: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let decay = |touch: u64| 1.0 / (1.0 + now.saturating_sub(touch) as f64);
+    let bump = |boosts: &mut std::collections::HashMap<String, f64>, path: String, w: f64| {
+        let entry = boosts.entry(path).or_insert(0.0);
+        if w > *entry {
+            *entry = w;
+        }
+    };
+
+    if !explored_files.is_empty() {
+        let anchors: Vec<String> = explored_files.keys().cloned().collect();
+
+        // Files that import an explored file.
+        let mut importers = Vec::new();
+        query_pairs_chunked(
+            conn,
+            "SELECT from_path, to_path FROM import_edges WHERE to_path IN",
+            " AND from_path IS NOT NULL",
+            &anchors,
+            &mut importers,
+        );
+        for (from_path, to_path) in &importers {
+            if let Some(&touch) = explored_files.get(to_path) {
+                bump(&mut boosts, from_path.clone(), decay(touch));
+            }
+        }
+
+        // Files an explored file imports.
+        let mut imported = Vec::new();
+        query_pairs_chunked(
+            conn,
+            "SELECT from_path, to_path FROM import_edges WHERE from_path IN",
+            " AND to_path IS NOT NULL",
+            &anchors,
+            &mut imported,
+        );
+        for (from_path, to_path) in &imported {
+            if let Some(&touch) = explored_files.get(from_path) {
+                bump(&mut boosts, to_path.clone(), decay(touch));
+            }
+        }
+    }
+
+    if !explored_symbols.is_empty() {
+        let anchors: Vec<String> = explored_symbols.keys().cloned().collect();
+
+        // Files containing a caller of an explored symbol.
+        let mut callers = Vec::new();
+        query_symbol_path_pairs_chunked(
+            conn,
+            "SELECT to_symbol, from_path FROM call_edges WHERE to_symbol IN",
+            &anchors,
+            &mut callers,
+        );
+        for (symbol, from_path) in &callers {
+            if let (Some(&touch), Some(path)) = (explored_symbols.get(symbol), from_path) {
+                bump(&mut boosts, path.clone(), decay(touch));
+            }
+        }
+    }
+
+    boosts
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SymbolInfoOutput {
     pub(crate) name: String,
@@ -688,3 +904,118 @@ pub(crate) fn line_preview(
 // ---------------------------------------------------------------------------
 // Tool 8: dependencies
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod personalization_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ci_core::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn empty_explored_state_yields_no_boosts() {
+        let conn = test_conn();
+        let boosts = compute_proximity_boosts(&conn, &HashMap::new(), &HashMap::new(), 5);
+        assert!(boosts.is_empty());
+    }
+
+    #[test]
+    fn boosts_file_that_imports_an_explored_file() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+            [],
+        )
+        .unwrap();
+        let mut explored_files = HashMap::new();
+        explored_files.insert("b.rs".to_string(), 3u64); // touched at tool-call 3
+
+        let boosts = compute_proximity_boosts(&conn, &explored_files, &HashMap::new(), 4);
+        // now(4) - touch(3) = 1 -> decay = 1/(1+1) = 0.5
+        assert_eq!(boosts.get("a.rs"), Some(&0.5));
+    }
+
+    #[test]
+    fn boosts_file_an_explored_file_imports_too() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('a.rs', 'b.rs', 'b')",
+            [],
+        )
+        .unwrap();
+        let mut explored_files = HashMap::new();
+        explored_files.insert("a.rs".to_string(), 3u64);
+
+        let boosts = compute_proximity_boosts(&conn, &explored_files, &HashMap::new(), 4);
+        assert_eq!(boosts.get("b.rs"), Some(&0.5));
+    }
+
+    #[test]
+    fn more_recent_touch_decays_less_than_older_touch() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('recent.rs', 'anchor.rs', 'anchor')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('stale.rs', 'old_anchor.rs', 'old_anchor')",
+            [],
+        )
+        .unwrap();
+        let mut explored_files = HashMap::new();
+        explored_files.insert("anchor.rs".to_string(), 9u64); // touched 1 call ago
+        explored_files.insert("old_anchor.rs".to_string(), 0u64); // touched 10 calls ago
+
+        let boosts = compute_proximity_boosts(&conn, &explored_files, &HashMap::new(), 10);
+        let recent = boosts["recent.rs"];
+        let stale = boosts["stale.rs"];
+        assert!(
+            recent > stale,
+            "recently-touched anchor must decay less: recent={recent} stale={stale}"
+        );
+    }
+
+    #[test]
+    fn boosts_file_containing_caller_of_an_explored_symbol() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path) \
+             VALUES ('caller_fn', 'target_fn', 'caller_file.rs', 'target_file.rs')",
+            [],
+        )
+        .unwrap();
+        let mut explored_symbols = HashMap::new();
+        explored_symbols.insert("target_fn".to_string(), 2u64);
+
+        let boosts = compute_proximity_boosts(&conn, &HashMap::new(), &explored_symbols, 2);
+        // now(2) - touch(2) = 0 -> decay = 1/(1+0) = 1.0 (just-touched anchor)
+        assert_eq!(boosts.get("caller_file.rs"), Some(&1.0));
+    }
+
+    #[test]
+    fn takes_the_best_boost_when_multiple_anchors_connect_to_the_same_path() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('shared.rs', 'old.rs', 'old')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES ('shared.rs', 'fresh.rs', 'fresh')",
+            [],
+        )
+        .unwrap();
+        let mut explored_files = HashMap::new();
+        explored_files.insert("old.rs".to_string(), 0u64);
+        explored_files.insert("fresh.rs".to_string(), 5u64);
+
+        let boosts = compute_proximity_boosts(&conn, &explored_files, &HashMap::new(), 5);
+        // Must take the fresher connection's weight (1.0), not the older one's (1/6).
+        assert_eq!(boosts.get("shared.rs"), Some(&1.0));
+    }
+}

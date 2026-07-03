@@ -77,8 +77,8 @@ impl CodeIntelligenceServer {
                 let log = self.session_log.lock().unwrap();
                 (
                     log.tool_calls,
-                    log.explored_symbols.iter().cloned().collect::<Vec<_>>(),
-                    log.explored_files.iter().cloned().collect::<Vec<_>>(),
+                    log.explored_symbols.keys().cloned().collect::<Vec<_>>(),
+                    log.explored_files.keys().cloned().collect::<Vec<_>>(),
                     log.session_started_at.clone(),
                 )
             };

@@ -37,7 +37,8 @@ impl CodeIntelligenceServer {
                 self.embedder().as_deref(),
                 rrf_k,
             ) {
-                Ok(output) => {
+                Ok(mut output) => {
+                    let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                     let results: Vec<SearchResultItem> = output
                         .results
                         .into_iter()
@@ -68,6 +69,7 @@ impl CodeIntelligenceServer {
                         truncated: output.truncated,
                         degraded: output.degraded,
                         note: output.note,
+                        personalized,
                         suggested_next: self.filter_sn(sn),
                     })
                     .unwrap_or_default()
@@ -77,6 +79,7 @@ impl CodeIntelligenceServer {
                     truncated: false,
                     degraded: true,
                     note: Some(format!("Search error: {e}")),
+                    personalized: false,
                     suggested_next: None,
                 })
                 .unwrap_or_default(),
@@ -106,7 +109,8 @@ impl CodeIntelligenceServer {
             &ignore_patterns,
             p.limit,
         ) {
-            Ok(output) => {
+            Ok(mut output) => {
+                let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                 let results: Vec<SearchResultItem> = output
                     .results
                     .into_iter()
@@ -135,6 +139,7 @@ impl CodeIntelligenceServer {
                     truncated: output.truncated,
                     degraded: output.degraded,
                     note: output.note,
+                    personalized,
                     suggested_next: self.filter_sn(sn),
                 })
                 .unwrap_or_default()
@@ -144,6 +149,7 @@ impl CodeIntelligenceServer {
                 truncated: false,
                 degraded: true,
                 note: Some(format!("grep search error: {e}")),
+                personalized: false,
                 suggested_next: None,
             })
             .unwrap_or_default(),
@@ -174,7 +180,7 @@ impl CodeIntelligenceServer {
             let rrf_k = ci_core::config::load_config(&self.project_root)
                 .map(|c| c.search.rrf_k as f64)
                 .unwrap_or(ci_core::search::DEFAULT_RRF_K);
-            let search_output = match ci_core::search::search(
+            let mut search_output = match ci_core::search::search(
                 &conn,
                 &p.query,
                 kind,
@@ -194,6 +200,8 @@ impl CodeIntelligenceServer {
                     .unwrap_or_default();
                 }
             };
+            let personalized =
+                self.apply_personalization_boost(&conn, &mut search_output.results);
 
             let results: Vec<SearchResultItem> = search_output
                 .results
@@ -299,6 +307,7 @@ impl CodeIntelligenceServer {
                 file_overview,
                 truncated,
                 depth_adjusted,
+                personalized,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -415,6 +424,11 @@ pub(crate) struct SearchOutput {
     pub(crate) degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
+    /// `true` when results were re-ranked toward this session's explored
+    /// files/symbols (see `CodeIntelligenceServer::apply_personalization_boost`)
+    /// — `false` for a cold session (nothing explored yet) or when
+    /// `search.personalization_weight` is configured to `0.0`.
+    pub(crate) personalized: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -544,6 +558,8 @@ pub(crate) struct LocateOutput {
     /// downgraded to `with_file`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) depth_adjusted: Option<String>,
+    /// See `SearchOutput::personalized`.
+    pub(crate) personalized: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

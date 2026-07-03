@@ -127,8 +127,7 @@ impl CodeIntelligenceServer {
             return false;
         }
 
-        let boosts =
-            compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
+        let boosts = compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
         if boosts.is_empty() {
             return false;
         }

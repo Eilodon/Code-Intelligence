@@ -221,18 +221,8 @@ mod tests {
     #[test]
     fn store_refs_replaces_previous_set_for_same_topic() {
         let conn = test_conn();
-        store_refs(
-            &conn,
-            "t",
-            &[("a.rs".to_string(), "hash_a".to_string())],
-        )
-        .unwrap();
-        store_refs(
-            &conn,
-            "t",
-            &[("b.rs".to_string(), "hash_b".to_string())],
-        )
-        .unwrap();
+        store_refs(&conn, "t", &[("a.rs".to_string(), "hash_a".to_string())]).unwrap();
+        store_refs(&conn, "t", &[("b.rs".to_string(), "hash_b".to_string())]).unwrap();
 
         assert_eq!(ref_count(&conn, "t").unwrap(), 1);
         let dir = temp_project("replace");

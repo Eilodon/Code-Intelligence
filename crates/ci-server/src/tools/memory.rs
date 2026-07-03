@@ -104,7 +104,8 @@ impl CodeIntelligenceServer {
             };
 
             let truncated = notes.len() as i64 > RECALL_LIMIT;
-            let mut notes: Vec<MemoryNote> = notes.into_iter().take(RECALL_LIMIT as usize).collect();
+            let mut notes: Vec<MemoryNote> =
+                notes.into_iter().take(RECALL_LIMIT as usize).collect();
 
             // Per note: "unchecked" (no file-path refs were ever captured for
             // it — either the content had none, or none resolved at

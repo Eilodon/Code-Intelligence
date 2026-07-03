@@ -154,6 +154,60 @@ is_definitely_unindexed_path() {
   return 1
 }
 
+# True if `cmd` contains a *real* `git commit`/`git push` invocation — i.e.
+# `git` is the first word of some top-level command segment, not merely the
+# text "commit"/"push" appearing anywhere in the string (a prior version
+# matched \bgit\b.*\b(commit|push)\b against the whole command blob, which
+# fired on e.g. `echo "...git commit..."` piping crafted JSON to this very
+# script during testing — the substring was inside a quoted payload, never
+# executed). Not a full shell parser: splits `cmd` on `;`/`&&`/`||`/`|` into
+# segments (plus the bodies of any `$(...)`/`` `...` `` substitutions, which
+# genuinely execute too, e.g. `RESULT=$(git commit -m x)`), strips a leading
+# VAR=value/sudo/command/exec prefix from each, and requires the first token
+# to be `git`/`*/git` — then walks tokens after it, skipping `-flag` forms
+# (and the separate value token for `-C`/`--git-dir`/`--work-tree`/`-c`)
+# until the first non-flag token, which must be `commit`/`push`. Fails
+# toward catching it (not silently allowing) whenever the parse is
+# ambiguous, same philosophy as `resolve_git_target_root` below.
+is_real_git_commit_or_push() {
+  local cmd="$1" segment first tok i extra
+
+  extra=$(grep -oE '\$\([^()]*\)|`[^`]*`' <<<"$cmd")
+  extra=$(sed -E 's/^\$\(//; s/\)$//; s/^`//; s/`$//' <<<"$extra")
+
+  while IFS= read -r segment; do
+    [ -z "$segment" ] && continue
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    while [[ "$segment" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+(.*)$ ]]; do
+      segment="${BASH_REMATCH[1]}"
+    done
+    segment="${segment#sudo }"
+    segment="${segment#command }"
+    segment="${segment#exec }"
+
+    read -r -a tokens <<<"$segment"
+    first="${tokens[0]:-}"
+    [[ "$first" == "git" || "$first" == */git ]] || continue
+
+    i=1
+    while [ "$i" -lt "${#tokens[@]}" ]; do
+      tok="${tokens[$i]}"
+      case "$tok" in
+        -C | --git-dir | --work-tree | -c)
+          i=$((i + 2)) ;;
+        -*)
+          i=$((i + 1)) ;;
+        commit | push)
+          return 0 ;;
+        *)
+          break ;;
+      esac
+    done
+  done < <(printf '%s\n%s\n' "$cmd" "$extra" | sed -E 's/&&|\|\||[;|]/\n/g')
+
+  return 1
+}
+
 # Resolve the git repo root that `cmd` will actually operate on, so the
 # commit/push gate only fires for *this* project's repo — not an unrelated
 # repo the agent is inspecting/debugging elsewhere (e.g. a scratch clone
@@ -230,13 +284,7 @@ case "$tool_name" in
     nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__ci__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__ci__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
     ;;
   Bash)
-    # Broad on purpose: `git -C <dir> commit` / `git --git-dir=<dir> push` put
-    # flags between the subcommand and "commit"/"push", so a tight
-    # `git commit` adjacency check misses them entirely (a false negative —
-    # worse than the false positive this file otherwise guards against).
-    # resolve_git_target_root() + the scope check below is what keeps this
-    # broad match from over-firing on unrelated repos.
-    if grep -qE '\bgit\b.*\b(commit|push)\b' <<<"$command"; then
+    if is_real_git_commit_or_push "$command"; then
       if [ "$needs_diff_impact" = "true" ]; then
         target_root=$(resolve_git_target_root "$command")
         project_root=$(git rev-parse --show-toplevel 2>/dev/null)

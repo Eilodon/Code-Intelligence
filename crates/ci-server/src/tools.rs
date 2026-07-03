@@ -1018,6 +1018,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `.rs` file under a dotdir (e.g. `.claude/`) has a recognized source
+    /// extension but sits in a path the walker never descends into (see
+    /// `ci_core::walk::path_has_ignored_dir_component`) — must be
+    /// "out_of_scope", not "pending_scan" (which would wrongly imply
+    /// `indexing_status` will eventually resolve it — it never will).
+    /// Regression: the classifier used to check extension only, not path.
+    #[test]
+    fn diff_impact_dotdir_file_with_source_extension_is_out_of_scope_not_pending_scan() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_diff_impact_dotdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let diff = "diff --git a/.claude/hooks/fake.rs b/.claude/hooks/fake.rs\n\
+                     new file mode 100644\n\
+                     --- /dev/null\n\
+                     +++ b/.claude/hooks/fake.rs\n\
+                     @@ -0,0 +1,1 @@\n\
+                     +fn fake() {}\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": ".claude/hooks/fake.rs", "reason": "out_of_scope"}])
+        );
+        assert_eq!(
+            v["aggregate_risk"], "low",
+            "a dotdir file must not poison aggregate_risk to unknown just because its extension looks like source"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A file that *has* been scanned (file_index row present) but has zero
     /// symbols (e.g. a Rust `mod.rs` that's only `pub mod` statements) must
     /// not appear in `unindexed_files` at all — it is fully indexed, just
@@ -2478,7 +2518,8 @@ mod tests {
 
     #[test]
     fn locate_boosts_result_near_recently_explored_file() {
-        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_locate_personalize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
@@ -2538,7 +2579,8 @@ mod tests {
 
     #[test]
     fn locate_personalization_weight_zero_disables_boost() {
-        let dir = std::env::temp_dir().join(format!("ci_locate_personalize_off_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_locate_personalize_off_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -2920,7 +2962,11 @@ mod tests {
             content: "see `resolver.py` for the tiering logic".into(),
         });
 
-        std::fs::write(dir.join("resolver.py"), "def resolve(): return None  # v2\n").unwrap();
+        std::fs::write(
+            dir.join("resolver.py"),
+            "def resolve(): return None  # v2\n",
+        )
+        .unwrap();
 
         let out = server.recall(RecallParams {
             topic: Some("resolver-note".into()),

@@ -100,9 +100,8 @@ mod tests {
 
     #[test]
     fn extracts_multiple_and_preserves_order() {
-        let refs = extract_path_refs(
-            "db/schema.py (CREATE), indexer/indexer.py (WRITE), tools/* (READ)",
-        );
+        let refs =
+            extract_path_refs("db/schema.py (CREATE), indexer/indexer.py (WRITE), tools/* (READ)");
         assert_eq!(refs, vec!["db/schema.py", "indexer/indexer.py"]);
     }
 
@@ -128,7 +127,11 @@ mod tests {
         );
         assert_eq!(
             refs,
-            vec![".mcp.json", ".cursor/mcp.json", ".github/workflows/release.yml"]
+            vec![
+                ".mcp.json",
+                ".cursor/mcp.json",
+                ".github/workflows/release.yml"
+            ]
         );
     }
 

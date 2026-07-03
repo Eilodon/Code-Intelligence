@@ -1119,6 +1119,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// CommonJS `require()` (real Node.js code, not just ES `import`) must
+    /// feed `import_map`/`import_edges` exactly like `import ... from ...`
+    /// does — see `indexer::imports::parse_js_require`.
+    #[test]
+    fn test_commonjs_require_cross_file_resolved_confidence() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_require_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("helper.js"),
+            "function helper() {}\nmodule.exports = { helper };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.js"),
+            "const { helper } = require('./helper');\n\nfunction run() {\n    helper();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let (to_path, module): (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(to_path,''), module_name FROM import_edges WHERE from_path = 'main.js'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(module, "./helper");
+        assert_eq!(
+            to_path, "helper.js",
+            "require() target resolved to in-project file"
+        );
+
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.js::run' AND to_symbol = 'helper.js::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "resolved",
+            "call through require() should be resolved, not textual"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression: `Type::method()` (a scoped-path call, no `.` receiver) must
     /// resolve *only* against `Type`, not fan out to every same-named symbol
     /// project-wide. Two structs (`StructA`, `StructB`) each define `fn new()`;

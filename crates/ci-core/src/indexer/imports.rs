@@ -151,9 +151,32 @@ fn parse_python_import(text: &str) -> Option<ParsedImport> {
     }
 }
 
+/// Strip an optional leading Rust visibility modifier from `text`, returning the
+/// remainder. Handles `pub`, `pub(crate)`, `pub(super)`, `pub(self)`, and
+/// `pub(in a::b)` — the parenthesized form may contain spaces, so we skip to the
+/// matching `)` rather than splitting on whitespace.
+fn strip_rust_visibility(text: &str) -> &str {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix("pub") else {
+        return t;
+    };
+    let rest = rest.trim_start();
+    match rest.strip_prefix('(') {
+        Some(after) => match after.split_once(')') {
+            Some((_, tail)) => tail.trim_start(),
+            None => rest, // malformed; leave as-is
+        },
+        None => rest,
+    }
+}
+
 fn parse_rust_import(text: &str) -> Option<ParsedImport> {
     // use a::b::c;  use a::b::{c, d};  use a::b as x;  use a::b::*;
-    let rest = text.strip_prefix("use ")?.trim().trim_start_matches("::");
+    // and the pub/pub(...) re-export forms of each.
+    let rest = strip_rust_visibility(text)
+        .strip_prefix("use ")?
+        .trim()
+        .trim_start_matches("::");
     if let Some((prefix, list)) = rest.split_once("::{") {
         let list = list.trim_end_matches('}');
         let names = list.split(',').filter_map(bound_name).collect();
@@ -162,12 +185,25 @@ fn parse_rust_import(text: &str) -> Option<ParsedImport> {
             imported_names: names,
         })
     } else {
-        let module = rest
+        let after_as = rest
             .split_once(" as ")
             .map(|(m, _)| m.trim())
-            .unwrap_or(rest)
-            .trim_end_matches("::*")
-            .to_string();
+            .unwrap_or(rest);
+        let is_glob = after_as.ends_with("::*");
+        let path = after_as.trim_end_matches("::*");
+        // Split the trailing item off the module path (`a::b::Item` -> module
+        // `a::b`, item `Item`), matching the `use a::{b, c}` group branch above.
+        // A glob (`a::b::*`) has no item to split off — `path` is already the
+        // whole module. A bare single-segment `use foo;` also has nothing to
+        // split — module and item are both `foo`.
+        let module = if is_glob {
+            path.to_string()
+        } else {
+            path.rsplit_once("::")
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(path)
+                .to_string()
+        };
         let names = bound_name(rest).into_iter().collect();
         Some(ParsedImport {
             module_name: module,
@@ -330,9 +366,26 @@ mod tests {
     }
 
     #[test]
+    fn rust_pub_use_reexport() {
+        let i = one("pub use engine::Engine;\n", "rust");
+        assert_eq!(i.module_name, "engine");
+        assert_eq!(i.imported_names, vec!["Engine"]);
+    }
+
+    #[test]
+    fn rust_pub_crate_use() {
+        let i = one("pub(crate) use crate::a::b;\n", "rust");
+        assert_eq!(i.module_name, "crate::a");
+        assert_eq!(i.imported_names, vec!["b"]);
+    }
+
+    #[test]
     fn rust_use_single() {
         let i = one("use std::collections::HashMap;\n", "rust");
-        assert_eq!(i.module_name, "std::collections::HashMap");
+        // Corrected alongside the pub-use fix above: the module/item split now
+        // matches the group-import branch (`a::b::{c}` -> module `a::b`) instead
+        // of folding the item into the module path.
+        assert_eq!(i.module_name, "std::collections");
         assert_eq!(i.imported_names, vec!["HashMap"]);
     }
 

@@ -250,8 +250,19 @@ impl CodeIntelligenceServer {
                                     path: row.get(3)?,
                                     line_start: row.get(4)?,
                                     line_end: row.get(5)?,
-                                    signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                                    docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
+                                    // Verbatim source text at index time — redact
+                                    // the same as `source()`'s body (see common.rs's
+                                    // `to_symbol_info`, which this mirrors).
+                                    signature: row
+                                        .get::<_, String>(6)
+                                        .ok()
+                                        .map(|s| ci_core::sanitize::sanitize_source_output(&s))
+                                        .filter(|s| !s.is_empty()),
+                                    docstring: row
+                                        .get::<_, String>(7)
+                                        .ok()
+                                        .map(|s| ci_core::sanitize::sanitize_source_output(&s))
+                                        .filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     coreness: None,
@@ -502,7 +513,9 @@ pub(crate) fn build_file_overview(
                 line_end: row.get(4)?,
                 caller_count: row.get(5)?,
                 is_hub: row.get::<_, i64>(6)? != 0,
-                signature: row.get(7)?,
+                // Verbatim source text at index time — redact the same as
+                // `source()`'s body (see common.rs's `to_symbol_info`).
+                signature: ci_core::sanitize::sanitize_source_output(&row.get::<_, String>(7)?),
             })
         })
         .unwrap()

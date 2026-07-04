@@ -74,8 +74,10 @@ impl CodeIntelligenceServer {
             let sanitized = sanitize_source_output(&source);
 
             let metadata = p.include_metadata.then(|| SourceMetadata {
-                signature: Some(c.signature.clone()).filter(|s| !s.is_empty()),
-                docstring: Some(c.docstring.clone()).filter(|s| !s.is_empty()),
+                // Verbatim source text at index time — redact the same as
+                // the `source` field above (see common.rs's `to_symbol_info`).
+                signature: Some(sanitize_source_output(&c.signature)).filter(|s| !s.is_empty()),
+                docstring: Some(sanitize_source_output(&c.docstring)).filter(|s| !s.is_empty()),
                 caller_count: c.caller_count,
                 is_hub: c.is_hub,
             });
@@ -157,8 +159,19 @@ impl CodeIntelligenceServer {
                                     path: row.get(3)?,
                                     line_start: row.get(4)?,
                                     line_end: row.get(5)?,
-                                    signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                                    docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
+                                    // Verbatim source text at index time — redact
+                                    // the same as this tool's own `source` field
+                                    // below (see common.rs's `to_symbol_info`).
+                                    signature: row
+                                        .get::<_, String>(6)
+                                        .ok()
+                                        .map(|s| sanitize_source_output(&s))
+                                        .filter(|s| !s.is_empty()),
+                                    docstring: row
+                                        .get::<_, String>(7)
+                                        .ok()
+                                        .map(|s| sanitize_source_output(&s))
+                                        .filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
                                     coreness: None,

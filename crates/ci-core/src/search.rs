@@ -517,7 +517,13 @@ pub fn search_grep(
                     matches.push(RawGrepMatch {
                         rel_path: rel_path.clone(),
                         line_no: (idx + 1) as i64,
-                        snippet: build_snippet(&lines, idx, context),
+                        // Raw disk content, never indexed/DB-stored — must be
+                        // redacted here directly, same as `source()`'s body
+                        // text, since this is the only point it ever passes
+                        // through before reaching the caller.
+                        snippet: crate::sanitize::sanitize_source_output(&build_snippet(
+                            &lines, idx, context,
+                        )),
                     });
                 }
             }

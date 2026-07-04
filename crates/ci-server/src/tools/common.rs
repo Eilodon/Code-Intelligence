@@ -450,8 +450,13 @@ impl CandidateRow {
             path: self.path.clone(),
             line_start: self.line_start,
             line_end: self.line_end,
-            signature: Some(self.signature.clone()).filter(|s| !s.is_empty()),
-            docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
+            // Extracted verbatim from source at index time — a default
+            // parameter value or doc-comment example can embed a real secret,
+            // so this must be redacted the same as `source()`'s body text.
+            signature: Some(ci_core::sanitize::sanitize_source_output(&self.signature))
+                .filter(|s| !s.is_empty()),
+            docstring: Some(ci_core::sanitize::sanitize_source_output(&self.docstring))
+                .filter(|s| !s.is_empty()),
             caller_count: self.caller_count,
             is_hub: self.is_hub,
             coreness: None, // set by handler based on edges_ready
@@ -940,15 +945,20 @@ pub(crate) fn line_preview(
     if raw.is_empty() {
         return None;
     }
-    if raw.chars().count() > CALL_SITE_PREVIEW_MAX_CHARS {
+    // Raw disk content, never indexed/DB-stored — redact here directly, same
+    // as `source()`'s body text, since this shared helper is the only point
+    // every caller's preview ever passes through.
+    let sanitized = ci_core::sanitize::sanitize_source_output(raw);
+    if sanitized.chars().count() > CALL_SITE_PREVIEW_MAX_CHARS {
         Some(format!(
             "{}…",
-            raw.chars()
+            sanitized
+                .chars()
                 .take(CALL_SITE_PREVIEW_MAX_CHARS)
                 .collect::<String>()
         ))
     } else {
-        Some(raw.to_string())
+        Some(sanitized)
     }
 }
 

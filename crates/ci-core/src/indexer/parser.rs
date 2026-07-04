@@ -45,7 +45,10 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // `impl`/`impl Trait for` block without a corresponding consumer.
         "impl_item" => SymbolKind::Impl,
         "interface_declaration" => SymbolKind::Interface,
-        "type_declaration" => SymbolKind::Type,
+        // Go's `type_declaration` and TS's `type_alias_declaration` are
+        // distinct grammar node kinds for the same concept (a named type),
+        // so both map to the one SymbolKind here.
+        "type_declaration" | "type_alias_declaration" => SymbolKind::Type,
         // Explicit method nodes are always Method regardless of scope.
         "method_declaration" | "method_definition" => SymbolKind::Method,
         // JS/TS `const foo = () => {}` — treated as a variable holding a function.
@@ -630,6 +633,14 @@ pub struct RawCall {
     /// bare-name fan-out candidates whose own signature can't possibly be
     /// `Option`/`Result` — see its `MAX_CALLEE_CANDIDATES` fallback.
     pub looks_option_or_result_chained: bool,
+    /// The immediate module-path segment just before the callee, when the
+    /// whole callee expression is a lowercase-qualified `::`-path
+    /// (`crate::telemetry::timed_tool` → `Some("telemetry")`) with no `use`
+    /// bringing the name into `file_symbols`/`import_map` — see
+    /// `module_hint_of`. `None` for a `.`-receiver call, a type-qualified
+    /// `Type::method()` call (already carried via `receiver`), or a bare
+    /// unqualified name.
+    pub module_hint: Option<String>,
     pub line: usize,
 }
 
@@ -668,6 +679,37 @@ fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
         Some((if is_type { recv } else { None }, callee, is_type))
     } else {
         Some((None, leading_ident(raw)?, false))
+    }
+}
+
+/// The module-path segment `split_receiver_callee` discards for a lowercase
+/// (non-type-like) `::`-qualified callee, e.g. `crate::telemetry::timed_tool`
+/// or `telemetry::timed_tool` → `Some("telemetry")`.
+///
+/// Without this, a fully-qualified call to a module-level function with no
+/// `use` importing it is textually indistinguishable from a bare unqualified
+/// call of the same name — `resolve_tier1` matches purely on bare name, and
+/// `rebuild_graph`'s same-file preference (see its doc comment) can then bind
+/// to an unrelated same-named symbol that merely happens to share the
+/// caller's own file, silently misresolving the edge (in the worst case, to
+/// a phantom self-recursive edge on the caller itself) instead of the module
+/// actually named in the source. Preserved separately from `receiver` so
+/// tier-2 method resolution (which expects a variable/type name, not a
+/// module) is unaffected — this is consumed only by `rebuild_graph`'s
+/// candidate selection, as a same-strength-as-`same_file` tiebreak that
+/// takes priority when present, since an explicit qualifier in the source
+/// text is stronger evidence than incidental file collocation.
+fn module_hint_of(raw: &str) -> Option<String> {
+    if raw.contains('.') {
+        return None; // dot-form's own receiver already covers this call
+    }
+    let idx = raw.rfind("::")?;
+    let (left, _) = raw.split_at(idx);
+    let seg = left.rsplit("::").next().and_then(leading_ident)?;
+    if is_type_like(&seg) {
+        None // type-qualified — already carried via `receiver`/`receiver_is_type_path`
+    } else {
+        Some(seg)
     }
 }
 
@@ -795,6 +837,7 @@ fn walk_calls(
             callee,
             receiver,
             receiver_is_type_path,
+            module_hint: module_hint_of(&source[fn_node.byte_range()]),
             looks_option_or_result_chained: looks_option_or_result_chained(node, source),
             line: node.start_position().row + 1,
         });
@@ -1684,6 +1727,31 @@ function standalone() {}
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
         assert_eq!(find(&symbols, "arrow").kind, SymbolKind::Variable);
         assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    /// Regression: a TS/DTO-only file (all `export interface`/`export type`,
+    /// no functions/classes) used to extract 0 symbols — `interface_declaration`
+    /// and `type_alias_declaration` were missing from `function_node_types`,
+    /// making such a file entirely invisible to `file_overview`/`search`.
+    #[test]
+    fn test_typescript_interface_and_type_alias_extracted() {
+        let code = r#"
+export interface FooRequest {
+    id: string;
+    count: number;
+}
+
+export type BarResponse = {
+    ok: boolean;
+};
+
+export type Baz = string | number;
+"#;
+        let symbols = extract_symbols(code, "typescript", "mcp_types.ts").unwrap();
+        assert_eq!(symbols.len(), 3, "all three type-level declarations must be extracted");
+        assert_eq!(find(&symbols, "FooRequest").kind, SymbolKind::Interface);
+        assert_eq!(find(&symbols, "BarResponse").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "Baz").kind, SymbolKind::Type);
     }
 
     #[test]

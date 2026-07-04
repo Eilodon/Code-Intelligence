@@ -28,6 +28,11 @@ pub struct HotspotSymbol {
     pub is_hub: bool,
     pub coreness: Option<i64>,
     pub caller_count: i64,
+    /// Disambiguates two same-named symbols in the same file (e.g. a
+    /// `#[cfg(feature)]` real impl vs. its stub) — mirrors `symbol_info`,
+    /// which already carries these for the same reason.
+    pub line_start: i64,
+    pub line_end: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -332,7 +337,7 @@ fn collect_complexity(conn: &Connection) -> HashMap<String, ComplexityInfo> {
 fn query_top_symbols(conn: &Connection, path: &str) -> Vec<HotspotSymbol> {
     let mut stmt = conn
         .prepare(
-            "SELECT name, kind, is_hub, coreness, caller_count \
+            "SELECT name, kind, is_hub, coreness, caller_count, line_start, line_end \
              FROM symbols WHERE path = ? \
              ORDER BY COALESCE(caller_count, 0) DESC, coreness DESC \
              LIMIT 5",
@@ -346,6 +351,8 @@ fn query_top_symbols(conn: &Connection, path: &str) -> Vec<HotspotSymbol> {
             is_hub: row.get::<_, i32>(2).unwrap_or(0) != 0,
             coreness: row.get(3)?,
             caller_count: row.get::<_, i64>(4).unwrap_or(0),
+            line_start: row.get(5)?,
+            line_end: row.get(6)?,
         })
     })
     .unwrap()
@@ -424,6 +431,11 @@ mod tests {
         let syms = output.hotspots[0].top_symbols.as_ref().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "m.foo"); // higher caller_count first
+        // Regression: line_start/line_end must be carried through so two
+        // same-named symbols in one file (e.g. a #[cfg(feature)] real impl
+        // vs. its stub) are distinguishable, same as symbol_info already does.
+        assert_eq!(syms[0].line_start, 1);
+        assert_eq!(syms[0].line_end, 10);
     }
 
     fn insert_test_symbol(conn: &Connection, qname: &str, path: &str, coreness: i64) {

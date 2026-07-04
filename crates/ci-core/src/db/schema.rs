@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     confidence   TEXT NOT NULL DEFAULT 'textual',
     receiver     TEXT,
     target_class TEXT,
-    looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0
+    looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0,
+    module_hint  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -230,6 +231,10 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "looks_option_or_result_chained",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // See parser::module_hint_of — the module-path segment of a
+    // lowercase-qualified `::`-call (`crate::telemetry::timed_tool`), used to
+    // disambiguate same-named candidates by file when there's no `use`.
+    migrate_add_column(conn, "call_sites", "module_hint", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     // Set by the SCIP overlay (`ci_core::scip::ingest`) when a reference at a
     // given call site is proven — via real type-checked evidence — to NOT be

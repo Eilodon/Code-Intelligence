@@ -511,6 +511,11 @@ pub(crate) struct HotspotSymbolOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) coreness: Option<i64>,
     pub(crate) caller_count: i64,
+    /// Disambiguates two same-named symbols in this file (e.g. a
+    /// `#[cfg(feature)]` real impl vs. its stub) — `symbol_info` already
+    /// carries these for the same reason.
+    pub(crate) line_start: i64,
+    pub(crate) line_end: i64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -565,6 +570,8 @@ impl From<ci_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
                         is_hub: s.is_hub,
                         coreness: s.coreness,
                         caller_count: s.caller_count,
+                        line_start: s.line_start,
+                        line_end: s.line_end,
                     })
                     .collect()
             }),

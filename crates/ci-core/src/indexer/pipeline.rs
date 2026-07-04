@@ -59,6 +59,7 @@ type CallSiteRow = (
     String,
     Option<String>,
     bool,
+    Option<String>,
 );
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
@@ -173,6 +174,12 @@ struct CallSiteData {
     receiver: Option<String>,
     target_class: Option<String>,
     looks_option_or_result_chained: bool,
+    /// See `parser::module_hint_of` — the discarded module-path segment of a
+    /// lowercase-qualified `::`-call (`crate::telemetry::timed_tool` →
+    /// `Some("telemetry")`), used by `rebuild_graph` to disambiguate among
+    /// same-named candidates by file when there's no `use` for `resolve_tier1`
+    /// to match against.
+    module_hint: Option<String>,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -352,6 +359,7 @@ fn extract_file_data(
                 receiver: c.receiver.clone(),
                 target_class,
                 looks_option_or_result_chained: c.looks_option_or_result_chained,
+                module_hint: c.module_hint.clone(),
             });
         }
     }
@@ -391,8 +399,8 @@ fn persist_file(
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for c in &extracted.call_sites {
         stmt.execute(rusqlite::params![
@@ -404,6 +412,7 @@ fn persist_file(
             c.receiver,
             c.target_class,
             c.looks_option_or_result_chained as i64,
+            c.module_hint,
         ])?;
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
@@ -459,7 +468,7 @@ fn rebuild_graph(
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
             "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained \
+                    looks_option_or_result_chained, module_hint \
              FROM call_sites",
         )?;
         stmt.query_map([], |r| {
@@ -471,6 +480,7 @@ fn rebuild_graph(
                 r.get::<_, String>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, i64>(6)? != 0,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -501,7 +511,7 @@ fn rebuild_graph(
     let candidates: Vec<Vec<(String, String)>> = sites
         .par_iter()
         .map(
-            |(from_path, _, callee, _, _, target_class, looks_option_or_result_chained)| {
+            |(from_path, _, callee, _, _, target_class, looks_option_or_result_chained, module_hint)| {
                 let targets = match target_class {
                     Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
                     None => by_name.get(callee),
@@ -533,6 +543,31 @@ fn rebuild_graph(
                 if t.is_empty() {
                     return Vec::new();
                 }
+                // Module-qualifier preference: `crate::telemetry::timed_tool()`
+                // carries an explicit, unambiguous module segment in the source
+                // text (see `parser::module_hint_of`) — stronger evidence than
+                // incidental file collocation, so it's checked *before* the
+                // same-file-as-caller fallback below. Without this, a call
+                // site like that one — whose bare callee name also happens to
+                // match a same-named symbol in the caller's OWN file (e.g. a
+                // same-named wrapper method delegating to the free function it
+                // wraps) — silently resolved to that unrelated same-file
+                // symbol instead of the module actually named in the source,
+                // in the worst case fabricating a self-recursive edge.
+                if let Some(hint) = module_hint {
+                    let hinted: Vec<_> = t
+                        .iter()
+                        .filter(|(_, p)| {
+                            Path::new(p.as_str())
+                                .file_stem()
+                                .is_some_and(|stem| stem == hint.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    if !hinted.is_empty() {
+                        return hinted;
+                    }
+                }
                 let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
                 if !same_file.is_empty() {
                     same_file
@@ -547,7 +582,7 @@ fn rebuild_graph(
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
-    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _), targets) in
+    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _, _), targets) in
         sites.iter().zip(candidates.iter())
     {
         // >1 surviving candidate means this call site's edge is duplicated
@@ -578,14 +613,39 @@ fn rebuild_graph(
 
     tx.execute("DELETE FROM call_edges", [])?;
     insert_call_edges_batch(tx, &edges)?;
-    tx.execute(
-        "UPDATE symbols SET caller_count = \
-            (SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE to_symbol = symbols.qualified_name)",
-        [],
-    )?;
+    refresh_caller_counts(tx)?;
     resolve_import_targets(tx, crate_map)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
+    Ok(())
+}
+
+/// Recompute every symbol's `caller_count` from `call_edges`, using the same
+/// "confirmed caller" definition as the `callers` tool's `direct_count`
+/// (`ruled_out_by_scip = 0` and not `ambiguous`-confidence): an `ambiguous`
+/// edge is index-time fan-out to every same-named candidate when a call's
+/// receiver type couldn't be resolved (e.g. `x.as_str()` fanning out to every
+/// `as_str` method in the repo), not a confirmed caller of any one of them.
+/// Counting it here — the previous behavior — inflated `caller_count` nearly
+/// identically across every same-named symbol regardless of real usage,
+/// corrupting the hub/coreness ranking and `dead_code_confidence` (which
+/// short-circuits to "not dead" on `caller_count > 0`) built on top of it.
+///
+/// Called both from [`rebuild_graph`] (after every full/incremental index)
+/// and, separately, after the SCIP overlay pass (`scip::run_overlay`) flips
+/// `ruled_out_by_scip`/`edge_confidence` on existing edges — that pass runs
+/// after this function's other caller, so without a second refresh
+/// afterward, `caller_count` would immediately go stale again relative to
+/// the very columns this filter depends on.
+pub fn refresh_caller_counts(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE symbols SET caller_count = \
+            (SELECT COUNT(DISTINCT from_symbol) FROM call_edges \
+             WHERE to_symbol = symbols.qualified_name \
+               AND ruled_out_by_scip = 0 \
+               AND edge_confidence != 'ambiguous')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1695,6 +1755,71 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the real-world incident this fix addresses (found via
+    /// this repo's own `common.rs::CodeIntelligenceServer::timed_tool`
+    /// delegating to `telemetry.rs::timed_tool` the same way): a same-named
+    /// wrapper method calling a fully-qualified `crate::module::func()` with
+    /// no `use` for it used to resolve to the WRONG same-named symbol — the
+    /// caller's own file, in the worst case a fabricated self-recursive edge
+    /// on the wrapper itself — because the explicit module qualifier was
+    /// discarded before the same-file preference ever saw it. `module_hint`
+    /// must take priority over that preference and route the edge to the
+    /// module actually named in the source.
+    #[test]
+    fn test_qualified_call_resolves_to_named_module_not_same_file_same_name() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_modhint_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("telemetry.rs"),
+            "pub fn timed_tool(name: &str) -> String {\n    name.to_string()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("common.rs"),
+            "pub struct Server;\nimpl Server {\n    pub fn timed_tool(&self, name: &str) -> String {\n        crate::telemetry::timed_tool(name)\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'timed_tool' AND path = 'common.rs') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'timed_tool' AND path = 'telemetry.rs')",
+            ),
+            1,
+            "crate::telemetry::timed_tool(...) must resolve to telemetry.rs's free function"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'timed_tool' AND path = 'common.rs') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'timed_tool' AND path = 'common.rs')",
+            ),
+            0,
+            "must NOT fabricate a self-recursive edge onto common.rs's own same-named method"
+        );
+        let telemetry_caller_count: i64 = conn
+            .query_row(
+                "SELECT caller_count FROM symbols WHERE name = 'timed_tool' AND path = 'telemetry.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            telemetry_caller_count, 1,
+            "telemetry.rs::timed_tool must show its one real caller, not 0"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_tier2_method_resolution() {
         let dir = std::env::temp_dir().join(format!("ci_idx_tier2_{}", std::process::id()));
@@ -2197,6 +2322,82 @@ impl StructB {
                 "fanned-out edge to {path}'s as_str must be marked ambiguous, not textual"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the real-world incident this fix addresses: before it,
+    /// `caller_count` was a blunt `COUNT(DISTINCT from_symbol)` over every
+    /// `call_edges` row regardless of confidence, so an `ambiguous` fan-out
+    /// edge (recorded once per same-named candidate) inflated every
+    /// candidate's `caller_count` almost identically — `Foo::as_str` (zero
+    /// real callers) showed the *same* `caller_count` as `Baz::as_str`
+    /// (one real caller via `self.as_str()`), which fed straight into
+    /// `dead_code_confidence` (short-circuits to "not dead" on
+    /// `caller_count > 0`), hub ranking, and coreness alike.
+    #[test]
+    fn test_caller_count_excludes_ambiguous_fan_out_edges() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ccambig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "pub struct Foo;\nimpl Foo {\n    pub fn as_str(&self) -> &'static str {\n        \"a\"\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "pub struct Baz;\nimpl Baz {\n    pub fn as_str(&self) -> &'static str {\n        \"c\"\n    }\n    pub fn wrapper(&self) -> &'static str {\n        self.as_str()\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("caller.rs"),
+            "fn get_something() -> i32 {\n    0\n}\nfn caller() {\n    let _ = get_something().as_str();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let caller_count = |path: &str| -> i64 {
+            conn.query_row(
+                "SELECT caller_count FROM symbols WHERE name = 'as_str' AND path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            caller_count("a.rs"),
+            0,
+            "Foo::as_str has only an ambiguous fan-out edge, no confirmed caller"
+        );
+        assert_eq!(
+            caller_count("b.rs"),
+            1,
+            "Baz::as_str has exactly one confirmed (resolved, same-file self.as_str()) caller — \
+             the ambiguous fan-out edge to it must not also be counted"
+        );
+
+        // refresh_caller_counts must be independently callable (this is what
+        // the SCIP overlay pass re-invokes after flipping ruled_out_by_scip),
+        // and must reflect that flag too: rule out caller.rs's own edge to
+        // Baz::as_str and confirm its caller_count drops back to 0.
+        conn.execute(
+            "UPDATE call_edges SET ruled_out_by_scip = 1 \
+             WHERE to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'as_str' AND path = 'b.rs') \
+               AND from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'wrapper')",
+            [],
+        )
+        .unwrap();
+        refresh_caller_counts(&conn).unwrap();
+        assert_eq!(
+            caller_count("b.rs"),
+            0,
+            "ruled_out_by_scip=1 edges must be excluded after a refresh_caller_counts() re-run"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

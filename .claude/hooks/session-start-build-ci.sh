@@ -31,6 +31,28 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 0
 fi
 
+# Resolve any unresolved Git LFS pointer stubs (assets/potion-code-16m/* —
+# the vendored embedding model — and .ci-bin/**/ci) BEFORE building. Real
+# incident this guards against: a checkout without git-lfs installed leaves
+# ~130-byte pointer text in place of real file content; `cargo build` still
+# succeeds (it just bakes that pointer text into the binary via
+# `include_bytes!`), and the failure only surfaces later, silently, as
+# `embeddings_status: "failed"` at runtime — not a build error, so nothing
+# here would have caught it otherwise. Every step is best-effort and
+# non-fatal (`|| true`) — this hook must degrade, not break the session, and
+# `Embedder::load`'s own runtime fallback (network download) plus
+# `embeddings_status: "offline_unavailable"` messaging are the safety net if
+# this doesn't fully resolve it (e.g. no apt, no network, git-lfs install
+# blocked). See docs/cloud-environment-setup.md for the full picture.
+if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
+  if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y git-lfs >/dev/null 2>&1 || true
+  fi
+  if git lfs version >/dev/null 2>&1; then
+    git lfs pull >/dev/null 2>&1 || true
+  fi
+fi
+
 build_output=$(cargo build --quiet -p ci-cli 2>&1)
 build_status=$?
 

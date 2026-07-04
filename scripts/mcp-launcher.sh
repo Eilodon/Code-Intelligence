@@ -101,8 +101,16 @@ is_binary_fresh() {
   local bin="$1"
   [ -d crates ] || return 0
   local newer
+  # Also checks vendored assets (crates/ci-core/assets/**, currently just the
+  # embedding model's tokenizer/config/weights) — not just source files.
+  # `include_bytes!` bakes these into the binary at compile time same as any
+  # `.rs` change, so a binary built before `git lfs pull` resolved a
+  # previously-stub asset must be treated as stale too, or this check would
+  # keep serving a binary with the old (possibly LFS-pointer-stub) bytes
+  # baked in even after the asset on disk is fixed — exactly the gap that let
+  # a resolved LFS pull go unnoticed until a manual rebuild.
   newer=$(find crates Cargo.toml Cargo.lock -type f \
-    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -path '*/ci-core/assets/*' \) \
     -newer "$bin" 2>/dev/null | head -1)
   [ -z "$newer" ]
 }

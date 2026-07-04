@@ -90,6 +90,26 @@ and put this in the **Setup script** field:
 # so ~/.cargo/env is not sourced automatically.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
+# Resolve Git LFS assets BEFORE building — a checkout without git-lfs
+# installed leaves ~130-byte pointer stubs in place of the vendored
+# embedding model (crates/ci-core/assets/potion-code-16m/) and the prebuilt
+# .ci-bin/ binary. The build still "succeeds" either way (`include_bytes!`
+# just bakes whatever is on disk into the binary) — this is a real incident,
+# not a hypothetical: it silently degrades semantic search to
+# `embeddings_status: "failed"` at runtime instead of failing the build
+# where it'd be noticed. Best-effort, same `|| true` philosophy as the build
+# below — `Embedder::load`'s own network-fallback and
+# `embeddings_status: "offline_unavailable"` messaging are the safety net
+# if this doesn't fully resolve it.
+if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
+  if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y git-lfs >/dev/null 2>&1 || true
+  fi
+  if git lfs version >/dev/null 2>&1; then
+    git lfs pull >/dev/null 2>&1 || true
+  fi
+fi
+
 # Build the ci-cli binary. The `|| true` is CRITICAL: setup scripts that
 # exit non-zero prevent the session from starting entirely (confirmed in
 # the official docs). A failed build here is non-fatal — the MCP server
@@ -158,6 +178,23 @@ session before any cache exists, or right after the ~7-day cache expiry)
   is already warm), but it's what keeps the binary from going *stale*
   (e.g. after editing `ci`'s own source), and it's the only mechanism at
   all for local/non-cloud Claude Code, which has no Setup Script concept.
+  Also runs the same `git lfs pull` best-effort step as the Setup Script
+  snippet above, before building — see the runtime safety net below for
+  what happens when this doesn't fully resolve it.
+- `Embedder::load`'s network fallback + `embeddings_status:
+  "offline_unavailable"` (`crates/ci-core/src/embedding.rs`,
+  `crates/ci-server/src/lib.rs::bootstrap_embeddings`) — the last line of
+  defense if the LFS pull above still leaves the vendored embedding model
+  asset as a pointer stub (offline environment, apt blocked, etc.):
+  `Embedder::load` detects the stub and falls back to a one-time
+  HuggingFace Hub download of the same default model instead of failing
+  permanently, unless `semantic_search.allow_network_fallback` is
+  explicitly set to `false` — in which case `embeddings_status` reports
+  `"offline_unavailable"` (a known policy outcome) instead of the more
+  generic `"failed"`. `indexing_status(retry_embeddings: true)` re-checks
+  this, so fixing the asset or flipping the config recovers without a
+  restart. This only covers the *embedding model*, not the `ci` binary
+  itself — that's what the two layers above are for.
 
 None of this replaces the Setup Script for cloud sessions — it narrows the
 window and covers the cases the Setup Script can't (local dev, staleness),

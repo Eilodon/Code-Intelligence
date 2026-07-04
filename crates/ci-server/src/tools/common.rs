@@ -213,16 +213,20 @@ impl CodeIntelligenceServer {
 
     /// Re-runs the embedding bootstrap in the background when it previously
     /// failed (model load, vector-table creation, or embedding all set status
-    /// to `Failed`). No-op for any other status: `Ready`/`Embedding`/
-    /// `Downloading` are already done or in flight, and `Disabled` means
-    /// semantic search isn't turned on in config. Opens its own DB connection
-    /// so the retry doesn't hold the shared connection mutex for its duration.
+    /// to `Failed`) or was blocked by offline policy (`OfflineUnavailable` —
+    /// e.g. the caller since flipped `semantic_search.allow_network_fallback`
+    /// to `true` or ran `git lfs pull` and wants to try again). No-op for any
+    /// other status: `Ready`/`Embedding`/`Downloading` are already done or in
+    /// flight, and `Disabled` means semantic search isn't turned on in
+    /// config. Opens its own DB connection so the retry doesn't hold the
+    /// shared connection mutex for its duration.
     pub(crate) fn retry_embeddings_if_failed(&self) {
-        // Claim the retry synchronously (Failed -> Downloading) so two
-        // overlapping `retry_embeddings` requests can't both spawn a bootstrap.
+        // Claim the retry synchronously (Failed/OfflineUnavailable ->
+        // Downloading) so two overlapping `retry_embeddings` requests can't
+        // both spawn a bootstrap.
         {
             let mut status = self.embed_status.write().unwrap();
-            if *status != EmbedStatus::Failed {
+            if *status != EmbedStatus::Failed && *status != EmbedStatus::OfflineUnavailable {
                 return;
             }
             *status = EmbedStatus::Downloading;

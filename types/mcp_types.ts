@@ -44,7 +44,7 @@ export interface RepoOverviewInput {
 export interface RepoOverviewOutput {
   languages: string[];
   indexing_phase: "scanning" | "parsing" | "building_edges" | "ready";
-  embeddings_status: "disabled" | "downloading" | "embedding" | "ready" | "failed";
+  embeddings_status: "disabled" | "downloading" | "embedding" | "ready" | "failed" | "offline_unavailable";
   module_map: {
     name: string;
     path: string;
@@ -319,7 +319,7 @@ export interface IndexingStatusInput {
 export interface IndexingStatusOutput {
   phase: "scanning" | "parsing" | "building_edges" | "ready";
   edges_ready: boolean;
-  embeddings_status: "disabled" | "downloading" | "embedding" | "ready" | "failed";
+  embeddings_status: "disabled" | "downloading" | "embedding" | "ready" | "failed" | "offline_unavailable";
   embeddings_error?: { reason: "download_failed" | "model_corrupt" | "oom" | "embed_failed"; message: string; retry_count: number };
   stats: {
     files_indexed: number;

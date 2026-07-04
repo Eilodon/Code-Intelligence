@@ -102,6 +102,21 @@ pub struct SemanticSearchConfig {
     pub model: String,
     pub dimensions: usize,
     pub index_on_startup: bool,
+    /// When the vendored default-model asset is unusable (e.g. an unresolved
+    /// Git LFS pointer left by a checkout that never ran `git lfs pull`/had
+    /// git-lfs installed — not hypothetical, see the incident this field was
+    /// added for), `true` (default) lets `Embedder::load` fall back to a
+    /// one-time HuggingFace Hub download of the same default model, cached
+    /// locally afterward (`~/.cache/huggingface`) — degrade to *slower on
+    /// this run only*, not permanently `failed`. `false` keeps semantic
+    /// search strictly zero-network: embeddings report
+    /// `embeddings_status: "offline_unavailable"` instead of ever touching
+    /// the network, until the vendored asset is fixed locally. Either way,
+    /// this governs recovery from a *broken local asset* only — it does not
+    /// change plain `search`/`callers`/etc., which never touch the network
+    /// and never send code/repo content anywhere; that guarantee is
+    /// independent of this flag.
+    pub allow_network_fallback: bool,
 }
 
 impl Default for SemanticSearchConfig {
@@ -114,6 +129,7 @@ impl Default for SemanticSearchConfig {
             model: crate::embedding::DEFAULT_MODEL_ID.into(),
             dimensions: 256,
             index_on_startup: true,
+            allow_network_fallback: true,
         }
     }
 }

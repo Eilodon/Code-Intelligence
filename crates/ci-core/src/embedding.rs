@@ -88,6 +88,33 @@ mod imp {
     static DEFAULT_TOKENIZER: &[u8] = include_bytes!("../assets/potion-code-16m/tokenizer.json");
     static DEFAULT_WEIGHTS: &[u8] = include_bytes!("../assets/potion-code-16m/model.safetensors");
 
+    /// True if `bytes` is an unresolved Git LFS pointer stub rather than real
+    /// file content — happens when `git lfs pull`/the smudge filter never ran
+    /// during checkout (e.g. git-lfs not installed in the environment). Real
+    /// model weights are tens of MB; a pointer stub is ~130 bytes starting
+    /// with this exact line (mirrors `is_lfs_pointer` in
+    /// `scripts/mcp-launcher.sh`, which checks the same thing for the
+    /// prebuilt `ci` binary — kept as a separate copy here since that's a
+    /// shell script and this is compiled into the binary itself). Length-
+    /// capped so a real, coincidentally-short binary blob is never misread as
+    /// a pointer. `pub(crate)` (not exported at the module's public surface)
+    /// purely so the `tests` module below — a sibling of `imp`, not a
+    /// descendant — can unit-test the length-cap/content-match logic
+    /// directly instead of only indirectly through `default_vendored_asset_unusable`.
+    pub(crate) fn is_lfs_pointer_stub(bytes: &[u8]) -> bool {
+        bytes.len() < 512 && bytes.starts_with(b"version https://git-lfs")
+    }
+
+    /// True if the vendored default-model asset baked into this binary is an
+    /// unresolved Git LFS pointer stub, not real weights — checked before
+    /// `Embedder::load` decides whether a network fallback is even needed,
+    /// and exposed publicly so `ci-server`'s `bootstrap_embeddings` can
+    /// short-circuit to `EmbedStatus::OfflineUnavailable` without a network
+    /// attempt when `semantic_search.allow_network_fallback` is `false`.
+    pub fn default_vendored_asset_unusable() -> bool {
+        is_lfs_pointer_stub(DEFAULT_WEIGHTS)
+    }
+
     /// A loaded static embedding model.
     pub struct Embedder {
         model: StaticModel,
@@ -95,11 +122,21 @@ mod imp {
     }
 
     impl Embedder {
-        /// Load `model_id`. The default model id (`DEFAULT_MODEL_ID`) loads
-        /// from the bytes vendored into the binary; any other id (a custom
-        /// model configured via `semantic_search.model`) still resolves via
-        /// `from_pretrained` — a local path, or a HuggingFace Hub download.
-        /// Output is L2-normalised so cosine distance behaves well.
+        /// Load `model_id`. The default model id (`DEFAULT_MODEL_ID`)
+        /// normally loads from the bytes vendored into the binary — zero-I/O,
+        /// zero-network. If that fails (most commonly: the vendored asset is
+        /// an unresolved Git LFS pointer, see `is_lfs_pointer_stub`), this
+        /// automatically falls back to `from_pretrained`, which downloads the
+        /// same default model from the HuggingFace Hub once and caches it
+        /// locally (`~/.cache/huggingface`) — the caller (`bootstrap_embeddings`)
+        /// is expected to have already checked `semantic_search.allow_network_fallback`
+        /// via `default_vendored_asset_unusable` before ever calling this, so
+        /// reaching this fallback here always means the caller already
+        /// consented to a network attempt. A custom model id (configured via
+        /// `semantic_search.model`) always resolves via `from_pretrained` — a
+        /// local path, or a HuggingFace Hub download, same as before this
+        /// fallback existed. Output is L2-normalised so cosine distance
+        /// behaves well.
         ///
         /// `dim` is only a hint (from `semantic_search.dimensions` in
         /// config) — model2vec-rs exposes no API to query a loaded model's
@@ -109,13 +146,37 @@ mod imp {
         /// silently mislabeling every vector this `Embedder` ever produces.
         pub fn load(model_id: &str, dim: usize) -> anyhow::Result<Self> {
             let model = if model_id == DEFAULT_MODEL_ID {
-                StaticModel::from_bytes(
+                match StaticModel::from_bytes(
                     DEFAULT_TOKENIZER,
                     DEFAULT_WEIGHTS,
                     DEFAULT_CONFIG,
                     Some(true),
-                )
-                .map_err(|e| anyhow::anyhow!("load vendored embedding model: {e}"))?
+                ) {
+                    Ok(m) => m,
+                    Err(vendored_err) => {
+                        if is_lfs_pointer_stub(DEFAULT_WEIGHTS) {
+                            tracing::warn!(
+                                "vendored embedding model asset is an unresolved Git LFS \
+                                 pointer (git-lfs not installed, or the checkout skipped the \
+                                 smudge filter) — falling back to a one-time HuggingFace Hub \
+                                 download of '{model_id}', cached locally afterward"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "vendored embedding model failed to load ({vendored_err}) — \
+                                 falling back to a one-time HuggingFace Hub download of \
+                                 '{model_id}', cached locally afterward"
+                            );
+                        }
+                        StaticModel::from_pretrained(DEFAULT_MODEL_ID, None, Some(true), None)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "vendored load failed ({vendored_err}); \
+                                     network fallback also failed: {e}"
+                                )
+                            })?
+                    }
+                }
             } else {
                 StaticModel::from_pretrained(model_id, None, Some(true), None)
                     .map_err(|e| anyhow::anyhow!("load embedding model '{model_id}': {e}"))?
@@ -418,6 +479,13 @@ mod imp {
         Ok(())
     }
 
+    /// Always `false` — there's no vendored asset to be unusable when the
+    /// `embeddings` feature itself is off; `Embedder::load`'s own stub
+    /// failure below is what surfaces this build's real limitation.
+    pub fn default_vendored_asset_unusable() -> bool {
+        false
+    }
+
     /// Stub embedder — `load` always fails, so callers keep `None` and degrade.
     pub struct Embedder;
 
@@ -460,9 +528,9 @@ mod imp {
 }
 
 pub use imp::{
-    Embedder, create_chunk_embedding_table, create_embedding_table, embed_pending,
-    embed_pending_chunks, knn, knn_chunks, prune_orphaned_chunk_vecs, store_chunk_embedding,
-    store_embedding,
+    Embedder, create_chunk_embedding_table, create_embedding_table,
+    default_vendored_asset_unusable, embed_pending, embed_pending_chunks, knn, knn_chunks,
+    prune_orphaned_chunk_vecs, store_chunk_embedding, store_embedding,
 };
 
 #[cfg(test)]
@@ -476,6 +544,49 @@ mod tests {
             "run fn run() does a thing"
         );
         assert_eq!(symbol_doc("run", "", ""), "run");
+    }
+
+    /// Regression for the exact incident this function was added for: a
+    /// checkout without git-lfs installed (or one that skipped the smudge
+    /// filter) leaves `assets/potion-code-16m/model.safetensors` as a ~130-
+    /// byte Git LFS pointer stub instead of real weights — `include_bytes!`
+    /// happily bakes that stub into the binary, and `Embedder::load` used to
+    /// fail permanently (`embeddings_status: "failed"`) with no clear signal
+    /// why. If this test ever fails, `git lfs pull` didn't run before this
+    /// crate was built.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn default_vendored_asset_is_not_an_lfs_pointer() {
+        assert!(
+            !imp::default_vendored_asset_unusable(),
+            "DEFAULT_WEIGHTS looks like an unresolved Git LFS pointer, not real model weights \
+             — run `git lfs pull`"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn is_lfs_pointer_stub_detects_pointer_text_not_real_weights() {
+        let pointer =
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n".as_slice();
+        assert!(imp::is_lfs_pointer_stub(pointer));
+        assert!(
+            !imp::is_lfs_pointer_stub(&[0u8; 1000]),
+            "1000 zero bytes is not a pointer stub by content, regardless of size"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn is_lfs_pointer_stub_length_cap_avoids_false_positive_on_large_content() {
+        let mut huge = b"version https://git-lfs.github.com/spec/v1".to_vec();
+        huge.resize(10_000, 0);
+        assert!(
+            !imp::is_lfs_pointer_stub(&huge),
+            "10KB of content must not be misread as a pointer stub even if it starts \
+             with the marker text — real weights are never this small either way, but \
+             the cap is the actual safety net, not the content match alone"
+        );
     }
 
     /// Regression for the vendored default model (`include_bytes!` in

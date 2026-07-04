@@ -273,8 +273,9 @@ pub(crate) struct SessionContextOutput {
 #[allow(dead_code)]
 pub(crate) struct IndexingStatusParams {
     /// `true` to re-attempt loading the embedding model and re-embedding,
-    /// but only if the current `embeddings_status` is `"failed"` — a no-op
-    /// otherwise (already succeeded, or already in progress).
+    /// but only if the current `embeddings_status` is `"failed"` or
+    /// `"offline_unavailable"` — a no-op otherwise (already succeeded, or
+    /// already in progress).
     #[serde(default)]
     pub(crate) retry_embeddings: bool,
 }

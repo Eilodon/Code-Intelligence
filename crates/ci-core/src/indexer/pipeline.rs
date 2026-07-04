@@ -511,7 +511,16 @@ fn rebuild_graph(
     let candidates: Vec<Vec<(String, String)>> = sites
         .par_iter()
         .map(
-            |(from_path, _, callee, _, _, target_class, looks_option_or_result_chained, module_hint)| {
+            |(
+                from_path,
+                _,
+                callee,
+                _,
+                _,
+                target_class,
+                looks_option_or_result_chained,
+                module_hint,
+            )| {
                 let targets = match target_class {
                     Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
                     None => by_name.get(callee),

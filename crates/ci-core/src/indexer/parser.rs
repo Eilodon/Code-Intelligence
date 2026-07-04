@@ -1748,7 +1748,11 @@ export type BarResponse = {
 export type Baz = string | number;
 "#;
         let symbols = extract_symbols(code, "typescript", "mcp_types.ts").unwrap();
-        assert_eq!(symbols.len(), 3, "all three type-level declarations must be extracted");
+        assert_eq!(
+            symbols.len(),
+            3,
+            "all three type-level declarations must be extracted"
+        );
         assert_eq!(find(&symbols, "FooRequest").kind, SymbolKind::Interface);
         assert_eq!(find(&symbols, "BarResponse").kind, SymbolKind::Type);
         assert_eq!(find(&symbols, "Baz").kind, SymbolKind::Type);

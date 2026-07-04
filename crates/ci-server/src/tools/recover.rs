@@ -51,6 +51,18 @@ impl CodeIntelligenceServer {
                     "Still indexing — poll again or use search/source while edges build",
                 )
             };
+
+            #[cfg(feature = "scip-overlay")]
+            let scip_overlay = {
+                let rust_cfg = ci_core::config::load_config(&self.project_root)
+                    .map(|c| c.rust)
+                    .unwrap_or_default();
+                ci_core::scip::overlay_status(&conn, &self.project_root, &rust_cfg)
+                    .map(ScipOverlayStatusOutput::from)
+            };
+            #[cfg(not(feature = "scip-overlay"))]
+            let scip_overlay: Option<ScipOverlayStatusOutput> = None;
+
             serde_json::to_string_pretty(&IndexingStatusOutput {
                 indexing_phase: phase,
                 files_indexed: files,
@@ -60,6 +72,7 @@ impl CodeIntelligenceServer {
                 embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
+                scip_overlay,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -294,8 +307,51 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) edges_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_updated: Option<String>,
+    /// `None` when this build wasn't compiled with the `scip-overlay` feature,
+    /// or `rust.scip.enabled` is explicitly `false` — nothing to report.
+    /// Otherwise reflects whether Rust call edges are currently up to date
+    /// with SCIP-upgraded (`formal`) confidence — see
+    /// `ci_core::scip::overlay_status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scip_overlay: Option<ScipOverlayStatusOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+/// Local mirror of `ci_core::scip::OverlayStatus` — that type lives in
+/// `ci-core`, which doesn't depend on `schemars`, so it can't derive
+/// `JsonSchema` itself. Only exists when this crate is built with the
+/// `scip-overlay` feature (the same gate `ci_core::scip` itself is behind).
+#[cfg(feature = "scip-overlay")]
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ScipOverlayStatusOutput {
+    /// `rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.
+    pub(crate) available: bool,
+    /// `false` means Rust source has changed since the last overlay run (or
+    /// none has ever run) — the next non-noop incremental reindex will
+    /// actually invoke rust-analyzer again rather than cache-skip.
+    pub(crate) up_to_date: bool,
+}
+
+#[cfg(feature = "scip-overlay")]
+impl From<ci_core::scip::OverlayStatus> for ScipOverlayStatusOutput {
+    fn from(s: ci_core::scip::OverlayStatus) -> Self {
+        Self {
+            available: s.available,
+            up_to_date: s.up_to_date,
+        }
+    }
+}
+
+/// Stub so `IndexingStatusOutput`'s `scip_overlay` field type-checks
+/// identically regardless of the `scip-overlay` feature — always `None` when
+/// this build lacks the feature (see the `#[cfg(not(...))]` binding at the
+/// `indexing_status` call site).
+#[cfg(not(feature = "scip-overlay"))]
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ScipOverlayStatusOutput {
+    pub(crate) available: bool,
+    pub(crate) up_to_date: bool,
 }
 
 // ---------------------------------------------------------------------------

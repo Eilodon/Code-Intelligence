@@ -113,7 +113,8 @@ pub async fn serve_stdio_with_preset(
                 let rust_cfg = ci_core::config::load_config(&indexer_root)
                     .map(|c| c.rust)
                     .unwrap_or_default();
-                match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg) {
+                let dirty = ci_core::scip::rust_source_dirty_keys(&conn);
+                match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg, &dirty) {
                     Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
                         // caller_count was computed by rebuild_graph before this
                         // overlay flipped edge_confidence/ruled_out_by_scip on

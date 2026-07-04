@@ -140,6 +140,53 @@ pub fn run_watch_loop(
                                 tracing::error!("Incremental chunk embedding failed: {e}");
                             }
                         }
+                        // Re-run the SCIP confidence-upgrade overlay so Rust call
+                        // edges touched by *this* reindex don't stay stuck below
+                        // `formal` for the rest of a long-running session — before
+                        // this, `run_overlay` only ever ran once at server startup
+                        // (see `lib.rs`), so any Rust file added/edited afterward
+                        // never got upgraded until the next restart. Cheap when
+                        // nothing Rust-relevant actually changed: `dirty` (the
+                        // current Rust source fingerprint) makes `run_overlay`'s own
+                        // cache key skip re-invoking rust-analyzer in that case —
+                        // see `run_overlay`'s doc comment.
+                        #[cfg(feature = "scip-overlay")]
+                        {
+                            let rust_cfg = ci_core::config::load_config(&project_root)
+                                .map(|c| c.rust)
+                                .unwrap_or_default();
+                            let dirty = ci_core::scip::rust_source_dirty_keys(&conn);
+                            match ci_core::scip::run_overlay(
+                                &conn,
+                                &project_root,
+                                &rust_cfg,
+                                &dirty,
+                            ) {
+                                Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                                    // caller_count was computed by this reindex's
+                                    // rebuild_graph before the overlay flipped
+                                    // edge_confidence/ruled_out_by_scip on some
+                                    // edges — refresh or it goes stale immediately
+                                    // relative to the columns it's filtered on.
+                                    if let Err(e) =
+                                        ci_core::indexer::pipeline::refresh_caller_counts(&conn)
+                                    {
+                                        tracing::warn!(
+                                            "caller_count refresh after incremental SCIP overlay failed: {e}"
+                                        );
+                                    }
+                                    tracing::info!(
+                                        "Incremental SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
+                                        stats.upgraded,
+                                        stats.ruled_out
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    "Incremental SCIP overlay error (base graph intact): {e}"
+                                ),
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!("Incremental reindex failed: {e}"),

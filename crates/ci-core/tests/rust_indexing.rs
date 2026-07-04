@@ -65,6 +65,29 @@ fn crate_relative_import_resolves() {
     assert_eq!(to_path.as_deref(), Some("core/src/engine.rs"));
 }
 
+/// Regression for a `super::sibling` import inside a Rust-2018 `foo.rs` +
+/// `foo/` sibling-submodule layout (`core/src/util.rs` declares `mod alpha;
+/// mod beta;`, both living in `core/src/util/`) — `beta.rs`'s
+/// `use super::alpha::Alpha;` must resolve to the sibling submodule file
+/// `core/src/util/alpha.rs`, not the crate's own `core/src/lib.rs`. Before
+/// the fix, `resolve_rust_module`'s `super` handling always climbed one
+/// filesystem directory (correct only for the older `foo/mod.rs` convention)
+/// and its single-trailing-segment fallback then spuriously matched the
+/// crate root file at the climbed (wrong) directory.
+#[test]
+fn super_sibling_submodule_import_resolves_to_sibling_not_crate_root() {
+    let conn = index_fixture();
+    let to_path: Option<String> = conn
+        .query_row(
+            "SELECT to_path FROM import_edges \
+             WHERE from_path = 'core/src/util/beta.rs' AND module_name = 'super::alpha'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(to_path.as_deref(), Some("core/src/util/alpha.rs"));
+}
+
 #[test]
 fn trait_method_declaration_is_a_symbol() {
     let conn = index_fixture();

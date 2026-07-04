@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod util;
 
 // Re-export façade — the `pub use` bug (#1) makes this invisible today.
 pub use engine::Engine;

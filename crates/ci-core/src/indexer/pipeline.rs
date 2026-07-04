@@ -704,10 +704,19 @@ fn resolve_import_targets(
 /// best-effort `super::`. Returns `None` for paths that leave the workspace
 /// (std, third-party crates) — those correctly keep `to_path = NULL`.
 ///
-/// `super::` climbs one directory per `super` from the importing file's dir.
-/// This is exact for `foo.rs`-style modules and off-by-one for `foo/mod.rs`
-/// modules; the residual is covered by the optional SCIP overlay, so a miss
-/// here simply falls back to today's NULL, never a wrong edge.
+/// `super::` is ambiguous between two real Rust module layouts: the older
+/// `foo/mod.rs`-per-directory convention (climbing one filesystem directory
+/// per `super` is correct) and the modern 2018-edition `foo.rs` + `foo/`
+/// sibling-submodule convention, where files inside `foo/` (e.g.
+/// `tools/common.rs` and `tools/guardrails.rs`, both submodules of `tools`)
+/// are already siblings of each other — so a single `super` hop from one to
+/// reach the other resolves *within the same directory*, not one level up.
+/// For a single `super`, the same-directory hypothesis is tried first (it's
+/// the dominant modern convention, and the one this very codebase uses),
+/// falling back to the climbed-directory interpretation only if that misses.
+/// A miss on both falls back to `None`, never a wrong edge — see
+/// `resolve_candidates`'s `allow_root_fallback` for the guarantee this
+/// depends on.
 fn resolve_rust_module(
     from_path: &str,
     module: &str,
@@ -723,11 +732,14 @@ fn resolve_rust_module(
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
 
-    // (base directory to resolve the remaining segments under, remaining segments)
-    let (base_dir, rest, uniform_guess): (String, &[&str], bool) = match segs[0] {
+    // (base directory to resolve the remaining segments under, remaining
+    // segments, whether a single trailing segment may fall back to base_dir's
+    // OWN `.rs`/`mod.rs`/`lib.rs` file — only sound when base_dir is a
+    // *verified* crate/module root, never a `super`/`self`-climbed ancestor).
+    let (base_dir, rest, allow_root_fallback): (String, &[&str], bool) = match segs[0] {
         "crate" => {
             let (_, root) = crate_map.crate_of_file(from_path)?;
-            (root.to_string(), &segs[1..], false)
+            (root.to_string(), &segs[1..], true)
         }
         "self" => (from_dir.clone(), &segs[1..], false),
         "super" => {
@@ -736,6 +748,11 @@ fn resolve_rust_module(
             while i < segs.len() && segs[i] == "super" {
                 dir = parent_of(&dir);
                 i += 1;
+            }
+            if i == 1
+                && let Some(hit) = resolve_candidates(&from_dir, &segs[1..], false, known)
+            {
+                return Some(hit);
             }
             (dir, &segs[i..], false)
         }
@@ -746,32 +763,51 @@ fn resolve_rust_module(
             // crate root (e.g. `use engine::Engine;` inside that crate's own
             // `lib.rs` means the same as `use crate::engine::Engine;`).
             match crate_map.root_of(&other.replace('-', "_")) {
-                Some(root) => (root.to_string(), &segs[1..], false),
+                Some(root) => (root.to_string(), &segs[1..], true),
                 None => {
                     let (_, root) = crate_map.crate_of_file(from_path)?;
-                    (root.to_string(), segs.as_slice(), true)
+                    (root.to_string(), segs.as_slice(), false)
                 }
             }
         }
     };
 
-    // Try the full remaining path and, for item imports (`use a::b::Item`), its
-    // parent — plus `mod.rs` / crate-root conventions.
+    resolve_candidates(&base_dir, rest, allow_root_fallback, known)
+}
+
+/// Try resolving `rest` (module segments after the `crate`/`self`/`super`/
+/// external-crate prefix has been stripped) under `base_dir` against the set
+/// of indexed files (`known`). Tries the full remaining path and, for item
+/// imports (`use a::b::Item`), its parent directory — plus `mod.rs`/`lib.rs`
+/// directory-index conventions.
+///
+/// `allow_root_fallback` additionally permits a single trailing segment
+/// (`use crate::Item`) to match `base_dir`'s own `.rs`/`mod.rs`/`lib.rs` file
+/// directly — a genuine re-export-at-the-root pattern, but only sound when
+/// `base_dir` is a *verified* crate/module root (the `crate::` branch and the
+/// named-external-crate case, both backed by `CrateMap`). It must stay
+/// `false` for `super`/`self`, where `base_dir` is merely a climbed filesystem
+/// ancestor with no such guarantee: enabling it there previously let a
+/// `super::sibling` import spuriously match the *crate's own* `lib.rs` — a
+/// confidently wrong `to_path` — whenever the climbed ancestor directory
+/// happened to coincide with the crate root, instead of the honest `None`
+/// this function is documented to fall back to on a genuine miss.
+fn resolve_candidates(
+    base_dir: &str,
+    rest: &[&str],
+    allow_root_fallback: bool,
+    known: &HashSet<String>,
+) -> Option<String> {
     let joined = rest.join("/");
     let mut bases: Vec<String> = Vec::new();
     if joined.is_empty() {
-        bases.push(base_dir.clone());
+        bases.push(base_dir.to_string());
     } else {
-        bases.push(join_rel(&base_dir, &joined));
+        bases.push(join_rel(base_dir, &joined));
         if let Some((parent, _)) = joined.rsplit_once('/') {
-            bases.push(join_rel(&base_dir, parent));
-        } else if !uniform_guess {
-            // Single trailing item (`crate::Item`) → the crate root file
-            // itself (an item re-exported at the crate root). Skipped for a
-            // uniform-path guess (`use extern_crate::Item`): its leading
-            // segment is an external crate we only optimistically treated as
-            // local, so it must NOT fall back to this crate's own lib.rs.
-            bases.push(base_dir.clone());
+            bases.push(join_rel(base_dir, parent));
+        } else if allow_root_fallback {
+            bases.push(base_dir.to_string());
         }
     }
 

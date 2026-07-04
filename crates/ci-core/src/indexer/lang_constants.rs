@@ -57,6 +57,13 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
                 "class_declaration",
                 "method_definition",
                 "lexical_declaration",
+                // TypeScript-only (never appear in the JS grammar, so no-op
+                // there): interface/type-alias declarations are otherwise
+                // invisible to the extractor entirely — a TS/DTO-only file
+                // would index as 0 symbols. See node_kind_to_symbol_kind for
+                // the SymbolKind mapping.
+                "interface_declaration",
+                "type_alias_declaration",
             ],
             name_field: "name",
             docstring_type: Some("comment"),

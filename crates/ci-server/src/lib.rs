@@ -114,11 +114,20 @@ pub async fn serve_stdio_with_preset(
                     .map(|c| c.rust)
                     .unwrap_or_default();
                 match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg) {
-                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => tracing::info!(
-                        "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
-                        stats.upgraded,
-                        stats.ruled_out
-                    ),
+                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                        // caller_count was computed by rebuild_graph before this
+                        // overlay flipped edge_confidence/ruled_out_by_scip on
+                        // some edges — refresh it or it goes stale again
+                        // immediately relative to the columns it's filtered on.
+                        if let Err(e) = ci_core::indexer::pipeline::refresh_caller_counts(&conn) {
+                            tracing::warn!("caller_count refresh after SCIP overlay failed: {e}");
+                        }
+                        tracing::info!(
+                            "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
+                            stats.upgraded,
+                            stats.ruled_out
+                        );
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                 }

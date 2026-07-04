@@ -103,8 +103,15 @@ agent: "tôi cần sửa hàm getUserByEmail"
   còn phụ thuộc extension C nào, nên hoạt động giống hệt trên mọi platform release (trước đây
   `sqlite-vec` không compile được trên musl libc, khiến bản Linux/Docker bị tắt semantic). Model mặc
   định (`minishlab/potion-code-16M`, MIT license) được vendor sẵn vào binary lúc compile
-  (`crates/ci-core/assets/potion-code-16m/`, qua Git LFS) — load model mặc định không cần mạng, chỉ
-  model tuỳ biến qua `semantic_search.model` mới tải từ HuggingFace Hub.
+  (`crates/ci-core/assets/potion-code-16m/`, qua Git LFS) — load model mặc định thường không cần
+  mạng. Nếu asset vendor bị hỏng/thiếu (vd checkout thiếu `git-lfs` nên còn nguyên LFS pointer thay
+  vì nội dung thật — không giả định, đã xảy ra thật), `Embedder::load` tự fallback sang tải model
+  mặc định đó qua HuggingFace Hub 1 lần rồi cache local, thay vì `embeddings_status` treo ở
+  `"failed"` vĩnh viễn; set `semantic_search.allow_network_fallback: false` để tắt hẳn fallback này
+  và giữ đúng zero-network tuyệt đối (lúc đó status báo `"offline_unavailable"` thay vì mập mờ). Model
+  tuỳ biến qua `semantic_search.model` luôn tải từ HuggingFace Hub như trước, không đổi. Lưu ý: đây
+  chỉ là tải 1 file model tĩnh, công khai — không liên quan tới cam kết "không gọi ra ngoài" của `ci`
+  (cam kết đó là về code/dữ liệu repo, không phải về việc tải asset).
 - **Grep/glob thật, quét trực tiếp trên đĩa** — `search(kind="grep")` dùng regex thật (crate `regex`)
   + glob filter (`globset`) qua walker tôn trọng `.gitignore`/`.git/info/exclude` thật (crate
   `ignore`), không qua FTS/DB nên phủ được cả file indexer không parse (`Cargo.toml`, `docs/*.md`).

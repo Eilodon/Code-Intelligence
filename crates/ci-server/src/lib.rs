@@ -138,6 +138,21 @@ pub async fn serve_stdio_with_preset(
     Ok(())
 }
 
+/// True when semantic search should stop before ever attempting a network
+/// call: the configured model is the vendored default, that vendored asset
+/// is unusable (see `ci_core::embedding::default_vendored_asset_unusable`),
+/// and the config has not opted into a network fallback. Pulled out as a
+/// pure function (taking the three already-evaluated booleans, not
+/// re-deriving them) so the policy logic is unit-testable without touching
+/// the real vendored asset or the network — see the `tests` module below.
+fn embeddings_blocked_by_offline_policy(
+    is_default_model: bool,
+    vendored_asset_unusable: bool,
+    allow_network_fallback: bool,
+) -> bool {
+    is_default_model && vendored_asset_unusable && !allow_network_fallback
+}
+
 /// Load the embedding model, create the vector table, embed all symbols, and
 /// publish the model + status. Runs on the indexer thread after the graph is
 /// built (and again from `indexing_status`'s `retry_embeddings` after a prior
@@ -149,6 +164,20 @@ pub fn bootstrap_embeddings(
     status: &Arc<RwLock<EmbedStatus>>,
 ) {
     *status.write().unwrap() = EmbedStatus::Downloading;
+    if embeddings_blocked_by_offline_policy(
+        semantic.model == ci_core::embedding::DEFAULT_MODEL_ID,
+        ci_core::embedding::default_vendored_asset_unusable(),
+        semantic.allow_network_fallback,
+    ) {
+        tracing::warn!(
+            "Vendored embedding model is an unresolved Git LFS pointer and \
+             semantic_search.allow_network_fallback is false — embeddings unavailable this \
+             run. Run `git lfs pull` to fix the vendored asset, or set \
+             allow_network_fallback=true to download it instead, then retry_embeddings."
+        );
+        *status.write().unwrap() = EmbedStatus::OfflineUnavailable;
+        return;
+    }
     if semantic.model == ci_core::embedding::DEFAULT_MODEL_ID {
         tracing::info!(
             "Loading embedding model `{}` (vendored in the binary, no network needed)...",
@@ -305,4 +334,36 @@ fn current_git_head_short(project_root: &std::path::Path) -> Option<String> {
     let text = String::from_utf8(output.stdout).ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embeddings_blocked_by_offline_policy as blocked;
+
+    /// All three conditions must hold — a custom (non-default) model, a fine
+    /// vendored asset, or an allowed network fallback each independently
+    /// mean "don't block", only their conjunction does.
+    #[test]
+    fn embeddings_blocked_by_offline_policy_only_when_all_three_conditions_hold() {
+        assert!(
+            blocked(true, true, false),
+            "default model + unusable vendored asset + fallback disabled -> blocked"
+        );
+        assert!(
+            !blocked(false, true, false),
+            "a custom model was never going to use the vendored asset — unaffected"
+        );
+        assert!(
+            !blocked(true, false, false),
+            "vendored asset is fine — no fallback ever needed"
+        );
+        assert!(
+            !blocked(true, true, true),
+            "fallback explicitly allowed — proceed to Embedder::load's own fallback"
+        );
+        assert!(!blocked(false, false, false));
+        assert!(!blocked(false, false, true));
+        assert!(!blocked(false, true, true));
+        assert!(!blocked(true, false, true));
+    }
 }

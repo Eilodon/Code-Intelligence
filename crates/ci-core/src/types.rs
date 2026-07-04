@@ -108,6 +108,14 @@ pub enum EmbedStatus {
     Embedding,
     Ready,
     Failed,
+    /// The vendored default-model asset is unusable (e.g. an unresolved Git
+    /// LFS pointer) and `semantic_search.allow_network_fallback` is `false`,
+    /// so semantic search stays off rather than reaching the network — a
+    /// deliberate policy outcome, distinct from `Failed` (an unexpected
+    /// error). `indexing_status(retry_embeddings: true)` re-checks this the
+    /// same way it reclaims `Failed`, so flipping the config and retrying
+    /// recovers without a restart.
+    OfflineUnavailable,
 }
 
 impl EmbedStatus {
@@ -118,6 +126,7 @@ impl EmbedStatus {
             Self::Embedding => "embedding",
             Self::Ready => "ready",
             Self::Failed => "failed",
+            Self::OfflineUnavailable => "offline_unavailable",
         }
     }
 }

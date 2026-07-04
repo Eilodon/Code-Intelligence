@@ -16,6 +16,13 @@ không phải bảng xếp hạng cố định.
 | **Cursor (indexing built-in)** | Đa ngôn ngữ | Không — embedding-based, không phải graph | Có (qua editor riêng của Cursor, không phải MCP) | Không | Không | Không |
 | **Aider (repo-map)** | Đa ngôn ngữ | Không — PageRank trên tag-map, không phải graph có edge type | Có (qua Aider, không phải MCP tool tương tác) | Không | Không | Có, nhưng đóng trong vòng lặp riêng của Aider |
 
+Bảng trên dựa trên tài liệu công khai (định tính). Cho số đo được bằng tool call thật — cùng
+self-repo corpus, `ci` vs CodeGraph vs Semble — xem
+[`benchmarks/b10_real_competitor_ab/`](../benchmarks/b10_real_competitor_ab/): CodeGraph bỏ sót
+1/2 caller cross-crate mà `ci` bắt được đúng trên task `find_callers`; token ratio thô không nên
+đọc như bảng xếp hạng vì mỗi tool trả lời một mức độ chi tiết khác nhau (chi tiết trong README của
+B10).
+
 ## Vì sao bảng này quan trọng hơn nó trông có vẻ
 
 Một khảo sát độc lập về nhóm công cụ này (2026) kết luận thẳng hai điểm:

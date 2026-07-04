@@ -1,0 +1,66 @@
+# Competitor tool mapping for B9 — reuses the same 4 tasks as tasks.yaml
+# (same anchors, same self-repo corpus) so B9's numbers are directly
+# comparable to B4/B6's `ci` numbers, not a separate task set.
+#
+# codegraph: real MCP tool calls against a `codegraph init`-built .codegraph/
+#            index (colbymchenry/codegraph v1.2.0).
+# semble:    real MCP tool calls against `semble search`/`find_related`
+#            (embedding search, no call graph — tasks it structurally cannot
+#            answer are marked `unsupported: true` and still measured, not
+#            skipped, per this project's "report the bad number" policy).
+
+tasks:
+  - id: read_one_function
+    codegraph:
+      tool: codegraph_node
+      arguments:
+        symbol: run_indexing_pipeline
+        includeCode: true
+    semble:
+      tool: search
+      arguments:
+        query: "run_indexing_pipeline function implementation"
+        repo: "."
+        top_k: 1
+        max_snippet_lines: null
+
+  - id: find_callers
+    codegraph:
+      tool: codegraph_callers
+      arguments:
+        symbol: collect_source_files
+    semble:
+      tool: search
+      arguments:
+        query: "callers of collect_source_files"
+        repo: "."
+        top_k: 5
+        max_snippet_lines: 10
+      unsupported: true
+
+  - id: pre_edit_blast_radius
+    codegraph:
+      tool: codegraph_impact
+      arguments:
+        symbol: reindex_changed
+    semble:
+      tool: search
+      arguments:
+        query: "reindex_changed blast radius impact"
+        repo: "."
+        top_k: 5
+        max_snippet_lines: 10
+      unsupported: true
+
+  - id: locate_and_inspect
+    codegraph:
+      tool: codegraph_explore
+      arguments:
+        query: run_indexing_pipeline
+    semble:
+      tool: search
+      arguments:
+        query: "run_indexing_pipeline"
+        repo: "."
+        top_k: 3
+        max_snippet_lines: 10

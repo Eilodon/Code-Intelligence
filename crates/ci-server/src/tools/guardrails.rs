@@ -120,7 +120,23 @@ impl CodeIntelligenceServer {
                 .map(CoChangedFileOutput::from)
                 .collect();
 
-            let risk = Some(risk_level_from_caller_count(callers.len() as i64).to_string());
+            // `callers` (shown in full above, `ambiguous` entries included so
+            // the caller can judge each one) is not the same count as "risk of
+            // touching this symbol" — an `ambiguous` edge is index-time fan-out
+            // to every same-named candidate when a call's receiver type
+            // couldn't be resolved (see `refresh_caller_counts`'s doc comment),
+            // not a confirmed caller of *this* one. Counting it here inflated
+            // risk to "high" purely from name-collision noise (e.g. a common
+            // method name shared by several unrelated classes) even when the
+            // real, confirmed caller count was low or zero — the same
+            // "confirmed caller" definition `symbols.caller_count` already
+            // uses elsewhere in this codebase, now applied consistently here.
+            let confirmed_caller_count = callers
+                .iter()
+                .filter(|c| c.edge_confidence != "ambiguous")
+                .count();
+            let risk =
+                Some(risk_level_from_caller_count(confirmed_caller_count as i64).to_string());
 
             let trend = ci_core::fitness::compute_trend(
                 &conn,
@@ -290,6 +306,7 @@ impl CodeIntelligenceServer {
                             (line_start, sig_end),
                             fd.is_new_file,
                             &fd.added_lines,
+                            caller_count,
                         );
                         // A symbol that didn't exist before this diff cannot have had
                         // its signature "changed" — there is no prior signature to

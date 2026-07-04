@@ -1421,6 +1421,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for a real production finding from a live QA pass on
+    /// KARMA: a common short method name (e.g. `has`) picks up a dozen-plus
+    /// `ambiguous` fan-out edges from unrelated same-named methods elsewhere
+    /// in the repo (see `rebuild_graph`'s `MAX_CALLEE_CANDIDATES` fallback in
+    /// ci-core). Before this fix, `risk_assessment` counted every entry in
+    /// `callers` regardless of confidence, so this pure name-collision noise
+    /// alone pushed risk to "high" — with zero real, confirmed callers. The
+    /// full `callers` list must still show every entry (so the agent can
+    /// judge each one), but `risk_assessment` must reflect only confirmed
+    /// (non-`ambiguous`) callers, matching the definition `symbols.caller_count`
+    /// already uses elsewhere in this codebase.
+    #[test]
+    fn edit_context_risk_assessment_excludes_ambiguous_callers() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_ambigrisk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('keystore.ts::KeystoreManager::has', 'has', 'method', 'typescript', 'keystore.ts', 1, 1, '', '', 'has', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..12 {
+                let from = format!("unrelated{i}.rs::caller{i}");
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                     VALUES (?1, 'keystore.ts::KeystoreManager::has', ?2, 'keystore.ts', 'ambiguous')",
+                    rusqlite::params![from, format!("unrelated{i}.rs")],
+                )
+                .unwrap();
+            }
+        }
+
+        let output = server.edit_context(EditContextParams {
+            symbol: "has".into(),
+            path: None,
+            line: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["callers"].as_array().unwrap().len(),
+            12,
+            "the full caller list must still surface every ambiguous entry"
+        );
+        assert_eq!(
+            v["risk_assessment"], "low",
+            "12 ambiguous-confidence callers (name-collision noise) must not \
+             read as high risk when zero of them are confirmed — got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `edit_context` must surface files that historically co-changed with
     /// the target symbol's file even though nothing imports/calls between
     /// them — a signal the call graph alone cannot produce.

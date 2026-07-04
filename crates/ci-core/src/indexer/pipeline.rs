@@ -860,6 +860,18 @@ fn resolve_module_to_path(
     if m.starts_with("./") || m.starts_with("../") {
         // JS/TS relative import, resolved against the importing file's directory.
         bases.push(normalize_rel(&from_dir, m));
+        // TS/NodeNext-ESM convention: source imports a sibling `.ts` module
+        // using the *compiled-output* extension (`./foo.js` referring to
+        // `foo.ts` on disk) — required by `"moduleResolution": "node16"` /
+        // `"nodenext"` / `"bundler"` since the emitted JS must contain a
+        // specifier that resolves at runtime. The exact-match candidate
+        // above only ever finds a *real* `.js` file; without this second,
+        // extension-stripped candidate the EXTS loop below can only append
+        // more extensions onto the specifier's own `.js` suffix (producing
+        // nonsense like `foo.js.ts`) and never tries the real `foo.ts`.
+        if let Some(stripped) = strip_js_emit_extension(m) {
+            bases.push(normalize_rel(&from_dir, stripped));
+        }
     } else if let Some(stripped) = m.strip_prefix('.') {
         // Python relative import: leading dots climb packages.
         let ups = m.len() - m.trim_start_matches('.').len();
@@ -915,6 +927,17 @@ fn resolve_module_to_path(
             if known.contains(&c) {
                 return Some(c);
             }
+        }
+    }
+    None
+}
+
+/// Strips a compiled/emitted JS-family extension (`.mjs`/`.cjs`/`.jsx`/`.js`)
+/// from a relative import specifier, or `None` if it doesn't end in one.
+fn strip_js_emit_extension(m: &str) -> Option<&str> {
+    for ext in [".mjs", ".cjs", ".jsx", ".js"] {
+        if let Some(s) = m.strip_suffix(ext) {
+            return Some(s);
         }
     }
     None
@@ -1488,6 +1511,63 @@ mod tests {
         assert_eq!(
             confidence, "resolved",
             "call through require() should be resolved, not textual"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for a real production bug found via a live QA pass on
+    /// KARMA (a TS/NodeNext codebase): `"moduleResolution": "node16"` /
+    /// `"nodenext"` / `"bundler"` requires source files to import a sibling
+    /// `.ts` module using the *compiled-output* extension (`./runtime.js`
+    /// referring to `runtime.ts` on disk) — before this fix, every import
+    /// shaped like this failed to resolve at all (362/362 such edges had a
+    /// NULL `to_path` in KARMA's real index), silently breaking
+    /// `dependencies()`'s `imported_by` for any file imported this way.
+    #[test]
+    fn test_js_extension_import_resolves_to_ts_sibling() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_jsext_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("runtime.ts"),
+            "export class Runtime {\n    start() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.ts"),
+            "import { Runtime } from \"./runtime.js\";\n\nfunction main() {\n    new Runtime().start();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'index.ts' AND module_name = './runtime.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_path.as_deref(),
+            Some("runtime.ts"),
+            "a `.js`-suffixed relative import must resolve to the real `.ts` source file"
+        );
+
+        let imported_by: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM import_edges WHERE to_path = 'runtime.ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            imported_by, 1,
+            "dependencies()'s imported_by relies on to_path being populated"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

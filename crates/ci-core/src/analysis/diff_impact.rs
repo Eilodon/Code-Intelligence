@@ -310,13 +310,28 @@ pub fn signature_text_before_after(fd: &FileDiff, signature_range: (i64, i64)) -
 /// `signature_changed` flag, escalating every brand-new function to "high
 /// risk — all call sites may need update" even though a symbol with zero
 /// prior existence has zero prior call sites.
+///
+/// `caller_count` (the same value already looked up alongside this symbol's
+/// row for `blast_radius`) overrides the line-coverage check: a symbol with
+/// confirmed callers already indexed against its exact qualified name cannot
+/// be new — those edges could only exist if the symbol was already there
+/// when they were indexed. This matters because unified-diff markers alone
+/// can't distinguish "freshly inserted code" from "an existing symbol's
+/// entire body rewritten as one remove-old/add-new hunk" — every line reads
+/// as a `+` addition either way. A diff built from real disk content
+/// (`staged=true`/`commits=`/no-args) never produces that ambiguity for an
+/// unchanged symbol, but a hand-authored `diff` string can.
 pub fn is_new_symbol(
     signature_range: (i64, i64),
     file_is_new: bool,
     added_lines: &std::collections::HashSet<i64>,
+    caller_count: i64,
 ) -> bool {
     if file_is_new {
         return true;
+    }
+    if caller_count > 0 {
+        return false;
     }
     let (start, end) = signature_range;
     start <= end && (start..=end).all(|line| added_lines.contains(&line))
@@ -609,14 +624,15 @@ mod tests {
         assert!(is_new_symbol(
             (5, 7),
             true,
-            &std::collections::HashSet::new()
+            &std::collections::HashSet::new(),
+            0
         ));
     }
 
     #[test]
     fn test_is_new_symbol_all_lines_added() {
         let added: std::collections::HashSet<i64> = (5..=7).collect();
-        assert!(is_new_symbol((5, 7), false, &added));
+        assert!(is_new_symbol((5, 7), false, &added, 0));
     }
 
     #[test]
@@ -625,7 +641,7 @@ mod tests {
         // the signature range is not fully new text, even though its other
         // two lines are.
         let added: std::collections::HashSet<i64> = [5, 7].into_iter().collect();
-        assert!(!is_new_symbol((5, 7), false, &added));
+        assert!(!is_new_symbol((5, 7), false, &added, 0));
     }
 
     #[test]
@@ -633,8 +649,22 @@ mod tests {
         assert!(!is_new_symbol(
             (5, 7),
             false,
-            &std::collections::HashSet::new()
+            &std::collections::HashSet::new(),
+            0
         ));
+    }
+
+    #[test]
+    fn test_is_new_symbol_false_when_caller_count_positive_even_if_all_lines_added() {
+        // Regression for a hand-authored `diff` string (not derived from real
+        // disk content) that rewrites an *existing* symbol as a full
+        // remove-old/add-new hunk: every line in its range reads as a `+`
+        // addition, which the line-coverage check alone can't tell apart from
+        // a genuinely new symbol. A positive caller_count is proof the symbol
+        // was already indexed — and therefore already existed — before this
+        // diff, regardless of how the diff text itself is shaped.
+        let added: std::collections::HashSet<i64> = (5..=7).collect();
+        assert!(!is_new_symbol((5, 7), false, &added, 38));
     }
 
     /// Regression: a realistic git diff for inserting a new function after an

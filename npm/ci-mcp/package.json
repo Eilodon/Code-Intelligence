@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/ci-mcp",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Code Intelligence — MCP server for codebase analysis (Rust binary, no toolchain required to run it)",
   "license": "MIT",
   "homepage": "https://github.com/Eilodon/Code-Intelligence",
@@ -18,8 +18,8 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@eilodon/ci-mcp-linux-x64": "0.1.1",
-    "@eilodon/ci-mcp-linux-arm64": "0.1.1",
-    "@eilodon/ci-mcp-darwin-arm64": "0.1.1"
+    "@eilodon/ci-mcp-linux-x64": "0.1.3",
+    "@eilodon/ci-mcp-linux-arm64": "0.1.3",
+    "@eilodon/ci-mcp-darwin-arm64": "0.1.3"
   }
 }

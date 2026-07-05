@@ -1,290 +1,243 @@
-# Code Intelligence (CI)
+# CALM — Coding Agent Liveness Map
 
-**Code Intelligence** là một [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server
-viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *hiểu* codebase thay vì chỉ
-grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
-cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
-cấp full-text + semantic search + khả năng sửa file trực tiếp (hash-verified, risk-gated) — tất cả
-phục vụ qua 21 MCP tools, chạy local, không gọi ra ngoài.
+**A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
-## Triết lý
+> The CLI binary, MCP server name, crates, and packages are still named `ci` while this rename is staged incrementally — every command below works as written. See [`docs/rename-checklist.md`](docs/rename-checklist.md) for the full plan.
 
-`ci` không chỉ là một MCP server nhiều tool — nó được thiết kế như **bản đồ + trợ lý chủ động** cho
-chính agent đang cầm lái, không phải cho người vận hành đứng ngoài nhìn vào. Mọi response đều có
-`suggested_next` (chỉ đường từng bước, agent hiếm khi phải tự đoán lộ trình); những chỗ rủi ro thật
-sự cao (`edit_context` trước khi sửa, `diff_impact` trước khi commit) được hard-gate chứ không chỉ
-khuyến nghị suông; những chỗ còn lại chỉ nudge mềm, không chặn cứng, để agent vẫn giữ quyền tự
-quyết khi có lý do chính đáng. `fitness_report`, `session_context`'s `pending_diff_impact`/
-`possibly_stuck`, `repo_overview`'s `memory_notes_count` là các tín hiệu chủ động — agent không
-cần tự nhớ "mình đã diff_impact chưa" hay tự đếm "mình có đang loanh quanh không", `ci` tự trả lời
-trước khi được hỏi. Mục tiêu cuối: giảm tải nhận thức cho agent, để agent dồn sức vào phần việc tạo
-giá trị thật, thay vì tự quản lý trạng thái điều hướng.
+---
 
-`ci` không phải công cụ duy nhất trong nhóm "code intelligence cho AI agent" — xem
-[`docs/comparison.md`](docs/comparison.md) để biết vị trí của `ci` so với các lựa chọn khác
-(Serena, CodeGraph, Sourcegraph/Cody, Cursor, Aider...), và khi nào nên/không nên chọn `ci`.
+## The problem
 
-## Vì sao cần cái này?
+An AI agent that edits code without knowing who calls the function it's about to change will, sooner or later:
 
-Khi một AI agent sửa code mà không biết ai đang gọi hàm nó sắp đổi, nó dễ:
-- Xoá "dead code" mà thực ra vẫn có người dùng.
-- Đổi signature mà bỏ sót vài chục call site.
-- Refactor một symbol tưởng nhỏ nhưng hoá ra là hub trung tâm của cả module.
+- Delete "dead code" that a dozen other files still call.
+- Change a signature and miss half its call sites.
+- Refactor a symbol it assumed was minor — and discover, after breaking the build, that it was the hub the whole module leaned on.
 
-`ci` trả lời trực tiếp các câu hỏi đó trước khi agent đụng vào code: "ai gọi hàm này?", "sửa hàm
-này ảnh hưởng bao nhiêu file?", "hàm này có phải hub không?" — thay vì để agent tự đoán qua grep.
+None of that is a reasoning failure. It's a *visibility* failure: the agent never had a map. Give it one, and the guessing stops.
 
-## Quick Start
+## Why "CALM"
+
+Most coding agents operate the way anyone would in an unfamiliar codebase with only `grep`: no sense of what's wired to what, no way to know if touching this function ripples into fourteen others, no memory of the gotcha it worked out an hour ago. That's not confidence — it's fast guessing.
+
+CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is never a stale snapshot — it watches the filesystem, reindexes incrementally as files change, and is honest in every response about how fresh it currently is (`scanning → parsing → building_edges → ready`). *Map*, because it's an actual graph — call edges, import edges, hub/coreness metrics — not a flat text index pretending to be one. Hand an agent a live, trustworthy map of the terrain, and it stops flailing. It gets calm.
+
+## An independent look at this problem — and where CALM sits
+
+"Code intelligence for AI agents" is now a real product category, not a niche — several tools in it have tens of thousands of GitHub stars. A 2026 independent survey of that category landed on two blunt conclusions:
+
+> "No tools [in this category] implement pre-edit safety gates or impact warnings before structural changes."
+>
+> "Memory integration [is] notably absent across all tools — a gap that remains."
+
+Those are the two things CALM is built around: **hard safety gates before risky edits**, and **memory that survives a session restart**. Most tools in this space stop at "help the agent find code faster." CALM adds the step after that: help it know when to *stop and check* before it edits, and stop forcing it to re-derive navigational state (have I run `diff_impact` yet? am I going in circles?) every single turn.
+
+Full comparison against Serena, CodeGraph, GitNexus, Sourcegraph/Cody, Cursor, and Aider — including a real tool-call benchmark, not just marketing copy — lives in [`docs/comparison.md`](docs/comparison.md) (Vietnamese). Short version: CALM trades language breadth (6 languages with a full call graph, vs. e.g. Serena's 40+ via LSP) for depth — confidence-graded edges, hard pre-edit gates, and durable memory that the broader-coverage tools generally don't have.
+
+## Philosophy
+
+CALM isn't a pile of MCP tools bolted together — it's designed as a **map and an active co-pilot for the agent actually holding the wheel**, not a dashboard for a human watching from the sidelines.
+
+- **Every response carries `suggested_next`.** The agent is rarely left guessing what step comes next — the tool that just ran tells it.
+- **The genuinely risky steps are hard-gated, not just recommended.** `edit_context` before any edit, `diff_impact` before any commit — these are enforced, not suggested. Everything lower-stakes just nudges; the agent keeps its own judgment where the cost of being wrong is low.
+- **The signals are proactive, not something the agent has to ask for.** `fitness_report`, `session_context`'s `pending_diff_impact` / `possibly_stuck`, `repo_overview`'s `memory_notes_count` — the agent never has to remember "did I already check impact?" or notice on its own "am I going in circles?". CALM answers before it's asked.
+
+The end goal is reduced cognitive load: the agent spends its budget on the work that actually creates value, not on managing its own navigational bookkeeping.
+
+## Proof, not promises
+
+Numbers are cheap to claim and easy to fake. These are measured, today, by running CALM on its own ~1,350-symbol Rust codebase — not aspirational:
+
+| Metric | Measured value |
+|---|---|
+| Call edges resolved to `formal` (rust-analyzer ground truth) | **1,619 / 2,096 — 77.2%**, up from 0% before the SCIP overlay was wired in |
+| Self dead-code rate (`dead_code_pct`, coverage-aware) | **0.71%** |
+| Hub concentration (`hub_pct`) | 11.5% (well under the 20% gate) |
+| Full test suite (default features) | **574 passed, 0 failed** — reconfirmed 0 failures in 2 more feature-flag combinations (bare minimum, and SCIP overlay explicitly off) |
+| Architecture boundary violations | 0 (declared rules actively enforced, not aspirational) |
+
+That SCIP-overlay number is the one worth pausing on: CALM doesn't just guess at Rust call graphs from syntax — when `rust-analyzer` is on the machine, it silently upgrades the graph to type-checked ground truth, with a hard 120-second timeout and result caching so it never becomes the slow part of your day.
+
+## Quick start
 
 ```bash
-# 1. Build binary
+# 1. Build the binary
 cargo build --release -p ci-cli
 
-# 2. Khởi tạo config cho project
-ci init  --project-root .
+# 2. Initialize config for your project
+ci init --project-root .
 
-# 3. Build index (bao gồm cả semantic embeddings nếu enabled trong config.json)
+# 3. Build the index (embeds symbols too, if semantic search is enabled in config.json)
 ci index --project-root .
 
-# 4. Chạy MCP server (stdio) — tự incremental reindex nếu đã có index
+# 4. Run the MCP server over stdio — incremental reindex kicks in automatically if an index already exists
 ci serve --project-root .
 ```
 
-Repo đã có sẵn config cho Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`)
-và VS Code (`.vscode/mcp.json`) — cả ba đều trỏ vào `scripts/mcp-launcher.sh`,
-một launcher dùng chung: tự tìm binary đã build/cache, tải bản prebuilt đã
-verify checksum nếu đang ở đúng git tag, hoặc build từ source nếu không có
-gì sẵn — clone repo về là chạy được ngay, không cần build tay bước 1 ở trên
-trước. Xem [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) để biết
-cách dùng với Windsurf/JetBrains (config toàn cục, không check-in vào repo
-được) và chi tiết cách launcher hoạt động.
+This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and VS Code (`.vscode/mcp.json`) — all three point at `scripts/mcp-launcher.sh`, a shared launcher that finds an already-built binary, downloads a checksum-verified prebuilt release if you're on a matching git tag, or builds from source if nothing is available yet. Clone the repo and it just works — no manual build step required first. See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese) for Windsurf/JetBrains (global config, can't be checked into a repo) and how the launcher decides what to do.
 
-Không muốn clone repo này về máy? Xem [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) —
-cài bằng `curl | sh` (`scripts/install.sh`) hoặc `npx @eilodon/ci-mcp`, rồi chạy `ci setup` từ
-bên trong project của bạn để tự viết MCP config trỏ vào binary vừa cài.
+Don't want to clone this repo? See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — install via `curl | sh` (`scripts/install.sh`) or `npx @eilodon/ci-mcp`, then run `ci setup` from inside your own project to write MCP config pointing at the binary you just installed.
 
-> **Lưu ý**: `ci serve` tự động thêm `.codeindex/` vào `.gitignore` khi khởi động để tránh
-> commit DB vào repo.
+> **Note:** `ci serve` automatically adds `.codeindex/` to `.gitignore` on startup so the index database never gets committed.
 
-## Ví dụ sử dụng (agent workflow)
+## Example: an agent's actual workflow
 
 ```
 agent: repo_overview()
-  → 41 files, 710 symbols, 101 hub symbols, indexing_phase=ready
+  → 88 files, 1,346 symbols, 130 hub symbols, indexing_phase=ready
 
-agent: "tôi cần sửa hàm getUserByEmail"
-  → locate("getUserByEmail")       # tìm file + symbol metadata
-  → source("getUserByEmail")       # đọc đúng thân hàm, không flood context cả file
-  → edit_context("getUserByEmail") # BẮT BUỘC trước khi sửa
-      → 12 callers, risk_assessment=high → agent review từng caller trước khi đổi signature
-  → edit_symbol("getUserByEmail", expected_hash=..., new_text=...) # sửa trực tiếp, hoặc dùng tool edit khác
-      → risk_assessment=high, is_hub=true, không có confirm:true → bị từ chối kèm giải thích
-  → edit_symbol(..., confirm=true)  # xác nhận đã review xong, ghi thật + reindex ngay
-  → diff_impact(staged=true)       # xác nhận blast radius trước khi commit
+agent: "I need to change getUserByEmail"
+  → locate("getUserByEmail")        # find the file + symbol metadata
+  → source("getUserByEmail")        # read just the function body, not the whole file
+  → edit_context("getUserByEmail")  # MANDATORY before any edit
+      → 12 callers, risk_assessment=high → agent reviews each caller before touching the signature
+  → edit_symbol("getUserByEmail", expected_hash=..., new_text=...)
+      → risk_assessment=high, is_hub=true, no confirm:true → refused, with an explanation
+  → edit_symbol(..., confirm=true)  # confirms the review is done — writes for real, reindexes immediately
+  → diff_impact(staged=true)        # verifies blast radius before commit
 ```
 
-## Tính năng chính
+## How CALM works
 
-- **AST indexing — 6 ngôn ngữ Tier-0** (Python, TypeScript, JavaScript, Java, Rust, Go): parse đầy
-  đủ bằng tree-sitter, dựng call graph + import graph, áp resolver đa cấp.
-- **Shallow indexing — 8 ngôn ngữ Tier-0.5** (C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell): trích
-  xuất symbol bằng line-scan regex; không có call-graph hay import resolution — built-in, không cần
-  feature flag.
-- **Call graph có độ tin cậy** — mỗi edge được gắn nhãn `resolved` / `inferred` / `formal` /
-  `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python
-  và TypeScript/TSX.
-- **Import graph** — file-level dependency graph cho tool `dependencies`.
-- **Graph metrics** — `coreness` (k-core) và `is_hub` để nhận diện symbol trung tâm trước khi sửa.
-  `repo_overview.core_symbols` dùng lại chính `coreness` này để vẽ "khung xương kiến trúc" ngay từ
-  câu gọi đầu tiên (lấy cảm hứng từ repo-map PageRank của Aider, nhưng tận dụng metric đã có sẵn
-  thay vì tính riêng) — loại bỏ symbol trong test file, rỗng cho tới khi `edges_ready`.
-- **Incremental watcher** — chỉ re-parse file thay đổi (FNV-1a hash-diff), rebuild call graph tăng
-  dần; parallel hoá bằng `rayon`. `ci serve` tự động chọn incremental reindex khi đã có index cũ.
-- **Full-text + semantic search** — FTS5 (BM25) kết hợp semantic embeddings (`model2vec-rs`,
-  pure-Rust, không cần ONNX) qua Reciprocal Rank Fusion 3-way (FTS + symbol-identity vector +
-  code-body chunk vector) — tìm được cả khi câu query không trùng tên symbol. KNN là brute-force
-  cosine scan thuần Rust (cache theo path DB trong RAM, không phải re-fetch SQL mỗi query) — không
-  còn phụ thuộc extension C nào, nên hoạt động giống hệt trên mọi platform release (trước đây
-  `sqlite-vec` không compile được trên musl libc, khiến bản Linux/Docker bị tắt semantic). Model mặc
-  định (`minishlab/potion-code-16M`, MIT license) được vendor sẵn vào binary lúc compile
-  (`crates/ci-core/assets/potion-code-16m/`, qua Git LFS) — load model mặc định thường không cần
-  mạng. Nếu asset vendor bị hỏng/thiếu (vd checkout thiếu `git-lfs` nên còn nguyên LFS pointer thay
-  vì nội dung thật — không giả định, đã xảy ra thật), `Embedder::load` tự fallback sang tải model
-  mặc định đó qua HuggingFace Hub 1 lần rồi cache local, thay vì `embeddings_status` treo ở
-  `"failed"` vĩnh viễn; set `semantic_search.allow_network_fallback: false` để tắt hẳn fallback này
-  và giữ đúng zero-network tuyệt đối (lúc đó status báo `"offline_unavailable"` thay vì mập mờ). Model
-  tuỳ biến qua `semantic_search.model` luôn tải từ HuggingFace Hub như trước, không đổi. Lưu ý: đây
-  chỉ là tải 1 file model tĩnh, công khai — không liên quan tới cam kết "không gọi ra ngoài" của `ci`
-  (cam kết đó là về code/dữ liệu repo, không phải về việc tải asset).
-- **Grep/glob thật, quét trực tiếp trên đĩa** — `search(kind="grep")` dùng regex thật (crate `regex`)
-  + glob filter (`globset`) qua walker tôn trọng `.gitignore`/`.git/info/exclude` thật (crate
-  `ignore`), không qua FTS/DB nên phủ được cả file indexer không parse (`Cargo.toml`, `docs/*.md`).
-  Mỗi match được enrich thêm symbol bao quanh (nếu có) qua join ngược vào graph. `search(kind="file")`
-  cũng nhận glob pattern thật (`*.rs`, `src/**`), không chỉ substring như trước.
-- **Sửa file trực tiếp — `edit_lines`/`edit_symbol`** — line-range write tool duy nhất của `ci`, hoạt
-  động trên mọi file track được (không chỉ symbol đã parse). Conflict guard bằng hash nội dung
-  (FNV-1a) theo đúng range — sai hash bị từ chối và trả lại hash/nội dung hiện tại để đọc lại; nhiều
-  hunk trong 1 lệnh áp dụng bottom-up để không lệch offset giữa các hunk. Validate cú pháp bằng
-  tree-sitter **trước khi ghi đĩa** (từ chối nếu phát sinh lỗi cú pháp, không ghi gì). Sửa 1 symbol
-  `is_hub=true` hoặc >10 caller bị từ chối trừ khi có `confirm:true` — chính sách chỉ tool có call
-  graph mới làm được. Ghi file atomic (temp + fsync + rename) và reindex đồng bộ ngay sau khi ghi
-  (không đợi file watcher), response trả kèm risk/callers hậu-sửa như 1 `diff_impact` thu nhỏ.
-- **Index freshness minh bạch** — mọi response đều báo trạng thái index (`scanning → parsing →
-  building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
-- **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
-  khởi động; kết hợp với static analysis cho `dead_code_confidence`.
-- **Output sanitization** — `source`/`understand` redact credentials (PEM key, GitHub/AWS/Slack
-  token, JWT, password assignment...) trước khi trả về, và gắn cờ `content_warning` khi code chứa
-  văn bản giống prompt-injection (`"ignore previous instructions"`, fake `system:` marker...) —
-  không sửa nội dung code, chỉ cảnh báo, vì false positive ở đây sẽ làm hỏng code thật.
-- **Mandatory tools thật sự bắt buộc khi dùng Claude Code** — `.claude/hooks/ci-nudge.sh` (PreToolUse
-  hook, không phải chỉ quy ước trong docs) chặn cứng: `Edit` đầu tiên lên file code mỗi session bị từ
-  chối tới khi gọi `edit_context`; `git commit`/`git push` bị từ chối nếu có file đổi từ lần gọi
-  `diff_impact` gần nhất.
-- **Noise-penalty ranking** — `search`/`locate` hạ điểm (×0.6) kết quả nằm trong file test/generated/
-  example khi có kết quả tương đương ở code thật, để implementation thật lên trước thay vì bị chôn
-  dưới test file trùng tên.
-- **Memory tool (`remember`/`recall`)** — ghi chú diễn giải bền vững (quyết định kiến trúc, gotcha đã
-  gặp) theo topic, sống qua nhiều session/restart — khác `session_context` (chỉ track điều hướng
-  trong 1 session, mất khi server restart). `repo_overview.memory_notes_count` báo số lượng ghi chú
-  đang có (chỉ đếm, không kèm nội dung) — agent tự quyết định có đáng `recall()` hay không, thay vì
-  bị bơm nội dung note vào response một cách bị động.
-- **Git co-change mining** — `edit_context` mine `git log` để tìm file hay đổi cùng lúc với file
-  đang sửa dù không có quan hệ import/call nào (VD model + migration) — tín hiệu coupling logic mà
-  call graph tĩnh không thấy được.
-- **Session progress signal** — `session_context.possibly_stuck`/`calls_since_progress` báo agent
-  đang loanh quanh (10+ tool call không có file/symbol mới) — chỉ mang tính thông tin, không chặn;
-  quyết định dừng vòng lặp vẫn thuộc về host (VD Claude Code's `/goal`).
-- **Build freshness minh bạch** — `ci doctor` in git commit đã build binary (`ci_core::BUILD_INFO`)
-  và so với `HEAD` hiện tại của repo, cảnh báo rõ nếu lệch; `scripts/mcp-launcher.sh` tự kiểm tra
-  mtime của mọi source file trước khi tin một `target/{debug,release}/ci` có sẵn, rebuild nếu cũ hơn
-  thay vì âm thầm chạy binary lỗi thời.
-- **MCP Prompts** — 3 prompt đóng gói sẵn workflow lặp lại nhiều (`review_symbol`, `debug_symbol`,
-  `onboard_area`), MCP client như Claude Code hiện chúng dưới dạng slash-command
-  (`/mcp__ci__review_symbol`). Lưu ý: prompt chỉ trả về 1 message hướng dẫn sẵn, không tự chạy tool
-  — agent vẫn tự gọi từng bước, khác `suggested_next` (gợi ý per-response) ở chỗ đóng gói cả workflow
-  thành 1 lệnh gọi trước khi agent bắt đầu.
+### Multi-tier indexing
+- **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution.
+- **8 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell — get regex/line-scan symbol extraction (no call graph or import resolution). Built in, no feature flag required.
+- **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `ci serve` picks incremental reindex automatically whenever an index already exists.
 
-## Cấu trúc Crates
+### A call graph you can actually trust
+- **Every edge carries a confidence label** — `resolved` / `inferred` / `formal` / `textual` (plus `ambiguous`/`unresolved` fallback tiers when a call site's target genuinely can't be pinned down) — so an agent knows when it's looking at a sure thing versus a best guess.
+- **SCIP overlay (rust-analyzer) for ground truth on Rust** — on by default. Auto-detects `rust-analyzer` on `PATH`/rustup/VS Code and silently does nothing if it isn't there (zero behavior change on a machine without Rust tooling). A hard 120-second timeout kills and falls back to the syntactic graph if it ever runs long; results are cached against `(rust-analyzer version, Cargo.lock hash, changed files)` so it doesn't re-run on every reindex.
+- **Graph metrics — `coreness` (k-core) and `is_hub`** — flag the symbols central enough that touching them is inherently higher-risk. `repo_overview.core_symbols` reuses the same metric to sketch the architecture's "skeleton" on the very first call (inspired by Aider's PageRank repo-map, but built on a metric CALM already computes rather than a separate pass).
 
-- `crates/ci-core/` — Index Engine: tree-sitter parser, SQLite schema, resolver đa cấp (conservative
-  → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
-  symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
-  fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 21 tools + incremental file watcher.
-- `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci setup`, `ci fitness-check`, `ci doctor`.
+### Search that actually finds things
+- **Full-text + semantic search, fused** — FTS5 (BM25) combined with semantic embeddings (`model2vec-rs`, pure Rust, no ONNX) via a 3-way Reciprocal Rank Fusion (text + symbol-identity vector + code-body-chunk vector) — finds relevant code even when the query doesn't share a token with the symbol name. KNN is a brute-force cosine scan in pure Rust with an in-RAM cache — no C vector-search extension, so it behaves identically on every release platform (the previous `sqlite-vec` dependency didn't compile on musl libc, which silently killed semantic search on Linux/Docker builds). The default model (`minishlab/potion-code-16M`, MIT-licensed) is vendored straight into the binary at compile time via Git LFS — no network needed for the default case; a broken LFS checkout falls back to downloading it once from Hugging Face and caching it locally, unless you explicitly opt out to keep a strict zero-network guarantee.
+- **Real grep/glob, straight off disk** — `search(kind="grep")` uses actual regex + glob filtering through a `.gitignore`-respecting walker, bypassing the index entirely — so it reaches files the indexer never parses (`Cargo.toml`, `docs/*.md`) too, each match enriched with its surrounding symbol when one exists.
+- **Noise-penalty ranking** — results living in test/generated/example files are scored down when an equivalent real-implementation result exists, so the actual code surfaces first instead of getting buried under a same-named test fixture.
 
-## CLI Reference
+### Editing with an actual safety net
+- **`edit_lines`/`edit_symbol`** — the one write path, working on any tracked file (not just parsed symbols). A content-hash conflict guard (FNV-1a) on the exact line range rejects stale writes and hands back the current hash/content to re-read; multiple hunks in one call apply bottom-up so offsets never drift between them.
+- **Syntax-validated before it ever touches disk** — `tree-sitter` checks the result parses cleanly; a write that would introduce a syntax error is refused outright, nothing gets written.
+- **Hub and high-fan-in symbols require an explicit `confirm:true`** — a policy only a tool with a real call graph can enforce.
+- **Atomic writes, immediate reindex** — temp file + fsync + rename, then reindexed synchronously (not waiting on the file watcher); the response comes back with post-edit risk/callers, like a miniature `diff_impact`.
+- **Hook-enforced, not just documented** — under Claude Code, `.claude/hooks/ci-nudge.sh` actually blocks the first `Edit` of a session until `edit_context` has been called, and blocks `git commit`/`git push` if files changed since the last `diff_impact`. `session_context`'s `pending_diff_impact` gives the same signal on any other MCP client.
+
+### The codebase grading itself
+- **`ci fitness-check` / `fitness_report`** — 9 metrics (hub concentration, dead code, hotspot risk, edge coverage, cyclomatic complexity, architecture-boundary violations, doc-drift) checked against thresholds in `thresholds.toml`, queryable mid-session or as a CI gate.
+- **Coverage-aware dead-code detection** — auto-detects lcov / `.coverage` / Go `coverage.out` / Cobertura XML at startup and folds real runtime coverage into `dead_code_confidence`, so code a test actually exercises at runtime doesn't get flagged just because the static call graph missed the call site. `scripts/gen-coverage.sh` generates one on demand for this repo itself.
+- **Architecture boundaries — `[[boundaries]]`** — declare "module A must not import module B" directly in `thresholds.toml`, matched by path prefix against the real import graph; every violation is reported with the actual offending file pair, not just a count.
+- **Doc-drift detection — `[config_drift]`** — flags file-path references inside declared docs that no longer point at anything real, so a design doc doesn't quietly keep describing a file that was deleted three refactors ago.
+
+### An agent that remembers, and knows when it's stuck
+- **`remember`/`recall`** — durable, interpretive notes (an architecture decision, a gotcha) keyed by topic, surviving restarts — distinct from `session_context`, which only tracks in-session navigation and resets on restart.
+- **Git co-change mining** — `edit_context` mines `git log` for files that historically change alongside the one being edited despite no import/call relationship (a model and its migration, say) — a coupling signal the static graph can't see on its own.
+- **Session progress signal** — `session_context.possibly_stuck` flags 10+ tool calls with no new file/symbol touched; informational only, the decision to break the loop stays with the host (e.g. Claude Code's `/goal`).
+- **MCP Prompts** — `review_symbol`, `debug_symbol`, `onboard_area` package a full multi-step workflow into one slash-command-style call.
+
+### Honest about its own freshness
+- **Index state machine surfaced everywhere** — `scanning → parsing → building_edges → ready`, so an agent never mistakes stale data for current.
+- **Build-freshness check** — `ci doctor` compares the commit the running binary was built from against the repo's current `HEAD`; `scripts/mcp-launcher.sh` checks source mtimes before trusting an existing `target/{debug,release}/ci`, rebuilding rather than silently serving a stale binary.
+- **Single-instance indexing lock** — only one `ci serve` process per project root ever runs the background indexer/watcher (an OS-level advisory lock); a second concurrent process (e.g. two editor sessions on the same repo) serves tool calls read-only against the same fresh DB instead of racing a redundant reindex against it.
+
+### Safe by default
+- **Output sanitization** — `source`/`understand` redact credential-shaped text (PEM keys, GitHub/AWS/Slack tokens, JWTs, password assignments) before it's ever returned, and flag a `content_warning` when code contains prompt-injection-shaped text (`"ignore previous instructions"`, fake `system:` markers) — flagged, never silently altered, since a false positive there would corrupt real code.
+- **Local-only** — no outbound calls for the code/data path. The one narrow exception is the semantic-search default model download, which is a single public, static file fetch, opt-out-able, and unrelated to your repo's contents ever leaving the machine.
+
+## Crate layout
+
+- `crates/ci-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs or SCIP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
+- `crates/ci-server/` — the MCP server (`rmcp` over stdio), exposing 21 tools plus the incremental file watcher.
+- `crates/ci-cli/` — the CLI: `ci init`, `ci index`, `ci serve`, `ci setup`, `ci fitness-check`, `ci doctor`.
+
+## CLI reference
 
 ```bash
-ci init     --project-root .    # tạo .codeindex/config.json với defaults
+ci init     --project-root .    # writes .codeindex/config.json with defaults
 ci index    --project-root .    # one-shot full index (Scanning → Parsing → BuildingEdges → Ready)
-                                # tự embed symbols+chunks nếu semantic_search.enabled=true
-ci serve    --project-root .    # MCP server qua stdio + incremental reindex + file watcher
-ci serve    --project-root /project --db-path /data/index.db   # tách DB (container deployment)
-ci serve    --project-root . --preset orient   # chỉ đăng ký tools của phase orient
-ci doctor   --project-root .    # kiểm tra config, DB (symbols/files/metrics history), git
-ci setup    --project-root .    # viết/merge MCP config (.mcp.json/.cursor/.vscode) trỏ vào binary này
-ci fitness-check --project-root .                             # CI gate, exit 1 nếu fail
-ci fitness-check --project-root . --json                      # output JSON
-ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
+                                 # also embeds symbols+chunks if semantic_search.enabled=true
+ci serve    --project-root .    # MCP server over stdio + incremental reindex + file watcher
+ci serve    --project-root /project --db-path /data/index.db   # separate DB path (container deployment)
+ci serve    --project-root . --preset orient   # register only the "orient" phase's tools
+ci doctor   --project-root .    # validates config, DB (symbols/files/metrics history), git
+ci setup    --project-root .    # writes/merges MCP config (.mcp.json/.cursor/.vscode) pointing at this binary
+ci fitness-check --project-root .                             # CI gate, exits 1 on failure
+ci fitness-check --project-root . --json                      # JSON output
+ci fitness-check --project-root . --config thresholds.toml    # custom thresholds
 ```
 
-## 21 MCP Tools cho AI agents
+## 21 MCP tools for AI agents
 
-Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
-(mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
-`suggested_next` để hướng dẫn bước tiếp theo — xem chi tiết từng tool và workflow đầy đủ trong
-[AGENTS.md](AGENTS.md).
+CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `ci serve --preset` or the `preset` field in `config.json`. Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
-| Nhóm | Tools |
+| Group | Tools |
 |---|---|
-| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — cùng metrics với `ci fitness-check`, hỏi được giữa phiên), `indexing_status` |
+| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `ci fitness-check`, queryable mid-session), `indexing_status` |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh`; `session_context`'s `pending_diff_impact` là tín hiệu tương đương, hoạt động ở mọi MCP client chứ không riêng Claude Code |
+| Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool — hash-verified, risk-gated), `diff_impact` (mandatory before commit) — the first and last are hook-enforced under Claude Code (see `.claude/hooks/ci-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
 | Recover | `session_context`, `remember`, `recall` |
 
-### MCP Prompts — workflow đóng gói thành slash-command
+### MCP Prompts — workflows packaged as slash-commands
 
-Khác primitive `tools` ở trên — MCP Prompts (`prompts/list`, `prompts/get`) trả về 1 message hướng
-dẫn sẵn cho workflow lặp lại nhiều, MCP client hiện chúng dưới dạng slash-command:
+Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) return a single ready-made instruction message for a workflow you repeat often; MCP clients surface them as slash-commands:
 
-| Prompt | Argument | Workflow đóng gói |
+| Prompt | Argument | Packaged workflow |
 |---|---|---|
-| `review_symbol` | `symbol` | `locate` → `source` → `edit_context` (bắt buộc) → tóm tắt risk trước khi sửa |
-| `debug_symbol` | `symbol` | `understand` → `callers(max_depth=3)` → kiểm tra `test_files`/`dead_code_confidence` |
-| `onboard_area` | `path` | `repo_overview` → `file_overview`/`dependencies` → `hotspots` khoanh vùng path đó |
+| `review_symbol` | `symbol` | `locate` → `source` → `edit_context` (mandatory) → risk summary before touching anything |
+| `debug_symbol` | `symbol` | `understand` → `callers(max_depth=3)` → check `test_files`/`dead_code_confidence` |
+| `onboard_area` | `path` | `repo_overview` → `file_overview`/`dependencies` → `hotspots` scoped to that path |
 
-## Fitness Check — CI Gate
+## Fitness check — the CI gate
 
-`ci fitness-check` đo 9 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` measures 9 metrics against thresholds declared in `thresholds.toml`:
 
-| Metric | Mô tả | Ngưỡng mặc định |
+| Metric | What it measures | Default threshold |
 |---|---|---|
-| `hub_count` | Số symbols được phân loại là hub | ≤ 1000 |
-| `hub_pct` | % symbols là hub trên tổng symbol (scale-invariant) | ≤ 20.0% |
-| `avg_coreness` | Coreness trung bình (k-core) của graph | ≤ 15.0 |
-| `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
-| `hotspot_risk` | Hotspot score cao nhất trong codebase | ≤ 0.75 |
-| `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
-| `high_complexity_pct` | % function/method có cyclomatic complexity > 10 (McCabe, đếm branch qua AST — chỉ 6 ngôn ngữ Tier-0 có parse tree thật; Tier-0.5 luôn báo complexity=1) | ≤ 15.0% |
-| `boundary_violations` | Số `import_edges` phạm luật kiến trúc khai báo trong `[[boundaries]]` | ≤ 0 |
-| `config_drift_count` | Số reference file-path trong doc (khai báo qua `[config_drift].doc_paths`) không trỏ tới file thật nào | ≤ 0 |
+| `hub_count` | Count of symbols classified as hubs | ≤ 1000 |
+| `hub_pct` | % of symbols that are hubs (scale-invariant) | ≤ 20.0% |
+| `avg_coreness` | Average k-core coreness across the graph | ≤ 15.0 |
+| `dead_code_pct` | % of symbols with "high" dead-code confidence | ≤ 10% |
+| `hotspot_risk` | Highest hotspot score in the codebase | ≤ 0.75 |
+| `edge_coverage_pct` | % of symbols with at least one call edge | ≥ 60% |
+| `high_complexity_pct` | % of functions/methods with McCabe cyclomatic complexity > 10 (AST-based; Tier-0.5 languages always report complexity 1) | ≤ 15.0% |
+| `boundary_violations` | Count of `import_edges` violating a declared `[[boundaries]]` rule | ≤ 0 |
+| `config_drift_count` | Count of doc file-path references (declared via `[config_drift].doc_paths`) pointing at nothing real | ≤ 0 |
 
-Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
-trend (delta so với ngày trước).
+Every `ci fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
 
 ### Architecture boundaries — `[[boundaries]]`
 
-Khai báo luật "module A không được import module B" ngay trong `thresholds.toml` (cùng file với
-`[thresholds]`), match theo path-prefix (không phải glob/regex):
+Declare "module A must not import module B" directly in `thresholds.toml` (same file as `[thresholds]`), matched by path prefix (not glob/regex). Note this is for layering Rust's own crate/module boundaries *don't* already enforce — declaring "ci-core must not import ci-server" would be a no-op, since Cargo's dependency graph makes that structurally impossible already:
 
 ```toml
 [[boundaries]]
-from = "crates/ci-core/"
-to = "crates/ci-server/"
-reason = "core không được phụ thuộc server layer"
+from = "crates/ci-core/src/indexer/"
+to = "crates/ci-core/src/analysis/"
+reason = "indexer (extraction) must stay upstream of analysis (dead-code, hotspots, fitness) — not the other way around"
 ```
 
-`ci fitness-check` báo từng vi phạm cụ thể (from/to path thật + rule + reason) khi chạy không kèm
-`--json`; mặc định `max_boundary_violations = 0` — khai báo luật nào là luật đó phải giữ đúng.
+`ci fitness-check` reports each violation concretely (the real from/to path, the rule, and the reason) outside `--json` mode; the default `max_boundary_violations = 0` means a rule you bothered to declare is one you actually keep.
 
 ## Deployment
 
-- `cargo build --release` → binary tĩnh musl qua `.github/workflows/release.yml`, matrix:
-  `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (kèm `SHA256SUMS`),
-  `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` tự tải + verify checksum bản
-  đúng platform khi checkout đang ở đúng git tag — xem
-  [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md).
-- `Containerfile` multi-stage (`rust:alpine` → `scratch`) — single static binary,
-  không cần runtime image nào khác, publish lên `ghcr.io/eilodon/code-intelligence`
-  (tag theo version + `latest`) mỗi khi push git tag.
-- `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
-  `mem_limit: 256m`).
-- Repo dùng Git LFS cho `crates/ci-core/assets/potion-code-16m/*.safetensors` (~61MB) — cần
-  `git lfs install && git lfs pull` để lấy đúng weight file. Không có LFS, `git clone`/`cargo build`
-  vẫn chạy và **compile thành công** (`include_bytes!` chỉ nhúng byte thô, không parse) — nhưng file
-  đó chỉ là pointer text (~130 byte) thay vì model thật, nên lúc **runtime** việc load model sẽ fail
-  ("failed to parse safetensors"), `indexing_status` báo `embeddings_status: "failed"`, và
-  `search(kind="semantic"/"hybrid")` tự động degrade về FTS-only — không crash, nhưng semantic search
-  không hoạt động cho tới khi chạy `git lfs pull` rồi rebuild.
+- `cargo build --release` → static musl binaries via `.github/workflows/release.yml`, matrix: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (with `SHA256SUMS`), `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` downloads and checksum-verifies the right platform's build automatically when checkout is on a matching git tag — see [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese).
+- `Containerfile`, multi-stage (`rust:alpine` → `scratch`) — a single static binary, no runtime image needed, published to `ghcr.io/eilodon/code-intelligence` (tagged by version + `latest`) on every git tag push.
+- `compose.yaml` ships a hardened example (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`, `mem_limit: 256m`).
+- The repo uses Git LFS for `crates/ci-core/assets/potion-code-16m/*.safetensors` (~61MB) — run `git lfs install && git lfs pull` to get the real weight file. Without LFS, `git clone`/`cargo build` still **compiles successfully** (`include_bytes!` just embeds raw bytes without parsing them) — but that file is a ~130-byte LFS pointer instead of the real model, so loading it **at runtime** fails ("failed to parse safetensors"), `indexing_status` reports `embeddings_status: "failed"`, and `search(kind="semantic"/"hybrid")` automatically degrades to FTS-only — no crash, just no semantic search until you run `git lfs pull` and rebuild.
 
 ## Testing
 
 ```bash
-cargo test --workspace                        # unit + integration (mặc định)
-cargo test -p ci-core --features embeddings   # bao gồm semantic/vector path (brute-force cosine KNN)
+cargo test --workspace                        # unit + integration (default features)
+cargo test -p ci-core --features embeddings   # includes the semantic/vector path (brute-force cosine KNN)
 cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 
-Ba CI jobs chạy trên mọi PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus`
-(formal resolver parity), `embeddings` (clippy + test với feature `embeddings`).
+Three CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature).
 
-## Tài liệu kỹ thuật sâu
+## Further reading
 
-Chi tiết resolver internals, ADR, migration plans nằm trong [`docs/`](docs/).
+Resolver internals, ADRs, and migration plans live in [`docs/`](docs/) (mostly Vietnamese) — start with [`docs/comparison.md`](docs/comparison.md) for positioning or [`docs/architecture-design.md`](docs/architecture-design.md) for the technical design.
 
 ## License
 

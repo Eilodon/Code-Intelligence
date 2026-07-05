@@ -59,6 +59,10 @@ trước. Xem [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) để biế
 cách dùng với Windsurf/JetBrains (config toàn cục, không check-in vào repo
 được) và chi tiết cách launcher hoạt động.
 
+Không muốn clone repo này về máy? Xem [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) —
+cài bằng `curl | sh` (`scripts/install.sh`) hoặc `npx @eilodon/ci-mcp`, rồi chạy `ci setup` từ
+bên trong project của bạn để tự viết MCP config trỏ vào binary vừa cài.
+
 > **Lưu ý**: `ci serve` tự động thêm `.codeindex/` vào `.gitignore` khi khởi động để tránh
 > commit DB vào repo.
 
@@ -168,7 +172,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
 - `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 21 tools + incremental file watcher.
-- `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
+- `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci setup`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
 
@@ -180,6 +184,7 @@ ci serve    --project-root .    # MCP server qua stdio + incremental reindex + f
 ci serve    --project-root /project --db-path /data/index.db   # tách DB (container deployment)
 ci serve    --project-root . --preset orient   # chỉ đăng ký tools của phase orient
 ci doctor   --project-root .    # kiểm tra config, DB (symbols/files/metrics history), git
+ci setup    --project-root .    # viết/merge MCP config (.mcp.json/.cursor/.vscode) trỏ vào binary này
 ci fitness-check --project-root .                             # CI gate, exit 1 nếu fail
 ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh

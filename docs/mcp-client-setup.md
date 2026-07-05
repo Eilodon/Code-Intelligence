@@ -5,6 +5,61 @@ là entrypoint dùng chung cho **mọi** client MCP nói stdio (Claude Code, Cur
 VS Code, Windsurf, JetBrains, hoặc bất kỳ tool nào có thể spawn một command).
 File này giải thích launcher hoạt động ra sao và cách trỏ từng client vào nó.
 
+## Không muốn clone cả repo? — cài thẳng binary `ci`
+
+Phần "Launcher resolve binary theo 3 tầng" bên dưới mô tả cách self-host
+**trong chính checkout** của Code-Intelligence (dùng tốt nếu bạn đang dev
+`ci`, hoặc project của bạn chính là repo này). Nếu bạn chỉ muốn dùng `ci`
+như một MCP server bình thường cho **project khác**, không cần checkout gì
+cả, có 2 cách:
+
+### 1. Install script (không cần Node)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Eilodon/Code-Intelligence/main/scripts/install.sh | sh
+```
+
+Tải đúng prebuilt binary cho platform hiện tại (Linux x86_64/aarch64, macOS
+Apple Silicon — cùng matrix 3 platform mà `release.yml` build), verify
+SHA256 với `SHA256SUMS` publish kèm release, cài vào `~/.local/bin/ci`
+(đổi qua biến `CI_INSTALL_DIR`). Không có tầng build-from-source — không có
+source checkout để build; platform chưa hỗ trợ thì tự `git clone` +
+`cargo build --release --bin ci` theo README thay vì tự động fallback.
+
+### 2. npm (`@eilodon/ci-mcp`)
+
+```json
+{
+  "mcpServers": {
+    "ci": {
+      "command": "npx",
+      "args": ["-y", "@eilodon/ci-mcp", "serve"]
+    }
+  }
+}
+```
+
+Package JS mỏng, tự chọn đúng binary prebuilt cho platform qua
+`optionalDependencies` (không postinstall tải mạng — binary nằm sẵn trong
+tarball npm). Xem [`../npm/README.md`](../npm/README.md) để biết cách
+publish/kiểm tra package này.
+
+### Sau khi cài xong bằng 1 trong 2 cách trên: `ci setup`
+
+Từ bên trong project bạn muốn `ci` phân tích:
+
+```bash
+ci setup
+```
+
+Tự viết/merge entry `"ci"` vào `.mcp.json`, `.cursor/mcp.json`,
+`.vscode/mcp.json` trong project đó — không đụng tới các entry khác đã có
+sẵn — trỏ thẳng vào binary vừa cài. Đã có entry `"ci"` trỏ chỗ khác (ví dụ
+bạn từng dùng launcher script) thì `ci setup` mặc định để yên, dùng
+`ci setup --force` nếu thật sự muốn ghi đè. Windsurf/JetBrains vẫn phải dán
+tay (xem 2 phần riêng bên dưới) vì đó là global config, không phải
+project-level.
+
 ## Launcher resolve binary theo 3 tầng
 
 `scripts/mcp-launcher.sh` luôn thử theo đúng thứ tự sau, dùng ngay binary đầu

@@ -232,6 +232,7 @@ dependencies = [
  "clap",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -18,6 +18,9 @@ clap = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["embeddings", "tier0-5"]
 embeddings = ["ci-core/embeddings", "ci-server/embeddings"]

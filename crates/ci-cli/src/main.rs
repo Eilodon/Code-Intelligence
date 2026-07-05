@@ -58,6 +58,19 @@ enum Commands {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
     },
+    /// Write MCP client config (.mcp.json, .cursor/mcp.json,
+    /// .vscode/mcp.json) pointing at this binary, so an external project
+    /// can use `ci` as its MCP server without checking out this repo.
+    Setup {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Overwrite an existing "ci" entry even if it points somewhere
+        /// else (e.g. this repo's own scripts/mcp-launcher.sh wiring)
+        /// instead of leaving it alone
+        #[arg(long)]
+        force: bool,
+    },
     /// Decode a `.scip` index file to JSON lines (hidden; used by the B2
     /// call-graph-quality benchmark to get oracle occurrences without
     /// duplicating SCIP protobuf parsing outside ci-core).
@@ -294,7 +307,218 @@ async fn main() -> Result<()> {
                 root.display()
             );
         }
+        Commands::Setup {
+            project_root,
+            force,
+        } => {
+            let root = std::fs::canonicalize(&project_root)?;
+            let bin_path = std::env::current_exe()?;
+            let bin_str = bin_path.to_string_lossy().to_string();
+
+            println!("Configuring MCP clients in {}", root.display());
+            println!();
+
+            // (relative path, top-level JSON key) — VS Code alone uses
+            // "servers", not "mcpServers", for its top-level field; same
+            // command/args shape otherwise.
+            const TARGETS: [(&str, &str); 3] = [
+                (".mcp.json", "mcpServers"),
+                (".cursor/mcp.json", "mcpServers"),
+                (".vscode/mcp.json", "servers"),
+            ];
+            for (rel_path, top_key) in TARGETS {
+                let path = root.join(rel_path);
+                match write_mcp_config(&path, top_key, &bin_str, force) {
+                    Ok(action) => println!("  {rel_path}: {action}"),
+                    Err(e) => println!("  {rel_path}: skipped ({e})"),
+                }
+            }
+
+            println!();
+            println!(
+                "Windsurf and JetBrains read MCP config from a global (not \
+                project-level) file, so they can't be written here — add \
+                this by hand:"
+            );
+            println!();
+            println!("{}", manual_mcp_config_snippet(&bin_str));
+        }
     }
 
     Ok(())
+}
+
+/// Merges a `"ci"` entry into `path`'s top-level `top_key` object,
+/// creating the file (and parent dirs) if needed. Never touches unrelated
+/// entries — `ci setup` may run in a project that already wires up other
+/// MCP servers. Leaves an existing, *different* "ci" entry alone unless
+/// `force` is set, so re-running this inside a checkout that deliberately
+/// points at something else (e.g. this repo's own scripts/mcp-launcher.sh,
+/// which adds freshness checks and a source-build fallback a raw binary
+/// path doesn't have) can't silently downgrade that wiring.
+fn write_mcp_config(
+    path: &std::path::Path,
+    top_key: &str,
+    bin_path: &str,
+    force: bool,
+) -> Result<&'static str> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut root_value: serde_json::Value = if path.exists() {
+        let text = std::fs::read_to_string(path)?;
+        serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("existing file isn't valid JSON ({e}) — leaving it untouched")
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    let obj = root_value.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("existing file's top level isn't a JSON object — leaving it untouched")
+    })?;
+    let servers = obj.entry(top_key).or_insert_with(|| serde_json::json!({}));
+    let servers_obj = servers.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("existing \"{top_key}\" field isn't a JSON object — leaving it untouched")
+    })?;
+
+    let new_entry = serde_json::json!({ "command": bin_path, "args": ["serve"] });
+    let action = match servers_obj.get("ci") {
+        None => "wrote",
+        Some(existing) if existing == &new_entry => "up to date",
+        Some(_) if !force => "exists — pass --force to overwrite",
+        Some(_) => "updated",
+    };
+    if action == "up to date" || action.starts_with("exists") {
+        return Ok(action);
+    }
+    servers_obj.insert("ci".to_string(), new_entry);
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&root_value)?),
+    )?;
+    Ok(action)
+}
+
+/// Manual MCP config snippet for clients that only read a global (not
+/// project-level) config file — Windsurf (`~/.codeium/windsurf/mcp_config.json`)
+/// and JetBrains AI Assistant (its own settings UI) — mirrors
+/// docs/mcp-client-setup.md's existing hand-written snippet for those two.
+fn manual_mcp_config_snippet(bin_path: &str) -> String {
+    format!(
+        "{{\n  \"mcpServers\": {{\n    \"ci\": {{\n      \"command\": \"{bin_path}\",\n      \"args\": [\"serve\"]\n    }}\n  }}\n}}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_mcp_config_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+
+        let action = write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false).unwrap();
+
+        assert_eq!(action, "wrote");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["ci"]["command"], "/usr/local/bin/ci");
+        assert_eq!(
+            written["mcpServers"]["ci"]["args"],
+            serde_json::json!(["serve"])
+        );
+    }
+
+    #[test]
+    fn write_mcp_config_creates_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".vscode").join("mcp.json");
+
+        write_mcp_config(&path, "servers", "/usr/local/bin/ci", false).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn write_mcp_config_preserves_other_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"command":"foo","args":[]}}}"#,
+        )
+        .unwrap();
+
+        write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["other"]["command"], "foo");
+        assert_eq!(written["mcpServers"]["ci"]["command"], "/usr/local/bin/ci");
+    }
+
+    #[test]
+    fn write_mcp_config_rerun_with_same_binary_is_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+
+        write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false).unwrap();
+        let action = write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false).unwrap();
+
+        assert_eq!(action, "up to date");
+    }
+
+    #[test]
+    fn write_mcp_config_leaves_different_existing_entry_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let original =
+            r#"{"mcpServers":{"ci":{"command":"bash","args":["scripts/mcp-launcher.sh"]}}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let action = write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false).unwrap();
+
+        assert!(action.starts_with("exists"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn write_mcp_config_force_overwrites_different_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"ci":{"command":"bash","args":["scripts/mcp-launcher.sh"]}}}"#,
+        )
+        .unwrap();
+
+        let action = write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", true).unwrap();
+
+        assert_eq!(action, "updated");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["ci"]["command"], "/usr/local/bin/ci");
+    }
+
+    #[test]
+    fn write_mcp_config_invalid_json_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        let result = write_mcp_config(&path, "mcpServers", "/usr/local/bin/ci", false);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn manual_mcp_config_snippet_is_valid_json_with_command() {
+        let snippet = manual_mcp_config_snippet("/usr/local/bin/ci");
+        let parsed: serde_json::Value = serde_json::from_str(&snippet).unwrap();
+        assert_eq!(parsed["mcpServers"]["ci"]["command"], "/usr/local/bin/ci");
+    }
 }

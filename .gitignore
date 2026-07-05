@@ -33,3 +33,10 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# npm platform-package binaries — populated by npm/stage-release.sh from a
+# tagged GitHub Release, not committed (same ~95MB prebuilt binaries
+# .github/workflows/release.yml already publishes, just re-packaged)
+npm/*/ci
+npm/node_modules/
+npm/*/node_modules/

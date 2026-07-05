@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/ci-mcp-darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt ci (Code Intelligence) binary for darwin-arm64 (Apple Silicon) — platform package for @eilodon/ci-mcp, not meant to be installed directly",
   "license": "MIT",
   "repository": {

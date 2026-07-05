@@ -37,6 +37,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Workspace version defaults to whatever was last committed to
+      # Cargo.toml, which drifts from the release tag if nobody remembers to
+      # bump it by hand — stamp it from the tag so `ci --version` always
+      # matches the artifact it shipped in.
+      - name: Set crate version from tag
+        run: sed -i "s/^version = \".*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+
       # `cross` runs the build in a container that already has the C
       # cross-toolchain tree-sitter / stack-graphs / rusqlite need.
       - name: Install cross

@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/ci-mcp-linux-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt ci (Code Intelligence) binary for linux-x64 — platform package for @eilodon/ci-mcp, not meant to be installed directly",
   "license": "MIT",
   "repository": {

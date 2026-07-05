@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "ci-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ci-core",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "ci-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "globset",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "ci-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ci-core",

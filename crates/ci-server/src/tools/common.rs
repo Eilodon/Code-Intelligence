@@ -23,6 +23,7 @@ impl CodeIntelligenceServer {
             project_root,
             db_path,
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
+            last_index_error: Arc::new(RwLock::new(None)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             coverage: Arc::new(coverage),
@@ -31,7 +32,6 @@ impl CodeIntelligenceServer {
             preset,
         })
     }
-
     /// Opens a new dedicated read-only connection to the same DB file.
     /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
     /// tool handler is rejected at the SQLite level.
@@ -59,11 +59,8 @@ impl CodeIntelligenceServer {
     /// file lock is briefly held by an indexing transaction anyway, rather
     /// than failing the note immediately.
     pub(crate) fn memory_write_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
-        let conn = rusqlite::Connection::open(&self.db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(conn)
+        ci_core::db::conn::open_writer(&self.db_path)
     }
-
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
     /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
     /// since only this type has access to `session_log`.
@@ -190,6 +187,11 @@ impl CodeIntelligenceServer {
         Arc::clone(&self.phase)
     }
 
+    /// A handle the background indexer uses to publish an error message
+    /// when `phase` transitions to `Failed` (see `IndexingPhase::Failed`).
+    pub fn last_index_error_handle(&self) -> Arc<RwLock<Option<String>>> {
+        Arc::clone(&self.last_index_error)
+    }
     /// Handles the background indexer uses to publish the loaded model + status.
     pub fn embedder_handle(&self) -> Arc<RwLock<Option<Arc<Embedder>>>> {
         Arc::clone(&self.embedder)
@@ -237,15 +239,26 @@ impl CodeIntelligenceServer {
         let db_path = self.db_path.clone();
         let embedder = Arc::clone(&self.embedder);
         let status = Arc::clone(&self.embed_status);
-        std::thread::spawn(move || match rusqlite::Connection::open(&db_path) {
-            Ok(conn) => crate::bootstrap_embeddings(&conn, &semantic, &embedder, &status),
-            Err(e) => {
-                tracing::error!("Embeddings retry: failed to open DB: {e}");
+        std::thread::spawn(move || {
+            // Catches a panic inside the bootstrap so a bug there (or in a
+            // future change to it) can't leave `status` stuck on
+            // `Downloading` forever with no thread left to ever flip it —
+            // the discarded `JoinHandle` means nothing else would notice.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match ci_core::db::conn::open_writer(&db_path) {
+                    Ok(conn) => crate::bootstrap_embeddings(&conn, &semantic, &embedder, &status),
+                    Err(e) => {
+                        tracing::error!("Embeddings retry: failed to open DB: {e}");
+                        *status.write().unwrap() = EmbedStatus::Failed;
+                    }
+                }
+            }));
+            if outcome.is_err() {
+                tracing::error!("Embeddings retry thread panicked");
                 *status.write().unwrap() = EmbedStatus::Failed;
             }
         });
     }
-
     pub(crate) fn current_phase(&self) -> IndexingPhase {
         *self.phase.read().unwrap()
     }

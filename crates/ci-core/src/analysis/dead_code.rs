@@ -271,6 +271,47 @@ mod tests {
         assert_eq!(src, "static");
     }
 
+    /// Same guarantee as above, made explicit per-kind rather than relying
+    /// on "struct" to stand in for every other non-callable kind — the
+    /// real-grammar symbol-extraction fixes (crates/ci-core/src/indexer/
+    /// parser.rs) newly surface `enum`/`constructor`/`trait`/`type` symbols
+    /// for languages that previously never produced them at all (Rust
+    /// enums/unions, Java enums/records/constructors, TS enums, C#/C++/C
+    /// structs/enums/delegates, PHP traits, Ruby classes/modules). Each of
+    /// these must go through the same `kind` allowlist check, not just
+    /// "struct", or a newly-produced kind could silently regress back to
+    /// being scored for dead-code the way a real function/method is.
+    #[test]
+    fn test_every_non_callable_kind_is_never_flagged_dead() {
+        let non_callable_kinds = [
+            "class",
+            "interface",
+            "type",
+            "variable",
+            "enum",
+            "constructor",
+            "struct",
+            "trait",
+            "impl",
+        ];
+        for kind in non_callable_kinds {
+            let (conf, src) = compute_dead_code_confidence(
+                "/f.rs",
+                1,
+                10,
+                0,
+                false,
+                false,
+                true, // is_private — would return "high" for a function/method
+                true,
+                &no_coverage(),
+                kind,
+            );
+            assert_eq!(conf, "none", "kind={kind} must never be flagged dead");
+            assert_eq!(src, "static", "kind={kind}");
+        }
+    }
+
     #[test]
     fn test_method_kind_is_still_evaluated() {
         let (conf, _) = compute_dead_code_confidence(

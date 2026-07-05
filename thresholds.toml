@@ -1,0 +1,39 @@
+# Fitness-check thresholds for this repo's own CI gate (`ci fitness-check`,
+# same checks the `fitness_report` MCP tool queries mid-session). Only
+# [[boundaries]] and [config_drift] are declared here — the numeric
+# thresholds (hub_count, dead_code_pct, etc.) keep FitnessThresholds::default().
+
+# Layering rules Rust's own crate/module visibility does NOT already enforce
+# (unlike e.g. "ci-core must not depend on ci-server", which is structurally
+# impossible since ci-core/Cargo.toml doesn't list ci-server as a dependency —
+# declaring that here would be a no-op). Both verified at 0 violations against
+# the current import_edges graph before being added.
+
+[[boundaries]]
+from = "crates/ci-core/src/indexer/"
+to = "crates/ci-core/src/analysis/"
+reason = "indexer (extraction) must stay upstream of analysis (derived intelligence: dead-code, hotspots, fitness) — not the other way around"
+
+[[boundaries]]
+from = "crates/ci-server/src/watcher.rs"
+to = "crates/ci-server/src/tools/"
+reason = "the background reindex/watch loop must not depend on the MCP tool-handler layer it runs independently of"
+
+[config_drift]
+# Verified 2026-07-05 by actually running `ci fitness-check --config
+# thresholds.toml` against this repo: architecture-design.md,
+# migration-plan-v3.md, rust-support-research.md, and mcp-client-setup.md
+# were tried first but produced 18 false positives — the first three are
+# full of illustrative example paths (`src/user.py`, `foo.rs`) and
+# retired-Python-era migration narrative (`generate_oracle.py`), which read
+# as "dangling references" to a path-existence scanner but aren't; the last
+# has a real reference to `release.yml` written without its directory
+# (`.github/workflows/release.yml`) that the suffix-match heuristic doesn't
+# catch for single-segment filenames. Trimmed to the 4 docs that came back
+# clean in that same run — operational/factual, not full of code examples.
+doc_paths = [
+    "AGENTS.md",
+    "README.md",
+    "docs/comparison.md",
+    "docs/cloud-environment-setup.md",
+]

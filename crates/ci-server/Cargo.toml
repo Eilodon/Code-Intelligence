@@ -17,7 +17,7 @@ rmcp = { workspace = true }
 schemars = { workspace = true }
 
 [features]
-default = ["embeddings", "tier0-5"]
+default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["ci-core/embeddings"]
 lang-c      = ["ci-core/lang-c"]
 lang-cpp    = ["ci-core/lang-cpp"]

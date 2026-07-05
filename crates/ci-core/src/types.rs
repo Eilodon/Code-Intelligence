@@ -7,6 +7,12 @@ pub enum IndexingPhase {
     Parsing,
     BuildingEdges,
     Ready,
+    /// The background indexer (full index or incremental reindex) hit an
+    /// unrecoverable error or panicked. Distinct from resetting to
+    /// `Scanning`, which used to make a real failure look like indexing
+    /// simply hadn't started yet — `indexing_status`'s `indexing_error`
+    /// field carries the actual error message alongside this phase.
+    Failed,
 }
 
 impl IndexingPhase {
@@ -16,6 +22,7 @@ impl IndexingPhase {
             Self::Parsing => "parsing",
             Self::BuildingEdges => "building_edges",
             Self::Ready => "ready",
+            Self::Failed => "failed",
         }
     }
 }
@@ -35,6 +42,19 @@ pub enum EdgeConfidence {
     /// consumers can tell "low-confidence but singular" apart from "spread
     /// across N locations, most likely wrong for N-1 of them".
     Ambiguous,
+    /// A callee that could not be resolved to any candidate at all under
+    /// the current, deliberately conservative resolution rules (e.g. the
+    /// same-language filter in `rebuild_graph` ruled out every textually-
+    /// matching candidate because none shared the caller's language).
+    /// Reserved for a future producer — nothing constructs this yet, so no
+    /// `call_edges` row currently carries it — but adding the variant now
+    /// forces every exhaustive `match` on `EdgeConfidence` (see
+    /// `ci-server/src/tools/inspect.rs`) to decide how to handle it up
+    /// front, rather than that decision being made implicitly (or missed)
+    /// whenever a producer is eventually wired up. Ranked alongside
+    /// `Ambiguous` at the bottom — both mean "no single confident answer",
+    /// just for different reasons (multiple candidates vs. zero).
+    Unresolved,
 }
 
 impl EdgeConfidence {
@@ -45,6 +65,7 @@ impl EdgeConfidence {
             Self::Inferred => "inferred",
             Self::Textual => "textual",
             Self::Ambiguous => "ambiguous",
+            Self::Unresolved => "unresolved",
         }
     }
 
@@ -54,7 +75,11 @@ impl EdgeConfidence {
             Self::Resolved => 3,
             Self::Inferred => 2,
             Self::Textual => 1,
+            // Same rank as `Ambiguous` — both are the lowest confidence tier,
+            // deliberately tied rather than ordered against each other (see
+            // the variant's doc comment).
             Self::Ambiguous => 0,
+            Self::Unresolved => 0,
         }
     }
 
@@ -69,6 +94,7 @@ impl EdgeConfidence {
             "inferred" => Some(Self::Inferred),
             "textual" => Some(Self::Textual),
             "ambiguous" => Some(Self::Ambiguous),
+            "unresolved" => Some(Self::Unresolved),
             _ => None,
         }
     }
@@ -195,6 +221,8 @@ mod tests {
             EdgeConfidence::Resolved,
             EdgeConfidence::Inferred,
             EdgeConfidence::Textual,
+            EdgeConfidence::Ambiguous,
+            EdgeConfidence::Unresolved,
         ] {
             assert_eq!(EdgeConfidence::parse(ec.as_str()), Some(ec));
         }
@@ -211,5 +239,17 @@ mod tests {
         assert!(EdgeConfidence::Formal.rank() > EdgeConfidence::Resolved.rank());
         assert!(EdgeConfidence::Resolved.rank() > EdgeConfidence::Inferred.rank());
         assert!(EdgeConfidence::Inferred.rank() > EdgeConfidence::Textual.rank());
+    }
+
+    /// `Unresolved` is deliberately tied with `Ambiguous` at the bottom —
+    /// both mean "no single confident answer" — rather than ordered against
+    /// it (see the variant's doc comment).
+    #[test]
+    fn test_edge_confidence_unresolved_ties_with_ambiguous_at_the_bottom() {
+        assert_eq!(
+            EdgeConfidence::Unresolved.rank(),
+            EdgeConfidence::Ambiguous.rank()
+        );
+        assert!(EdgeConfidence::Textual.rank() > EdgeConfidence::Unresolved.rank());
     }
 }

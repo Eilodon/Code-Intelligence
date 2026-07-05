@@ -35,8 +35,22 @@ use crate::indexer::lang_constants::get_lang_constants;
 fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
     match node_kind {
         "class_definition" | "class_declaration" => SymbolKind::Class,
+        // Ruby's grammar uses the bare node kinds "class"/"module" (not
+        // "class_declaration") — without this arm they fell through to the
+        // generic Function/Method default below.
+        "class" | "module" => SymbolKind::Class,
         "struct_item" => SymbolKind::Struct,
+        // Java records and C#/C++/C struct declarations are all fixed-field
+        // data carriers — the closest existing kind to a dedicated "record".
+        "record_declaration" => SymbolKind::Struct,
+        // C++ `class_specifier`/`struct_specifier` and C's `struct_specifier`
+        // have direct "name" fields (see lang_constants.rs) but previously had
+        // no arm here, so they silently fell through to Function/Method.
+        "class_specifier" => SymbolKind::Class,
+        "struct_specifier" => SymbolKind::Struct,
+        "struct_declaration" => SymbolKind::Struct, // C#
         "trait_item" => SymbolKind::Trait,
+        "trait_declaration" => SymbolKind::Trait, // PHP
         // Reachable only if `resolve_name_node` ever grows an `impl_item` case (it
         // currently doesn't: `impl_item` has no `name` field, only `type`/`trait`).
         // `impl_item` stays in Rust's `function_node_types` purely so its children
@@ -45,15 +59,32 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // `impl`/`impl Trait for` block without a corresponding consumer.
         "impl_item" => SymbolKind::Impl,
         "interface_declaration" => SymbolKind::Interface,
-        // Go's `type_declaration` and TS's `type_alias_declaration` are
-        // distinct grammar node kinds for the same concept (a named type),
-        // so both map to the one SymbolKind here.
-        "type_declaration" | "type_alias_declaration" => SymbolKind::Type,
+        "enum_item" => SymbolKind::Enum, // Rust
+        // TS `enum_declaration`, Java `enum_declaration`, C# `enum_declaration`,
+        // C/C++ `enum_specifier` — one shared arm since the mapping only sees
+        // the bare node-kind string, not which language produced it.
+        "enum_declaration" | "enum_specifier" => SymbolKind::Enum,
+        "constructor_declaration" => SymbolKind::Constructor, // Java
+        // TS's `type_alias_declaration`, Go's `type_spec`/`type_alias` (each
+        // spec inside a `type (...)` block — see lang_constants.rs's Go entry
+        // and resolve_name_node), Rust's `type_item`/`union_item`, and C#'s
+        // `delegate_declaration` are all "this name refers to a type" —
+        // distinct grammar node kinds for the same concept, so all map here.
+        "type_alias_declaration"
+        | "type_spec"
+        | "type_alias"
+        | "type_item"
+        | "union_item"
+        | "union_specifier"
+        | "delegate_declaration" => SymbolKind::Type,
         // Explicit method nodes are always Method regardless of scope.
         "method_declaration" | "method_definition" => SymbolKind::Method,
         // JS/TS `const foo = () => {}` — treated as a variable holding a function.
         "lexical_declaration" => SymbolKind::Variable,
         // Plain function nodes: Method when inside a class/impl, Function otherwise.
+        // Also covers TS/JS `generator_function_declaration` (see
+        // lang_constants.rs) — a generator is still a plain function/method
+        // for this index's purposes, no dedicated kind needed.
         _ => {
             if in_class {
                 SymbolKind::Method
@@ -128,17 +159,21 @@ pub fn extract_symbols_from_tree(
         language,
         path,
         None,
+        Vec::new(),
         &mut symbols,
     );
     symbols
 }
 
 /// Resolve the name node for `node`. Most `function_node_types` expose `name`
-/// directly via `lc.name_field`, but a few wrap the name on a nested child:
-/// Go `type_declaration` holds it on a `type_spec` child, and JS/TS
-/// `lexical_declaration` holds it on a `variable_declarator` child (only
-/// followed when the declarator's value is itself a function literal, so
-/// plain `const x = 5` is not treated as a symbol).
+/// directly via `lc.name_field` — this includes Go's `type_spec`/`type_alias`
+/// (each spec inside a `type (...)` block has its own direct "name" field, so
+/// walking them individually rather than the enclosing `type_declaration`
+/// handles grouped blocks with N specs, not just the first). A few kinds wrap
+/// the name on a nested child instead: JS/TS `lexical_declaration` holds it on
+/// a `variable_declarator` child (only followed when the declarator's value is
+/// itself a function literal, so plain `const x = 5` is not treated as a
+/// symbol).
 fn resolve_name_node<'a>(
     node: tree_sitter::Node<'a>,
     lc: &crate::indexer::lang_constants::LangConstants,
@@ -147,12 +182,6 @@ fn resolve_name_node<'a>(
         return Some(n);
     }
     match node.kind() {
-        "type_declaration" => {
-            let mut cursor = node.walk();
-            node.children(&mut cursor)
-                .find(|c| c.kind() == "type_spec")
-                .and_then(|spec| spec.child_by_field_name("name"))
-        }
         "lexical_declaration" => {
             let mut cursor = node.walk();
             node.children(&mut cursor).find_map(|decl| {
@@ -228,6 +257,7 @@ fn collect_doc_comment_lines(node: tree_sitter::Node, source: &str, doc_type: &s
 
 /// Recursive symbol walk tracking the enclosing class/impl so methods record
 /// their `class_context`.
+#[allow(clippy::too_many_arguments)]
 fn walk_symbols(
     node: tree_sitter::Node,
     source: &str,
@@ -235,6 +265,7 @@ fn walk_symbols(
     language: &str,
     path: &str,
     enclosing_class: Option<String>,
+    enclosing_decorators: Vec<String>,
     out: &mut Vec<ParsedSymbol>,
 ) {
     // A symbol defined here belongs to the class we are currently inside.
@@ -272,7 +303,14 @@ fn walk_symbols(
             enclosing_class.clone()
         };
 
-        let is_entry_point = detect_entry_point(node, source, language, &name, &signature);
+        let is_entry_point = detect_entry_point(
+            node,
+            source,
+            language,
+            &name,
+            &signature,
+            &enclosing_decorators,
+        );
         let is_test = detect_is_test(node, source, language, &name, &signature, path);
         let complexity = compute_cyclomatic_complexity(node, language);
 
@@ -312,9 +350,72 @@ fn walk_symbols(
         enclosing_class.clone()
     };
 
+    // Container-decorator inheritance: a class/impl/etc. container's OWN
+    // decorators/annotations (e.g. Python `@app.route`-style class
+    // decorator, Rust `#[wasm_bindgen] impl Foo {..}`, TS/JS
+    // `@Controller()`/`@Injectable()`, Java `@RestController` on the class)
+    // are collected fresh for each container node reached — language-
+    // agnostic, same recursive-propagation shape as `child_class` above —
+    // and threaded down so `detect_entry_point` can let a public member
+    // inherit "reachable via framework" from its container instead of only
+    // ever checking the member's own decorators. Deliberately does NOT fall
+    // back to `enclosing_decorators` the way `child_class` falls back to
+    // `enclosing_class`: a nested container with no decorators of its own
+    // should not inherit an ancestor's, keeping the signal scoped to direct
+    // members of the decorated container, not arbitrarily deep nesting.
+    let child_decorators = if lc.class_node_types.contains(&node.kind()) {
+        container_decorators_of(node, source, language)
+    } else {
+        enclosing_decorators.clone()
+    };
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_symbols(child, source, lc, language, path, child_class.clone(), out);
+        walk_symbols(
+            child,
+            source,
+            lc,
+            language,
+            path,
+            child_class.clone(),
+            child_decorators.clone(),
+            out,
+        );
+    }
+}
+
+/// A node's own decorators/annotations, language-agnostic entry point for
+/// both `walk_symbols`'s container-decorator propagation and (indirectly, via
+/// the member-level call in `detect_entry_point`) a single symbol's own
+/// decorators. Three distinct grammar shapes, verified against each real
+/// grammar rather than assumed:
+/// - Java's `@Foo` parses as a CHILD of the declaration
+///   (`collect_java_annotations`).
+/// - TS/JS's decorator on a CLASS is a `decorator` FIELD directly on the
+///   `class_declaration` node itself (`class_declaration decorator: (...)
+///   name: ... body: ...`) — NOT a preceding sibling the way a class
+///   MEMBER's own decorator is (a member's decorator sits as a sibling
+///   inside `class_body`, which `collect_decorators`'s sibling walk already
+///   handles correctly — only the container/class case needed this
+///   field-based special-casing).
+/// - Every other supported language's decorator/attribute (Python, Rust,
+///   and TS/JS members) is a preceding SIBLING (`collect_decorators`).
+fn container_decorators_of(node: tree_sitter::Node, source: &str, language: &str) -> Vec<String> {
+    match language {
+        "java" => collect_java_annotations(node, source)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "javascript" | "typescript" if node.kind() == "class_declaration" => {
+            let mut cursor = node.walk();
+            node.children_by_field_name("decorator", &mut cursor)
+                .map(|d| source[d.byte_range()].trim().to_string())
+                .collect()
+        }
+        _ => collect_decorators(node, source, decorator_node_kinds(language))
+            .into_iter()
+            .map(String::from)
+            .collect(),
     }
 }
 
@@ -344,17 +445,25 @@ fn go_receiver_type(node: tree_sitter::Node, source: &str) -> Option<String> {
 
 /// Decorator/attribute sibling node kind(s) that may precede a definition, per
 /// language. Java needs two: `@Foo` parses as `marker_annotation`, `@Foo(...)`
-/// as `annotation`.
+/// as `annotation`. TS/JS decorators (`@Controller()`, `@Injectable()`, ...)
+/// parse as a single `decorator` node, same shape as Python's.
 fn decorator_node_kinds(language: &str) -> &'static [&'static str] {
     match language {
         "python" => &["decorator"],
         "rust" => &["attribute_item"],
         "java" => &["marker_annotation", "annotation"],
+        "javascript" | "typescript" => &["decorator"],
         _ => &[],
     }
 }
 
-/// Source text of every decorator/attribute immediately preceding `node` (innermost first).
+/// Source text of every decorator/attribute immediately preceding `node`
+/// (innermost first). Comment trivia (`line_comment`/`block_comment`/
+/// `comment`) sitting between two attributes — or trailing the last one
+/// right before `node` — is skipped rather than treated as a stop condition:
+/// `#[test]\n// why\n#[should_panic]\nfn foo() {}` must still see both
+/// attributes. Only a real, non-comment, non-matching sibling (i.e. actual
+/// code) legitimately ends the chain.
 fn collect_decorators<'a>(
     node: tree_sitter::Node,
     source: &'a str,
@@ -363,6 +472,10 @@ fn collect_decorators<'a>(
     let mut out = Vec::new();
     let mut sib = node.prev_named_sibling();
     while let Some(s) = sib {
+        if matches!(s.kind(), "line_comment" | "block_comment" | "comment") {
+            sib = s.prev_named_sibling();
+            continue;
+        }
         if !kinds.contains(&s.kind()) {
             break;
         }
@@ -372,14 +485,123 @@ fn collect_decorators<'a>(
     out
 }
 
+/// Whether `d` (a Rust `#[attr]`/`#[attr(...)]`/`#[path::attr]` source
+/// string) is a strong, general signal that something other than an
+/// ordinary call site invokes or registers whatever it's attached to —
+/// route/tool/RPC registration, FFI export, a plugin/handler framework,
+/// etc. Shared between member-level and container-level (inherited)
+/// attribute checks in `detect_entry_point`'s `"rust"` arm so both apply the
+/// exact same classification.
+fn rust_attr_is_dispatch_signal(d: &str) -> bool {
+    // The small set of modifier attributes that don't imply this.
+    const NON_DISPATCH_ATTRS: &[&str] = &[
+        "allow",
+        "deny",
+        "warn",
+        "forbid",
+        "must_use",
+        "deprecated",
+        "inline",
+        "cold",
+        "cfg",
+        "cfg_attr",
+        "doc",
+        "track_caller",
+        "non_exhaustive",
+        "repr",
+        "should_panic",
+        "ignore",
+        "test",
+        "derive",
+        "automatically_derived",
+    ];
+    let inner = d.trim_start_matches("#[").trim_end_matches(']');
+    let path = inner.split('(').next().unwrap_or(inner).trim();
+    path == "main" || path.ends_with("::main") || !NON_DISPATCH_ATTRS.contains(&path)
+}
+
+/// Whether a Java annotation (`@Foo`/`@Foo(...)`/`@pkg.Foo`, as returned by
+/// `collect_java_annotations`) is a well-known framework annotation implying
+/// the annotated class/method is invoked/registered by something other than
+/// an ordinary in-repo call — Spring-style component/route annotations and
+/// JAX-RS resource annotations. Deliberately an allowlist (unlike Rust's
+/// exclusion-list approach): Java has a much larger and less predictable
+/// universe of annotations used for purposes that do NOT imply reachability
+/// (validation, `@Override`, `@Deprecated`, `@SuppressWarnings`, ...), so
+/// guessing "anything not obviously harmless" would be unsound here. `@Test`
+/// is intentionally absent — that's `detect_is_test`'s signal, not an entry
+/// point. Generic over `S: AsRef<str>` so it accepts both the member-level
+/// `Vec<&str>` `collect_java_annotations` returns and the container-level
+/// `&[String]` `walk_symbols` threads through.
+fn java_annotation_signals_entry_point<S: AsRef<str>>(annotations: &[S]) -> bool {
+    const FRAMEWORK_ANNOTATIONS: &[&str] = &[
+        "RestController",
+        "Controller",
+        "Service",
+        "Component",
+        "Repository",
+        "Configuration",
+        "Bean",
+        "RequestMapping",
+        "GetMapping",
+        "PostMapping",
+        "PutMapping",
+        "DeleteMapping",
+        "PatchMapping",
+        "EventListener",
+        "Scheduled",
+        "PostConstruct",
+        "PreDestroy",
+        "Path",
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+    ];
+    annotations.iter().any(|ann| {
+        let ann = ann.as_ref();
+        let inner = ann.trim_start_matches('@');
+        let base = inner.split('(').next().unwrap_or(inner).trim();
+        let base = base.rsplit('.').next().unwrap_or(base);
+        FRAMEWORK_ANNOTATIONS.contains(&base)
+    })
+}
+
+/// Whether a class/impl MEMBER is public enough to inherit an entry-point
+/// signal from its enclosing container's own decorator/annotation (see
+/// `detect_entry_point`'s `container_decorators` parameter). NOT the same
+/// check as `analysis::dead_code::is_private_symbol`: that function's
+/// TypeScript/JavaScript case checks for the `export` keyword, which is
+/// right for top-level declarations but would always read a class METHOD as
+/// private (individual methods are never themselves marked `export` — only
+/// top-level declarations are), silently defeating the NestJS/Angular case
+/// this parameter exists for. Bare/`protected` TS/JS members count as
+/// public-enough here — only an explicit `private` modifier excludes them —
+/// erring toward not missing a real entry point rather than tightening the
+/// gate.
+fn member_is_pub_for_container_inheritance(language: &str, signature: &str) -> bool {
+    match language {
+        "rust" => signature.contains("pub "),
+        "java" => !signature.contains("private "),
+        "typescript" | "javascript" => !signature.contains("private "),
+        _ => false,
+    }
+}
+
 /// Per-language entry-point convention: known framework decorators/attributes,
-/// `main`/`init` functions, and `export default`.
+/// `main`/`init` functions, `export default`, and — for Rust/Java/TS/JS — a
+/// public member inheriting the same signal from its enclosing container's
+/// own decorator/annotation (`container_decorators`, propagated by
+/// `walk_symbols`; empty for Python/Go, which don't have this gap — Python
+/// already checks a class-level-vs-member-level distinction differently via
+/// dunder methods, and Go has no class/decorator concept at all).
 fn detect_entry_point(
     node: tree_sitter::Node,
     source: &str,
     language: &str,
     name: &str,
     signature: &str,
+    container_decorators: &[String],
 ) -> bool {
     let decorators = collect_decorators(node, source, decorator_node_kinds(language));
 
@@ -406,33 +628,6 @@ fn detect_entry_point(
                     .any(|d| HOOKS.iter().any(|h| d.contains(h)))
         }
         "rust" => {
-            // Any non-trivial attribute macro on a function/method is a
-            // strong, general signal that something other than an ordinary
-            // call site invokes or registers it — route/tool/RPC
-            // registration, FFI export, a plugin/handler framework, etc.
-            // (see `NON_DISPATCH_ATTRS` for the small set of modifier
-            // attributes that don't imply this).
-            const NON_DISPATCH_ATTRS: &[&str] = &[
-                "allow",
-                "deny",
-                "warn",
-                "forbid",
-                "must_use",
-                "deprecated",
-                "inline",
-                "cold",
-                "cfg",
-                "cfg_attr",
-                "doc",
-                "track_caller",
-                "non_exhaustive",
-                "repr",
-                "should_panic",
-                "ignore",
-                "test",
-                "derive",
-                "automatically_derived",
-            ];
             // Common std/core trait methods dispatched via operator or
             // protocol syntax (`x.into()`, `x == y`, `for v in x`,
             // `x.clone()`, ...) rather than by their literal name at a call
@@ -475,16 +670,20 @@ fn detect_entry_point(
             ];
             name == "main"
                 || TRAIT_DISPATCH_NAMES.contains(&name)
-                || decorators.iter().any(|d| {
-                    let inner = d.trim_start_matches("#[").trim_end_matches(']');
-                    let path = inner.split('(').next().unwrap_or(inner).trim();
-                    path == "main"
-                        || path.ends_with("::main")
-                        || !NON_DISPATCH_ATTRS.contains(&path)
-                })
+                || decorators.iter().any(|d| rust_attr_is_dispatch_signal(d))
+                || (member_is_pub_for_container_inheritance(language, signature)
+                    && container_decorators
+                        .iter()
+                        .any(|d| rust_attr_is_dispatch_signal(d)))
         }
         "go" => node.kind() == "function_declaration" && (name == "main" || name == "init"),
-        "java" => signature.contains("public static void main"),
+        "java" => {
+            signature.contains("public static void main")
+                || (member_is_pub_for_container_inheritance(language, signature)
+                    && (java_annotation_signals_entry_point(&collect_java_annotations(
+                        node, source,
+                    )) || java_annotation_signals_entry_point(container_decorators)))
+        }
         "javascript" | "typescript" => {
             name == "main"
                 || node
@@ -496,6 +695,8 @@ fn detect_entry_point(
                                 .starts_with("export default")
                     })
                     .unwrap_or(false)
+                || (member_is_pub_for_container_inheritance(language, signature)
+                    && (!decorators.is_empty() || !container_decorators.is_empty()))
         }
         _ => false,
     }
@@ -932,12 +1133,23 @@ pub fn extract_type_map_from_tree(
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     // Node kinds carrying a `name(s): type` (or `name(s) type`) binding.
+    // Includes struct/class FIELD declarations (not just params/locals) so
+    // tier-2 method resolution can disambiguate `x.foo()` by `x`'s real
+    // field type across modules — without this, two unrelated types in
+    // different modules sharing both a field name and a method name could
+    // only be told apart by same-file/same-language heuristics, not by the
+    // field's actual declared type.
     let binding_kinds: &[&str] = match language {
         "python" => &["typed_parameter"],
-        "typescript" => &["required_parameter", "optional_parameter"],
-        "rust" => &["parameter", "let_declaration"],
-        "go" => &["parameter_declaration", "var_spec"],
-        "java" => &["formal_parameter"],
+        "typescript" => &[
+            "required_parameter",
+            "optional_parameter",
+            "public_field_definition",
+            "property_signature",
+        ],
+        "rust" => &["parameter", "let_declaration", "field_declaration"],
+        "go" => &["parameter_declaration", "var_spec", "field_declaration"],
+        "java" => &["formal_parameter", "field_declaration"],
         _ => return map, // javascript: no static annotations
     };
 
@@ -1059,11 +1271,17 @@ fn binding_names_and_type(
     }
 
     let names: Vec<String> = match language {
-        // `x, y Foo`: every identifier child shares the type.
+        // `x, y Foo`: every identifier child shares the type. Go's struct
+        // `field_declaration` exposes each repeated name as its own
+        // `field_identifier` child (confirmed via the real grammar: e.g.
+        // `X, Y int` emits two sibling `name: (field_identifier)` nodes on
+        // one `field_declaration`), rather than the bare `identifier`
+        // children `var_spec`/`parameter_declaration` use — same multi-name-
+        // one-type shape, different node kind for the name itself.
         "go" => {
             let mut cur = node.walk();
             node.children(&mut cur)
-                .filter(|c| c.kind() == "identifier")
+                .filter(|c| c.kind() == "identifier" || c.kind() == "field_identifier")
                 .map(|c| source[c.byte_range()].to_string())
                 .collect()
         }
@@ -1073,7 +1291,23 @@ fn binding_names_and_type(
             .map(|n| source[n.byte_range()].to_string())
             .into_iter()
             .collect(),
-        // TS/Rust use a `pattern` field; Java uses `name`.
+        // Java's `field_declaration` shares one type across one-or-more
+        // `variable_declarator` children (`int x, y;`) — the name lives on
+        // each declarator, not on `field_declaration` itself (unlike
+        // `formal_parameter`, which names itself directly and falls through
+        // to the generic arm below unchanged).
+        "java" if node.kind() == "field_declaration" => {
+            let mut cur = node.walk();
+            node.children(&mut cur)
+                .filter(|c| c.kind() == "variable_declarator")
+                .filter_map(|d| d.child_by_field_name("name"))
+                .map(|n| source[n.byte_range()].to_string())
+                .collect()
+        }
+        // TS/Rust use a `pattern` field for parameters; Java's
+        // `formal_parameter` and every field-declaration kind added above
+        // (TS `public_field_definition`/`property_signature`, Rust/Go
+        // `field_declaration`) name themselves directly via `name`.
         _ => node
             .child_by_field_name("pattern")
             .or_else(|| node.child_by_field_name("name"))
@@ -1537,6 +1771,56 @@ mod tests {
         assert!(extract_type_map("function f(x) {}\n", "javascript").is_empty());
     }
 
+    /// Regression: struct/class FIELD types (as opposed to params/locals,
+    /// which already worked) used to be entirely absent from `type_map` for
+    /// every one of these four languages — the resolver could only
+    /// disambiguate `x.foo()` by a locally-typed variable `x`, never by a
+    /// field `self.x.foo()`/`this.x.foo()`. This is the same-language,
+    /// cross-module false-callee gap (two unrelated types in different
+    /// modules sharing a field name AND a method name resolve to the wrong
+    /// one without the field's real declared type to disambiguate).
+    #[test]
+    fn test_type_map_covers_struct_class_field_declarations() {
+        let rust = "struct Foo {\n    bar: BarType,\n}\n";
+        assert_eq!(
+            extract_type_map(rust, "rust").get("bar"),
+            Some(&"BarType".to_string())
+        );
+
+        let go = "package p\ntype Foo struct {\n\tBar BarType\n}\n";
+        assert_eq!(
+            extract_type_map(go, "go").get("Bar"),
+            Some(&"BarType".to_string())
+        );
+        // Go field declarations also share one type across multiple names.
+        let go_multi = "package p\ntype Foo struct {\n\tX, Y int\n}\n";
+        let m = extract_type_map(go_multi, "go");
+        assert_eq!(m.get("X"), Some(&"int".to_string()));
+        assert_eq!(m.get("Y"), Some(&"int".to_string()));
+
+        let java = "class Foo {\n    BarType bar;\n}\n";
+        assert_eq!(
+            extract_type_map(java, "java").get("bar"),
+            Some(&"BarType".to_string())
+        );
+        // Java field declarations also share one type across multiple names.
+        let java_multi = "class Foo {\n    int x, y;\n}\n";
+        let m = extract_type_map(java_multi, "java");
+        assert_eq!(m.get("x"), Some(&"int".to_string()));
+        assert_eq!(m.get("y"), Some(&"int".to_string()));
+
+        let ts_class = "class Foo {\n    bar: BarType;\n}\n";
+        assert_eq!(
+            extract_type_map(ts_class, "typescript").get("bar"),
+            Some(&"BarType".to_string())
+        );
+        let ts_interface = "interface Foo {\n    bar: BarType;\n}\n";
+        assert_eq!(
+            extract_type_map(ts_interface, "typescript").get("bar"),
+            Some(&"BarType".to_string())
+        );
+    }
+
     /// Regression for the `confidence.as_str()`-style gap: a `let mut x;`
     /// with no initializer (so the `let_declaration` constructor-inference
     /// branch never fires) only reveals its type at a later `x = Foo::Variant;`
@@ -1683,6 +1967,19 @@ fn standalone() {}
     }
 
     #[test]
+    fn test_rust_enum_union_type_alias_kinds() {
+        let code = r#"
+enum Status { Active, Inactive }
+type Alias = i32;
+union Word { i: i32, f: f32 }
+"#;
+        let symbols = extract_symbols(code, "rust", "test.rs").unwrap();
+        assert_eq!(find(&symbols, "Status").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "Alias").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "Word").kind, SymbolKind::Type);
+    }
+
+    #[test]
     fn test_java_symbol_kinds() {
         let code = r#"
 class Greeter {
@@ -1694,6 +1991,27 @@ interface Shape {}
         assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
         assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_java_enum_record_constructor_kinds() {
+        let code = r#"
+class Box {
+    Box() {}
+}
+enum Status { ACTIVE, INACTIVE }
+record Point(int x, int y) {}
+"#;
+        let symbols = extract_symbols(code, "java", "Test.java").unwrap();
+        let box_kinds: Vec<SymbolKind> = symbols
+            .iter()
+            .filter(|s| s.name == "Box")
+            .map(|s| s.kind)
+            .collect();
+        assert!(box_kinds.contains(&SymbolKind::Class));
+        assert!(box_kinds.contains(&SymbolKind::Constructor));
+        assert_eq!(find(&symbols, "Status").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "Point").kind, SymbolKind::Struct);
     }
 
     #[test]
@@ -1713,6 +2031,19 @@ func Standalone() {}
         assert_eq!(find(&symbols, "Standalone").kind, SymbolKind::Function);
     }
 
+    /// Regression: a grouped `type (...)` block used to collapse to a
+    /// single symbol (whichever `type_spec` `resolve_name_node`'s `.find()`
+    /// happened to hit first) — every other spec in the block silently
+    /// vanished from the index. Each spec/alias is now walked individually.
+    #[test]
+    fn test_go_grouped_type_block_extracts_all_specs() {
+        let code = "package p\n\ntype (\n\tA struct{ X int }\n\tB int\n\tC = int\n)\n";
+        let symbols = extract_symbols(code, "go", "test.go").unwrap();
+        assert_eq!(find(&symbols, "A").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "B").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "C").kind, SymbolKind::Type);
+    }
+
     #[test]
     fn test_typescript_symbol_kinds() {
         let code = r#"
@@ -1727,6 +2058,17 @@ function standalone() {}
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
         assert_eq!(find(&symbols, "arrow").kind, SymbolKind::Variable);
         assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_typescript_enum_and_generator_function_kinds() {
+        let code = r#"
+enum Color { Red, Green, Blue }
+function* gen() { yield 1; }
+"#;
+        let symbols = extract_symbols(code, "typescript", "test.ts").unwrap();
+        assert_eq!(find(&symbols, "Color").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "gen").kind, SymbolKind::Function);
     }
 
     /// Regression: a TS/DTO-only file (all `export interface`/`export type`,
@@ -1902,6 +2244,100 @@ public class Main {
         assert!(find(&symbols, "main").is_entry_point);
     }
 
+    /// Container-decorator inheritance: an attribute macro on the `impl`
+    /// BLOCK (not the method itself) is a strong entry-point signal for
+    /// every pub method inside — e.g. `#[wasm_bindgen] impl Widget { pub
+    /// fn tick(&self) {} }` exports `tick` to JS even though nothing in this
+    /// repo calls it by name. Gated on `member_is_pub_for_container_
+    /// inheritance`: a private helper in the same impl block must NOT
+    /// inherit the signal just because its container happens to be
+    /// decorated.
+    #[test]
+    fn test_rust_container_decorator_inherited_by_pub_method_only() {
+        let code = "#[wasm_bindgen]\nimpl Widget {\n    pub fn tick(&self) {}\n    fn helper(&self) {}\n}\n";
+        let symbols = extract_symbols(code, "rust", "widget.rs").unwrap();
+        assert!(
+            find(&symbols, "tick").is_entry_point,
+            "pub method inside a decorated impl block inherits the container's entry-point signal"
+        );
+        assert!(
+            !find(&symbols, "helper").is_entry_point,
+            "a private method in the same impl must NOT inherit the signal"
+        );
+    }
+
+    /// Same container-decorator inheritance for TS/JS: NestJS/Angular-style
+    /// class decorators (`@Controller`, `@Injectable`, ...) previously left
+    /// `decorator_node_kinds` returning an empty list for "typescript"/
+    /// "javascript" entirely, so plain methods on a `@Controller` class were
+    /// invisible to entry-point detection no matter what.
+    #[test]
+    fn test_typescript_container_decorator_inherited_by_method_only() {
+        let code = "@Controller('/users')\nclass UserController {\n    findAll() {}\n    private helper() {}\n}\n";
+        let symbols = extract_symbols(code, "typescript", "user.controller.ts").unwrap();
+        assert!(
+            find(&symbols, "findAll").is_entry_point,
+            "a plain method inside a @Controller-decorated class inherits the container's entry-point signal"
+        );
+        assert!(
+            !find(&symbols, "helper").is_entry_point,
+            "an explicitly private TS method must NOT inherit the signal"
+        );
+    }
+
+    /// A method's OWN decorator (no class-level decorator at all) is a
+    /// separate code path from container inheritance — a member's decorator
+    /// sits as a sibling inside `class_body` (verified via the real
+    /// grammar), which `collect_decorators`'s existing sibling walk already
+    /// finds correctly once `decorator_node_kinds` covers TS/JS at all.
+    #[test]
+    fn test_typescript_member_own_decorator_wired_into_entry_point() {
+        let code = "class Api {\n    @Get()\n    findAll() {}\n    plain() {}\n}\n";
+        let symbols = extract_symbols(code, "typescript", "api.ts").unwrap();
+        assert!(
+            find(&symbols, "findAll").is_entry_point,
+            "a method decorated directly (no class decorator needed) is an entry point"
+        );
+        assert!(
+            !find(&symbols, "plain").is_entry_point,
+            "a plain undecorated method in an undecorated class is not"
+        );
+    }
+
+    /// Same for Java: `collect_java_annotations` already correctly extracted
+    /// class-level annotations, but nothing ever fed them into
+    /// `detect_entry_point` — only `detect_is_test` used them. A
+    /// `@RestController` class's plain public methods must be reachable via
+    /// the framework's dispatch, not flagged dead just because nothing in
+    /// this repo calls them directly.
+    #[test]
+    fn test_java_container_annotation_inherited_by_public_method_only() {
+        let code = "@RestController\nclass UserController {\n    public void findAll() {}\n    private void helper() {}\n}\n";
+        let symbols = extract_symbols(code, "java", "UserController.java").unwrap();
+        assert!(
+            find(&symbols, "findAll").is_entry_point,
+            "public method inside a @RestController class inherits the container's entry-point signal"
+        );
+        assert!(
+            !find(&symbols, "helper").is_entry_point,
+            "a private Java method must NOT inherit the signal"
+        );
+    }
+
+    /// Java member-level annotations (`@GetMapping`, ...) must also be
+    /// checked directly by `detect_entry_point` — not only inherited from a
+    /// container-level annotation — since route methods are commonly
+    /// annotated individually rather than only at the class level.
+    #[test]
+    fn test_java_member_annotation_wired_into_entry_point() {
+        let code = "class Api {\n    @GetMapping(\"/users\")\n    public void getUsers() {}\n}\n";
+        let symbols = extract_symbols(code, "java", "Api.java").unwrap();
+        assert!(
+            find(&symbols, "getUsers").is_entry_point,
+            "collect_java_annotations was already correct but never wired into detect_entry_point until this fix"
+        );
+    }
+
     // ---------------------------------------------------------------
     // DEBT-008: is_test detection (dead-code false-positive fix)
     // ---------------------------------------------------------------
@@ -1921,6 +2357,22 @@ fn helper() {}
         assert!(find(&symbols, "test_addition").is_test);
         assert!(find(&symbols, "test_async_thing").is_test);
         assert!(!find(&symbols, "helper").is_test);
+    }
+
+    /// Regression: a comment sitting between two attributes — or trailing
+    /// the last one right before the function — used to hard-stop
+    /// `collect_decorators`'s backward walk, silently dropping every
+    /// attribute above the comment. `#[test]` here is separated from
+    /// `fn test_thing` by `#[should_panic]` AND a comment between the two
+    /// attributes; both must still be seen.
+    #[test]
+    fn test_rust_collect_decorators_skips_comment_between_attributes() {
+        let code = "#[test]\n// explanatory comment\n#[should_panic]\nfn test_thing() {\n    panic!(\"boom\");\n}\n";
+        let symbols = extract_symbols(code, "rust", "src/lib.rs").unwrap();
+        assert!(
+            find(&symbols, "test_thing").is_test,
+            "a comment between #[test] and #[should_panic] must not break the attribute chain"
+        );
     }
 
     #[test]
@@ -2059,6 +2511,61 @@ public class FooTest {
                 .any(|c| c.enclosing_name == "bar" && c.callee == "foo"),
             "bar calling foo must produce a call edge"
         );
+    }
+
+    // Real-grammar SymbolKind coverage for the remaining Tier-0.5 languages
+    // — without these, a mis-mapped node kind (falling through to the
+    // default Function/Method arm) has no test that would ever catch it,
+    // exactly the gap the ABI guards above were born from.
+    #[test]
+    #[cfg(feature = "lang-cpp")]
+    fn test_cpp_real_grammar_symbol_kinds() {
+        let code = "class Foo {};\nstruct Bar {};\nenum Color { Red, Green };\nint standalone() { return 0; }\n";
+        let symbols = extract_symbols(code, "cpp", "test.cpp").unwrap();
+        assert_eq!(find(&symbols, "Foo").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "Bar").kind, SymbolKind::Struct);
+        assert_eq!(find(&symbols, "Color").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-c")]
+    fn test_c_real_grammar_symbol_kinds() {
+        let code = "struct Point { int x; int y; };\nunion Word { int i; float f; };\nenum Status { Active, Inactive };\nint standalone() { return 0; }\n";
+        let symbols = extract_symbols(code, "c", "test.c").unwrap();
+        assert_eq!(find(&symbols, "Point").kind, SymbolKind::Struct);
+        assert_eq!(find(&symbols, "Word").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "Status").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-csharp")]
+    fn test_csharp_real_grammar_symbol_kinds() {
+        let code = "struct Point { }\nenum Status { Active, Inactive }\ndelegate void Handler();\nclass Foo { void Bar() {} }\n";
+        let symbols = extract_symbols(code, "csharp", "test.cs").unwrap();
+        assert_eq!(find(&symbols, "Point").kind, SymbolKind::Struct);
+        assert_eq!(find(&symbols, "Status").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "Handler").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "Bar").kind, SymbolKind::Method);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-php")]
+    fn test_php_real_grammar_trait_kind() {
+        let code = "<?php\ntrait Greetable {\n    public function hello() {}\n}\n";
+        let symbols = extract_symbols(code, "php", "test.php").unwrap();
+        assert_eq!(find(&symbols, "Greetable").kind, SymbolKind::Trait);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-ruby")]
+    fn test_ruby_real_grammar_class_module_kinds() {
+        let code = "module Greetable\n  class Greeter\n    def hello\n    end\n  end\nend\n";
+        let symbols = extract_symbols(code, "ruby", "test.rb").unwrap();
+        assert_eq!(find(&symbols, "Greetable").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
     }
 
     // ---------------------------------------------------------------

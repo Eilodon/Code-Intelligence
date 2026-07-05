@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 tempfile = "3"
 
 [features]
-default = ["embeddings", "tier0-5"]
+default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["ci-core/embeddings", "ci-server/embeddings"]
 lang-c      = ["ci-core/lang-c",      "ci-server/lang-c"]
 lang-cpp    = ["ci-core/lang-cpp",    "ci-server/lang-cpp"]

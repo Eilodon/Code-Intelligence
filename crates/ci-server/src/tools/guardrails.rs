@@ -135,8 +135,46 @@ impl CodeIntelligenceServer {
                 .iter()
                 .filter(|c| c.edge_confidence != "ambiguous")
                 .count();
-            let risk =
-                Some(risk_level_from_caller_count(confirmed_caller_count as i64).to_string());
+            let mut risk = risk_level_from_caller_count(confirmed_caller_count as i64).to_string();
+
+            // Raw caller-count alone can't see entry points, test-only
+            // helpers, or runtime dispatch (reflection, framework callbacks)
+            // that never shows up in the static call graph — exactly the
+            // richer signal `compute_dead_code_confidence` already computes
+            // for `symbol_info`'s `build_health`, just never wired in here
+            // before. Only relevant when there are zero confirmed callers
+            // (`risk_level_from_caller_count` already tiers nonzero counts
+            // sensibly on its own): if the dead-code heuristic disagrees
+            // that this looks safely removable — `"none"` (confirmed
+            // entry-point/test) or `"low"` (runtime-covered despite no
+            // static callers, or genuinely ambiguous scope) — escalate from
+            // "low" to "medium" so the caller doesn't read a bare 0-caller
+            // count as "safe to delete" when it isn't.
+            let abs_path =
+                ci_core::analysis::coverage::normalize_path(&self.project_root.join(&c.path));
+            let is_private =
+                ci_core::analysis::dead_code::is_private_symbol(&c.language, &c.name, &c.signature);
+            let scope_clear = ci_core::analysis::dead_code::scope_clear_for_language(&c.language);
+            let (dead_code_confidence, dead_code_source) =
+                ci_core::analysis::dead_code::compute_dead_code_confidence(
+                    &abs_path,
+                    c.line_start,
+                    c.line_end,
+                    confirmed_caller_count as i64,
+                    c.is_entry_point,
+                    c.is_test,
+                    is_private,
+                    scope_clear,
+                    &self.coverage,
+                    &c.kind,
+                );
+            if confirmed_caller_count == 0
+                && risk == "low"
+                && matches!(dead_code_confidence, "none" | "low")
+            {
+                risk = "medium".to_string();
+            }
+            let risk = Some(risk);
 
             let trend = ci_core::fitness::compute_trend(
                 &conn,
@@ -156,6 +194,8 @@ impl CodeIntelligenceServer {
                 blast_radius,
                 range_checksum,
                 risk_assessment: risk,
+                dead_code_confidence: dead_code_confidence.to_string(),
+                dead_code_source: dead_code_source.to_string(),
                 trend,
                 co_changed_files,
                 suggested_next: self.filter_sn(suggested(
@@ -227,31 +267,46 @@ impl CodeIntelligenceServer {
                     // file with 0 symbols (e.g. a Rust `mod.rs` that's just
                     // `pub mod` statements) is still fully indexed, just
                     // empty, and must not be reported as "unindexed" (the old
-                    // `symbols`-only check couldn't tell the two apart).
-                    let scanned: i64 = conn
+                    // `symbols`-only check couldn't tell the two apart). A row
+                    // whose `language` is NULL is a third case: a
+                    // recognized-but-unparseable extension (see
+                    // `is_recognized_unparsed_extension`) the indexer tracks by
+                    // path only — it can never have symbols no matter how long
+                    // you wait, so it's still reported here, with its own
+                    // reason rather than silently reading as a normal empty file.
+                    let row_language: Option<Option<String>> = conn
                         .query_row(
-                            "SELECT COUNT(*) FROM file_index WHERE path = ?1",
+                            "SELECT language FROM file_index WHERE path = ?1",
                             rusqlite::params![fd.path],
-                            |r| r.get(0),
+                            |r| r.get::<_, Option<String>>(0),
                         )
-                        .unwrap_or(0);
-                    if scanned == 0 {
-                        let path = std::path::Path::new(&fd.path);
-                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        // A recognized extension only means "pending_scan" if the
-                        // indexer would ever actually reach it — a .rs file under
-                        // a dotdir or IGNORE_DIRS (e.g. .claude/, target/) never
-                        // gets scanned no matter how long you wait, so it must be
-                        // "out_of_scope" too, not just files of an unrecognized
-                        // extension. See `ci_core::walk::path_has_ignored_dir_component`.
-                        let reason = if !ci_core::walk::path_has_ignored_dir_component(path)
-                            && ci_core::indexer::lang_constants::language_for_extension(ext)
-                                .is_some()
-                        {
-                            "pending_scan"
-                        } else {
-                            "out_of_scope"
-                        };
+                        .ok();
+                    let reason = match &row_language {
+                        None => {
+                            let path = std::path::Path::new(&fd.path);
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            // A recognized extension only means "pending_scan" if the
+                            // indexer would ever actually reach it — a .rs file under
+                            // a dotdir or IGNORE_DIRS (e.g. .claude/, target/) never
+                            // gets scanned no matter how long you wait, so it must be
+                            // "out_of_scope" too, not just files of an unrecognized
+                            // extension. See `ci_core::walk::path_has_ignored_dir_component`.
+                            if !ci_core::walk::path_has_ignored_dir_component(path)
+                                && (ci_core::indexer::lang_constants::language_for_extension(ext)
+                                    .is_some()
+                                    || ci_core::indexer::lang_constants::is_recognized_unparsed_extension(
+                                        ext,
+                                    ))
+                            {
+                                Some("pending_scan")
+                            } else {
+                                Some("out_of_scope")
+                            }
+                        }
+                        Some(None) => Some("recognized_unparsed"),
+                        Some(Some(_)) => None,
+                    };
+                    if let Some(reason) = reason {
                         unindexed_files.push(UnindexedFileOutput {
                             path: fd.path.clone(),
                             reason: reason.to_string(),
@@ -535,6 +590,15 @@ pub(crate) struct EditContextOutput {
     pub(crate) range_checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) risk_assessment: Option<String>,
+    /// `"none"` (confirmed not dead — entry point, test, or has confirmed
+    /// callers), `"high"`/`"medium"`/`"low"` confidence it genuinely is dead
+    /// code — see `ci_core::analysis::dead_code::compute_dead_code_confidence`.
+    /// Also feeds `risk_assessment`: a 0-caller symbol only keeps "low" risk
+    /// when this independently agrees (`"high"`/`"medium"`).
+    pub(crate) dead_code_confidence: String,
+    /// `"static"` or `"static+coverage"` — whether a runtime coverage file
+    /// (see `scripts/gen-coverage.sh`) was available to inform `dead_code_confidence`.
+    pub(crate) dead_code_source: String,
     /// Absent when there's no snapshot yet at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS`
     /// old (e.g. `ci fitness-check` hasn't run for that long) — not an error.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,6 +673,12 @@ pub(crate) struct UnindexedFileOutput {
     /// config, etc.), or it sits under a dotdir/`IGNORE_DIRS` path (e.g.
     /// `.claude/`, `target/`) the walker categorically never descends into,
     /// regardless of extension.
+    /// "recognized_unparsed" — a `file_index` row exists (the indexer has
+    /// scanned it) but `language` is NULL: a recognized-but-unsupported
+    /// extension (see `is_recognized_unparsed_extension`) tracked by path
+    /// only. Like "out_of_scope", this never resolves on its own — there is
+    /// no symbol extraction to wait for — but unlike "out_of_scope" the file
+    /// genuinely is indexed (has a row), just never for symbols.
     pub(crate) reason: String,
 }
 

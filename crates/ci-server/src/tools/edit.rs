@@ -157,7 +157,7 @@ impl CodeIntelligenceServer {
             );
         }
 
-        let mut write_conn = match rusqlite::Connection::open(&self.db_path) {
+        let mut write_conn = match ci_core::db::conn::open_writer(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 drop(_guard);
@@ -170,9 +170,6 @@ impl CodeIntelligenceServer {
                 );
             }
         };
-        if let Err(e) = write_conn.busy_timeout(std::time::Duration::from_secs(5)) {
-            tracing::error!("edit_lines: failed to set busy_timeout: {e}");
-        }
         match ci_core::indexer::pipeline::reindex_changed(&mut write_conn, &self.project_root) {
             Ok(summary) if !summary.is_noop() => {
                 if let Some(model) = self.embedder() {

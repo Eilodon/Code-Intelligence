@@ -43,7 +43,13 @@ impl CodeIntelligenceServer {
             };
 
             let phase = self.phase_str();
-            let sn = if phase == "ready" {
+            let indexing_error = self.last_index_error.read().unwrap().clone();
+            let sn = if phase == "failed" {
+                suggested(
+                    "indexing_status",
+                    "Indexing failed — check indexing_error, fix the underlying issue, then restart or retry",
+                )
+            } else if phase == "ready" {
                 suggested("locate", "Index ready — begin exploration")
             } else {
                 suggested(
@@ -65,6 +71,7 @@ impl CodeIntelligenceServer {
 
             serde_json::to_string_pretty(&IndexingStatusOutput {
                 indexing_phase: phase,
+                indexing_error,
                 files_indexed: files,
                 files_total,
                 symbols_indexed: symbols,
@@ -78,7 +85,6 @@ impl CodeIntelligenceServer {
             .unwrap_or_default()
         })
     }
-
     #[tool(
         name = "session_context",
         description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count."
@@ -296,6 +302,10 @@ pub(crate) struct IndexingStatusParams {
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct IndexingStatusOutput {
     pub(crate) indexing_phase: String,
+    /// Error message from the most recent indexing failure, present only
+    /// when `indexing_phase == "failed"` — see `IndexingPhase::Failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) indexing_error: Option<String>,
     pub(crate) files_indexed: i64,
     /// Tier-0 source files currently discoverable on disk (respects
     /// `config.ignore`) — compare against `files_indexed` to see whether the

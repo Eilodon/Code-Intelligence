@@ -30,6 +30,9 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
                 "struct_item",
                 "trait_item",
                 "impl_item",
+                "enum_item",
+                "type_item",
+                "union_item",
             ],
             name_field: "name",
             docstring_type: Some("line_comment"),
@@ -42,7 +45,14 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             function_node_types: &[
                 "function_declaration",
                 "method_declaration",
-                "type_declaration",
+                // Each `type_spec`/`type_alias` is walked individually (not
+                // the enclosing `type_declaration`) since a grouped
+                // `type (\n A struct{}\n B int\n)` block is one
+                // `type_declaration` node containing N sibling specs —
+                // matching on the wrapper alone only ever surfaced the
+                // first one. See resolve_name_node's doc comment.
+                "type_spec",
+                "type_alias",
             ],
             name_field: "name",
             docstring_type: Some("comment"),
@@ -54,16 +64,18 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
         "javascript" | "typescript" => Some(LangConstants {
             function_node_types: &[
                 "function_declaration",
+                "generator_function_declaration",
                 "class_declaration",
                 "method_definition",
                 "lexical_declaration",
                 // TypeScript-only (never appear in the JS grammar, so no-op
-                // there): interface/type-alias declarations are otherwise
-                // invisible to the extractor entirely — a TS/DTO-only file
-                // would index as 0 symbols. See node_kind_to_symbol_kind for
-                // the SymbolKind mapping.
+                // there): interface/type-alias/enum declarations are
+                // otherwise invisible to the extractor entirely — a
+                // TS/DTO-only file would index as 0 symbols. See
+                // node_kind_to_symbol_kind for the SymbolKind mapping.
                 "interface_declaration",
                 "type_alias_declaration",
+                "enum_declaration",
             ],
             name_field: "name",
             docstring_type: Some("comment"),
@@ -77,12 +89,20 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
                 "method_declaration",
                 "class_declaration",
                 "interface_declaration",
+                "enum_declaration",
+                "record_declaration",
+                "constructor_declaration",
             ],
             name_field: "name",
             docstring_type: Some("block_comment"),
             call_node_types: &["method_invocation"],
             call_function_field: "name",
-            class_node_types: &["class_declaration", "interface_declaration"],
+            class_node_types: &[
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+                "record_declaration",
+            ],
             class_name_field: "name",
         }),
         // Tier-0.5 — full tree-sitter parsing when the optional grammar feature is enabled.
@@ -185,8 +205,18 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
         }),
         // C: function names live inside a declarator chain (no direct "name" field);
         // resolve_name_node() has a special case that walks declarator → identifier.
+        // struct_specifier/union_specifier/enum_specifier DO have a direct
+        // "name" field, same as C++ below — without these the real grammar
+        // path recognized only functions, strictly less than the old regex
+        // fallback (detect_c_cpp), which at least caught struct/union/enum
+        // keywords textually.
         "c" => Some(LangConstants {
-            function_node_types: &["function_definition"],
+            function_node_types: &[
+                "function_definition",
+                "struct_specifier",
+                "union_specifier",
+                "enum_specifier",
+            ],
             name_field: "name", // no-op for function_definition; handled by resolve_name_node
             docstring_type: Some("comment"),
             call_node_types: &["call_expression"],
@@ -304,5 +334,52 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
         "php" => Some("php"),
 
         _ => None,
+    }
+}
+
+/// File extensions recognized as meaningful source for a language this
+/// indexer has no extraction support for at all — no tree-sitter grammar, no
+/// shallow regex fallback (`language_for_extension` returns `None` for all of
+/// these). A match still earns the file a `file_index` row (path, hash, mtime,
+/// `language = NULL`, `symbol_count = 0`) via `collect_source_files`, so it's
+/// visible to `dependencies`/`repo_overview`/`diff_impact` as "recognized but
+/// unparsed" rather than being indistinguishable from a truly invisible file
+/// (an image, a lockfile, a doc) that still gets no row at all. Deliberately
+/// narrow — this is not a general "track every file" catch-all, just enough to
+/// give diff_impact an honest, non-misleading signal for these languages
+/// until real extraction support exists.
+pub fn is_recognized_unparsed_extension(ext: &str) -> bool {
+    matches!(ext, "sol" | "circom" | "move" | "cairo" | "vy")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_recognized_unparsed_extension_matches_known_registry() {
+        for ext in ["sol", "circom", "move", "cairo", "vy"] {
+            assert!(
+                is_recognized_unparsed_extension(ext),
+                "{ext} should be recognized"
+            );
+        }
+        assert!(!is_recognized_unparsed_extension("md"));
+        assert!(!is_recognized_unparsed_extension("png"));
+        assert!(!is_recognized_unparsed_extension("lock"));
+    }
+
+    /// The registry must stay disjoint from `language_for_extension` —
+    /// otherwise a real tier-0/tier-0.5 language could be double-counted or
+    /// (worse) accidentally downgraded to path-only tracking by a stray
+    /// entry here.
+    #[test]
+    fn is_recognized_unparsed_extension_never_overlaps_language_for_extension() {
+        for ext in ["sol", "circom", "move", "cairo", "vy"] {
+            assert!(
+                language_for_extension(ext).is_none(),
+                "{ext} must not also be a language_for_extension entry"
+            );
+        }
     }
 }

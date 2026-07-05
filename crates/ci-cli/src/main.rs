@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut conn = rusqlite::Connection::open(&db_path)?;
+            let mut conn = ci_core::db::conn::open_writer(&db_path)?;
             ci_core::db::schema::init_db(&conn)?;
             let phase = std::sync::Arc::new(std::sync::RwLock::new(
                 ci_core::types::IndexingPhase::Scanning,
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
             let config_drift_doc_paths =
                 ci_core::fitness::load_config_drift_doc_paths(config.as_deref())?;
 
-            let conn = rusqlite::Connection::open(&db_path)
+            let conn = ci_core::db::conn::open_writer(&db_path)
                 .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
             ci_core::db::schema::init_db(&conn)?;
 

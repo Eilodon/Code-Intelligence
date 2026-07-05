@@ -33,7 +33,12 @@ Rust dev), crate `scip` 0.9 (Phase B, feature-gated), rayon.
 2. `EdgeConfidence` giữ nguyên 4 biến thể (`Formal`/`Resolved`/`Inferred`/`Textual`) — tái dùng
    `Formal`, không thêm biến thể mới (ADR-0004 §5).
 3. Zero dependency mới bắt buộc cho Phase A. Phase B thêm đúng 1 crate (`scip`), feature-gated,
-   **off by default**.
+   **off by default**. **Superseded 2026-07-05**: đây là caution tạm thời chờ verify độ ổn định,
+   không phải bất biến vĩnh viễn — sau khi xác nhận `scip` chỉ phụ thuộc `protobuf` thuần Rust
+   (không rủi ro musl/cross-compile như sqlite-vec), `run_scip` có timeout cứng 120s (đo thực tế
+   21.5s trên chính workspace này), và cache theo (rust-analyzer version, Cargo.lock hash, dirty
+   files) nên không chạy lại mỗi lần reindex, `scip-overlay` đã được thêm vào `default` ở cả 3
+   Cargo.toml (ci-core/ci-server/ci-cli). Xem [[audit-underused-features-2026-07-05]] memory.
 4. Trước mỗi commit: `cargo fmt --all` + `cargo clippy --all-targets -- -D warnings` sạch.
 
 ---
@@ -912,7 +917,9 @@ scip = { version = "0.9", optional = true }
 # (trong [features])
 scip-overlay = ["dep:scip"]
 ```
-> **KHÔNG** thêm `scip-overlay` vào `default`. Off by default (Invariant 3).
+> **KHÔNG** thêm `scip-overlay` vào `default`. Off by default (Invariant 3) — **superseded
+> 2026-07-05**, xem ghi chú tại Invariant 3 ở đầu file: đã bật `default` sau khi verify không có
+> tradeoff nghiêm trọng.
 
 - [ ] **Step 2: Khai báo module** — trong `crates/ci-core/src/lib.rs`:
 ```rust

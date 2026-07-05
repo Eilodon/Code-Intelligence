@@ -179,6 +179,7 @@ diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 - `aggregate_risk == "unknown"` → a `pending_scan` file is present; wait for index to reach `ready`, then retry
 - `unindexed_files[].reason == "pending_scan"` → that file's index is stale/missing; DO NOT treat diff as safe to push yet
 - `unindexed_files[].reason == "out_of_scope"` → not a source file (docs/config/etc.); permanent, harmless, does not affect `aggregate_risk`
+- `unindexed_files[].reason == "recognized_unparsed"` → a recognized-but-unsupported source extension (e.g. `.sol`/`.circom`/`.move`/`.cairo`/`.vy`) tracked by path only, never by symbols; like `out_of_scope`, permanent and harmless — there is no scan to wait for
 - `suggested_reviewers` present → notify these owners before merging
 
 **Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call. Host-agnostic backup for any MCP client (not just Claude Code): `session_context`'s `pending_diff_impact`/`files_pending_diff_impact` report the same thing — files written via `edit_lines`/`edit_symbol` since the last `diff_impact` call — and its `suggested_next` points straight at `diff_impact` while any are pending.

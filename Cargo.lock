@@ -243,6 +243,7 @@ name = "ci-core"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "fs4",
  "globset",
  "ignore",
  "model2vec-rs",

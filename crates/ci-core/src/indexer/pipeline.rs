@@ -8,7 +8,7 @@ use crate::indexer::edges::{
     CallEdge, insert_call_edges_batch, insert_code_chunks_batch, insert_import_edges_batch,
     insert_symbols_batch,
 };
-use crate::indexer::lang_constants::language_for_extension;
+use crate::indexer::lang_constants::{is_recognized_unparsed_extension, language_for_extension};
 use crate::indexer::parser::{
     ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
     extract_symbols_from_tree, extract_symbols_shallow, extract_type_map_from_tree, parse_tree,
@@ -75,13 +75,12 @@ pub fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBu
         }
         let path = entry.into_path();
         if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && language_for_extension(ext).is_some()
+            && (language_for_extension(ext).is_some() || is_recognized_unparsed_extension(ext))
         {
             out.push(path);
         }
     }
 }
-
 /// Portable FNV-1a 64-bit hash. `DefaultHasher` is explicitly *not* stable
 /// across Rust versions/platforms per the std docs — using it for the
 /// persisted `file_index.hash` column meant a toolchain upgrade could
@@ -148,10 +147,13 @@ fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<(
     Ok(())
 }
 
+/// `lang` is `None` for a recognized-but-unparsed extension (see
+/// `is_recognized_unparsed_extension`) — persisted as SQL `NULL`, matching
+/// `file_index.language`'s nullable column.
 fn upsert_file_index(
     tx: &rusqlite::Transaction,
     rel: &str,
-    lang: &str,
+    lang: Option<&str>,
     hash: &str,
     mtime: f64,
     symbol_count: usize,
@@ -164,7 +166,6 @@ fn upsert_file_index(
     )?;
     Ok(())
 }
-
 /// One call site's resolved fields, ready to persist into `call_sites`.
 struct CallSiteData {
     enclosing_qn: String,
@@ -198,6 +199,19 @@ struct ExtractedFile {
     /// or query them.
     chunks: Vec<CodeChunk>,
 }
+
+/// One file's `(rel_path, language, hash, mtime, extracted_data)` from a
+/// batch's parallel extraction pass in `run_indexing_pipeline` —
+/// `language`/`extracted_data` are `None` for a recognized-unparsed-extension
+/// file (see `is_recognized_unparsed_extension`), which still gets a
+/// `file_index` row but nothing to persist.
+type ExtractedBatchRow = (
+    String,
+    Option<&'static str>,
+    String,
+    f64,
+    Option<ExtractedFile>,
+);
 
 /// Parse and resolve one file's symbols, imports, and call sites. No DB access —
 /// safe to run concurrently across files (see [`run_indexing_pipeline`]).
@@ -429,16 +443,27 @@ fn rebuild_graph(
     hub_config: &crate::config::HubThresholdConfig,
     crate_map: &crate::indexer::crate_map::CrateMap,
 ) -> rusqlite::Result<()> {
-    // name → [(qn, path)] for tier-1; (name, class) → [(qn, path)] for tier-2.
-    let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let mut by_name_class: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    // name → [(qn, path, language)] for tier-1; (name, class) → [(qn, path,
+    // language)] for tier-2. `language` rides along so a call site can never
+    // resolve to a same-named symbol written in a different language (see
+    // `path_lang` and the same-language filter below) — a bare-name/textual
+    // match across languages is never a real call, just an incidental name
+    // collision (e.g. a Rust `new` and a Python `new` sharing `by_name`).
+    type SymbolCandidate = (String, String, String); // (qualified_name, path, language)
+    let mut by_name: HashMap<String, Vec<SymbolCandidate>> = HashMap::new();
+    let mut by_name_class: HashMap<(String, String), Vec<SymbolCandidate>> = HashMap::new();
     // qualified_name → signature, so the `MAX_CALLEE_CANDIDATES` fallback below
     // can tell whether a candidate's return type could possibly be
     // `Option`/`Result` — see `looks_option_or_result_chained`'s doc comment.
     let mut sig_by_qn: HashMap<String, String> = HashMap::new();
+    // path → language, one entry per indexed file (derived from that file's
+    // own symbols, so it's always populated for any path that could ever be
+    // a call site's `from_path` below).
+    let mut path_lang: HashMap<String, String> = HashMap::new();
     {
-        let mut stmt =
-            tx.prepare("SELECT name, qualified_name, path, class_context, signature FROM symbols")?;
+        let mut stmt = tx.prepare(
+            "SELECT name, qualified_name, path, class_context, signature, language FROM symbols",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -447,19 +472,24 @@ fn rebuild_graph(
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (name, qn, path, cls, sig) in rows {
-            by_name
-                .entry(name.clone())
-                .or_default()
-                .push((qn.clone(), path.clone()));
+        for (name, qn, path, cls, sig, language) in rows {
+            path_lang
+                .entry(path.clone())
+                .or_insert_with(|| language.clone());
+            by_name.entry(name.clone()).or_default().push((
+                qn.clone(),
+                path.clone(),
+                language.clone(),
+            ));
             if let Some(c) = cls {
                 by_name_class
                     .entry((name, c))
                     .or_default()
-                    .push((qn.clone(), path));
+                    .push((qn.clone(), path, language));
             }
             sig_by_qn.insert(qn, sig);
         }
@@ -528,6 +558,26 @@ fn rebuild_graph(
                 let Some(t) = targets else {
                     return Vec::new();
                 };
+                // Same-language filter: a call site can only ever resolve to a
+                // symbol written in the same language as its caller — a
+                // cross-language name collision (e.g. a Rust `foo` incidentally
+                // matching a Python `foo` elsewhere in the repo) is never a
+                // real call edge no matter how well the name/class matches.
+                // Applied first, before every other candidate-narrowing
+                // heuristic below, since this one is a hard correctness
+                // constraint rather than a preference — the rest of this
+                // function is unchanged from here on, just operating on the
+                // now same-language-only, language-stripped candidate list.
+                let caller_lang = path_lang.get(from_path);
+                let same_lang: Vec<(String, String)> = t
+                    .iter()
+                    .filter(|(_, _, lang)| Some(lang) == caller_lang)
+                    .map(|(qn, path, _)| (qn.clone(), path.clone()))
+                    .collect();
+                if same_lang.is_empty() {
+                    return Vec::new();
+                }
+                let t = &same_lang;
                 // Return-shape exclusion: `foo.bar()?`/`foo.bar().unwrap()` can only
                 // compile if `bar`'s return type is `Option`/`Result` — so a candidate
                 // whose own signature returns neither is *provably* not this call's
@@ -628,7 +678,6 @@ fn rebuild_graph(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     Ok(())
 }
-
 /// Recompute every symbol's `caller_count` from `call_edges`, using the same
 /// "confirmed caller" definition as the `callers` tool's `direct_count`
 /// (`ruled_out_by_scip = 0` and not `ambiguous`-confidence): an `ambiguous`
@@ -1024,16 +1073,25 @@ pub fn run_indexing_pipeline(
     tx.execute("DELETE FROM code_chunks", [])?;
 
     for batch in files.chunks(PARSE_BATCH_SIZE) {
-        let extracted: Vec<(String, &'static str, String, f64, ExtractedFile)> = batch
+        // `lang: None` + `data: None` means a recognized-unparsed-extension
+        // file (see `is_recognized_unparsed_extension`) — still earns a
+        // `file_index` row below (path/hash/mtime, `language` NULL,
+        // `symbol_count` 0), just with nothing to extract or persist.
+        let extracted: Vec<ExtractedBatchRow> = batch
             .par_iter()
             .map(|file| {
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let lang = language_for_extension(ext)?;
+                let lang = language_for_extension(ext);
+                if lang.is_none() && !is_recognized_unparsed_extension(ext) {
+                    return None;
+                }
                 let source = std::fs::read_to_string(file).ok()?;
                 let rel = rel_path(project_root, file);
                 let hash = hash_content(&source);
                 let mtime = mtime_secs(file);
-                let data = extract_file_data(&rel, lang, &source, &entry_point_patterns, &formal);
+                let data = lang.map(|lang| {
+                    extract_file_data(&rel, lang, &source, &entry_point_patterns, &formal)
+                });
                 Some((rel, lang, hash, mtime, data))
             })
             .collect::<Vec<_>>()
@@ -1042,8 +1100,18 @@ pub fn run_indexing_pipeline(
             .collect();
 
         for (rel, lang, hash, mtime, data) in &extracted {
-            persist_file(&tx, rel, hash, data)?;
-            upsert_file_index(&tx, rel, lang, hash, *mtime, data.symbol_count, now)?;
+            if let Some(data) = data {
+                persist_file(&tx, rel, hash, data)?;
+            }
+            upsert_file_index(
+                &tx,
+                rel,
+                *lang,
+                hash,
+                *mtime,
+                data.as_ref().map(|d| d.symbol_count).unwrap_or(0),
+                now,
+            )?;
         }
     }
 
@@ -1057,7 +1125,6 @@ pub fn run_indexing_pipeline(
 
     Ok(())
 }
-
 /// Incremental reindex: re-parse only files whose content hash changed (or are
 /// new), drop rows for deleted files, then rebuild the graph once if anything
 /// changed. Cheap to call repeatedly — the basis for the file watcher.
@@ -1089,7 +1156,12 @@ pub fn reindex_changed(
     // actually changed before paying the parse+resolve cost on just those.
     struct Candidate {
         rel: String,
-        lang: &'static str,
+        // `None` for a recognized-unparsed-extension file (see
+        // `is_recognized_unparsed_extension`) — included here (not filtered
+        // out like a genuinely unrecognized extension) so its `file_index`
+        // row stays in `seen_paths` below and doesn't get mistaken for a
+        // deleted file on every incremental pass.
+        lang: Option<&'static str>,
         source: String,
         hash: String,
         mtime: f64,
@@ -1098,7 +1170,10 @@ pub fn reindex_changed(
         .par_iter()
         .map(|file| {
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let lang = language_for_extension(ext)?;
+            let lang = language_for_extension(ext);
+            if lang.is_none() && !is_recognized_unparsed_extension(ext) {
+                return None;
+            }
             let source = std::fs::read_to_string(file).ok()?;
             let rel = rel_path(project_root, file);
             let hash = hash_content(&source);
@@ -1128,25 +1203,28 @@ pub fn reindex_changed(
     let mut summary = ReindexSummary::default();
 
     for batch in changed.chunks(PARSE_BATCH_SIZE) {
-        let extracted: Vec<(&Candidate, ExtractedFile)> = batch
+        let extracted: Vec<(&Candidate, Option<ExtractedFile>)> = batch
             .par_iter()
             .map(|c| {
-                let data =
-                    extract_file_data(&c.rel, c.lang, &c.source, &entry_point_patterns, &formal);
+                let data = c.lang.map(|lang| {
+                    extract_file_data(&c.rel, lang, &c.source, &entry_point_patterns, &formal)
+                });
                 (c, data)
             })
             .collect();
 
         for (c, data) in &extracted {
             remove_file_rows(&tx, &c.rel)?;
-            persist_file(&tx, &c.rel, &c.hash, data)?;
+            if let Some(data) = data {
+                persist_file(&tx, &c.rel, &c.hash, data)?;
+            }
             upsert_file_index(
                 &tx,
                 &c.rel,
                 c.lang,
                 &c.hash,
                 c.mtime,
-                data.symbol_count,
+                data.as_ref().map(|d| d.symbol_count).unwrap_or(0),
                 now,
             )?;
             summary.changed += 1;
@@ -1167,7 +1245,6 @@ pub fn reindex_changed(
     tx.commit()?;
     Ok(summary)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,6 +1326,95 @@ mod tests {
                 "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
             ),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a recognized-unparsed-extension file (see
+    /// `is_recognized_unparsed_extension`) must earn a `file_index` row
+    /// (path/hash/mtime, `language` NULL, `symbol_count` 0) so it's visible
+    /// as "recognized but unparsed" rather than invisible like a doc/image/
+    /// lockfile — but must never get symbols/edges, since there is no
+    /// extractor for it.
+    #[test]
+    fn test_run_indexing_pipeline_tracks_recognized_unparsed_extension_by_path_only() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_unparsed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def hello():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("Token.sol"),
+            "pragma solidity ^0.8.0;\ncontract Token {}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1); // only a.py::hello
+
+        let sol_language: Option<String> = conn
+            .query_row(
+                "SELECT language FROM file_index WHERE path = 'Token.sol'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sol_language, None,
+            "recognized-unparsed row must have language = NULL"
+        );
+        let sol_symbol_count: i64 = conn
+            .query_row(
+                "SELECT symbol_count FROM file_index WHERE path = 'Token.sol'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sol_symbol_count, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the incremental-reindex trap this design closes: before
+    /// the fix, `reindex_changed`'s file-collection step filtered out
+    /// recognized-unparsed files entirely, so their `file_index` row (created
+    /// by a prior full index) was absent from `seen_paths` and got deleted as
+    /// if the file had disappeared — on literally the very next incremental
+    /// pass, even with no changes on disk at all.
+    #[test]
+    fn test_reindex_changed_does_not_delete_recognized_unparsed_file_row() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_unparsed_reindex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def hello():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("Token.sol"),
+            "pragma solidity ^0.8.0;\ncontract Token {}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 2);
+
+        let summary = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            summary.deleted, 0,
+            "an unchanged recognized-unparsed file must not be treated as deleted"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_index WHERE path = 'Token.sol'"
+            ),
+            1,
+            "Token.sol's file_index row must survive an incremental reindex"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1825,6 +1991,135 @@ impl StructB {
             ),
             0,
             "caller_b's helper() must NOT also fan out to a.rs's unrelated helper()"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-language false callee: a bare-name fallback (nothing in the
+    /// caller's own file matches, so the global by-name fan-out kicks in)
+    /// must never resolve to a same-named symbol written in a DIFFERENT
+    /// language — that's never a real call, just an incidental name
+    /// collision (e.g. Python `helper` and Rust `helper` sharing a bare
+    /// name). Regression for the missing same-language filter in
+    /// `rebuild_graph`'s candidate lookup, which used to fan out to every
+    /// same-named symbol in the whole multi-language repo.
+    #[test]
+    fn test_same_language_filter_excludes_cross_language_false_callee() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_crosslang_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `main` has no same-named `helper` in its own file, so resolution
+        // falls through to the global by-name fan-out fallback — exactly the
+        // path that never filtered by language before this fix.
+        std::fs::write(dir.join("a.py"), "def main():\n    helper()\n").unwrap();
+        std::fs::write(dir.join("c.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn helper() {}\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'c.py')",
+            ),
+            1,
+            "main()'s helper() must resolve to the same-language (Python) helper in c.py"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'b.rs')",
+            ),
+            0,
+            "main()'s helper() must NEVER resolve to the unrelated Rust helper() in b.rs"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT caller_count FROM symbols WHERE qualified_name = 'b.rs::helper'",
+            ),
+            0,
+            "the Rust helper() must show zero callers — it was never actually called"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same-language, cross-module false callee (the "odra vs soroban" case):
+    /// two unrelated types in DIFFERENT files (same language) share a method
+    /// name (`execute`), and the caller reaches one of them through a typed
+    /// struct FIELD (`self.engine.execute()`), not a local variable. Split
+    /// across three files so tier-1's same-file `file_symbols` match (which
+    /// takes priority over tier-2 whenever it fires) never fires here —
+    /// `execute` is defined in neither odra.rs nor soroban.rs's caller file
+    /// (main.rs), forcing resolution through tier-2's receiver-type lookup,
+    /// same as the real cross-module case this bug was found in. Before the
+    /// field-type-map fix, struct fields were invisible to `type_map`, so
+    /// tier-2 had no receiver type to key off of and fell back to the global
+    /// by-name fan-out — matching both `execute` methods (marked
+    /// `ambiguous`) instead of resolving to the one the field is actually
+    /// declared as.
+    #[test]
+    fn test_field_type_map_resolves_same_language_cross_module_method_call() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_fieldtypemap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("odra.rs"),
+            "pub struct OdraEngine;\nimpl OdraEngine {\n    pub fn execute(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("soroban.rs"),
+            "pub struct SorobanEngine;\nimpl SorobanEngine {\n    pub fn execute(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.rs"),
+            "struct Odra {\n    engine: OdraEngine,\n}\n\
+             impl Odra {\n    fn run(&self) {\n        self.engine.execute();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'execute' AND class_context = 'OdraEngine')",
+            ),
+            1,
+            "self.engine.execute() must resolve to OdraEngine::execute via the field's declared type"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'execute' AND class_context = 'SorobanEngine')",
+            ),
+            0,
+            "self.engine.execute() must NOT also fan out to the unrelated SorobanEngine::execute"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run')",
+            ),
+            1,
+            "exactly one call edge from run() — not fanned out/marked ambiguous"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

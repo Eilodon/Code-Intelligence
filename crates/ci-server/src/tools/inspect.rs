@@ -347,7 +347,13 @@ pub(crate) fn build_health(
                             ci_core::types::EdgeConfidence::Resolved => resolved += cnt,
                             ci_core::types::EdgeConfidence::Inferred => inferred += cnt,
                             ci_core::types::EdgeConfidence::Textual => textual += cnt,
-                            ci_core::types::EdgeConfidence::Ambiguous => ambiguous += cnt,
+                            // `Unresolved` folds into the same low-confidence
+                            // bucket as `Ambiguous` — both mean "no single
+                            // confident answer", and there's no dedicated
+                            // output field for a tier nothing produces yet
+                            // (see the variant's doc comment in types.rs).
+                            ci_core::types::EdgeConfidence::Ambiguous
+                            | ci_core::types::EdgeConfidence::Unresolved => ambiguous += cnt,
                         }
                     }
                     Ok(())

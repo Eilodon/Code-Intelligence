@@ -47,95 +47,165 @@ pub async fn serve_stdio_with_preset(
     let indexer_root = project_root.clone();
     let watch_ct = ct.clone();
     let phase = server.phase_handle();
+    let last_index_error = server.last_index_error_handle();
     let embedder = server.embedder_handle();
     let embed_status = server.embed_status_handle();
     let watch_embedder = embedder.clone();
-    tokio::task::spawn_blocking(move || {
-        tracing::info!("Background indexer thread started");
-        if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
-            let _ = ci_core::db::schema::init_db(&conn);
+    // Kept outside the `spawn_blocking` closure below so a panic there (caught
+    // via the awaited `JoinHandle`) still has a handle to report through —
+    // `phase`/`last_index_error` themselves are moved into that closure.
+    let outer_phase = phase.clone();
+    let outer_last_index_error = last_index_error.clone();
+    tokio::spawn(async move {
+        let handle = tokio::task::spawn_blocking(move || {
+            tracing::info!("Background indexer thread started");
 
-            // Use incremental reindex when the index already has data — avoids
-            // a full re-parse of every file on every server restart.
-            let existing_files: i64 = conn
-                .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
-                .unwrap_or(0);
-
-            let index_ok = if existing_files > 0 {
+            // Every `ci serve` process used to spawn its own indexer+watcher
+            // against the same shared DB — harmless with one process, but N
+            // concurrent processes on the same project_root (e.g. multiple
+            // editor/MCP-client sessions) meant N redundant reindex loops
+            // racing each other, mitigated only by `open_writer`'s
+            // `busy_timeout`, never prevented. Only the process that wins
+            // this advisory lock runs the indexer+watcher below; a loser
+            // still serves tool calls read-only against the DB the winner
+            // keeps fresh.
+            let lock_dir = indexer_db_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| indexer_root.clone());
+            let Some(_indexer_lock) = ci_core::db::instance_lock::try_acquire(&lock_dir) else {
                 tracing::info!(
-                    "Existing index found ({existing_files} files) — incremental reindex"
+                    "Another ci serve process already owns indexing for this project — skipping redundant indexer/watcher"
                 );
-                *phase.write().unwrap() = ci_core::types::IndexingPhase::Parsing;
-                match ci_core::indexer::pipeline::reindex_changed(&mut conn, &indexer_root) {
-                    Ok(summary) => {
-                        tracing::info!(
-                            "Incremental reindex: {} changed, {} deleted",
-                            summary.changed,
-                            summary.deleted
-                        );
+                // Best-effort: if a prior process already indexed this
+                // project, there's real data to serve immediately — don't
+                // leave `phase` stuck at its initial pre-Ready value this
+                // process will now never itself advance. If the DB is
+                // genuinely empty (everyone racing to index a brand new
+                // project simultaneously), leave `phase` as-is; it stays
+                // honestly non-Ready here, but reads still start reflecting
+                // real data as soon as the owning process writes it.
+                if let Ok(conn) = ci_core::db::conn::open_writer(&indexer_db_path) {
+                    let existing_files: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    if existing_files > 0 {
                         *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
+                    }
+                }
+                return;
+            };
+
+            if let Ok(mut conn) = ci_core::db::conn::open_writer(&indexer_db_path) {
+                let _ = ci_core::db::schema::init_db(&conn);
+
+                // Use incremental reindex when the index already has data — avoids
+                // a full re-parse of every file on every server restart.
+                let existing_files: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
+                    .unwrap_or(0);
+
+                let index_result: Result<(), String> = if existing_files > 0 {
+                    tracing::info!(
+                        "Existing index found ({existing_files} files) — incremental reindex"
+                    );
+                    *phase.write().unwrap() = ci_core::types::IndexingPhase::Parsing;
+                    match ci_core::indexer::pipeline::reindex_changed(&mut conn, &indexer_root) {
+                        Ok(summary) => {
+                            tracing::info!(
+                                "Incremental reindex: {} changed, {} deleted",
+                                summary.changed,
+                                summary.deleted
+                            );
+                            *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Incremental reindex failed, falling back to full: {e}"
+                            );
+                            ci_core::indexer::pipeline::run_indexing_pipeline(
+                                &mut conn,
+                                &indexer_root,
+                                phase.clone(),
+                            )
+                            .map_err(|e| e.to_string())
+                        }
+                    }
+                } else {
+                    tracing::info!("No existing index — running full index");
+                    ci_core::indexer::pipeline::run_indexing_pipeline(
+                        &mut conn,
+                        &indexer_root,
+                        phase.clone(),
+                    )
+                    .map_err(|e| e.to_string())
+                };
+
+                let index_ok = match &index_result {
+                    Ok(()) => {
+                        tracing::info!("Background indexing completed");
+                        *last_index_error.write().unwrap() = None;
                         true
                     }
                     Err(e) => {
-                        tracing::error!("Incremental reindex failed, falling back to full: {e}");
-                        ci_core::indexer::pipeline::run_indexing_pipeline(
-                            &mut conn,
-                            &indexer_root,
-                            phase.clone(),
-                        )
-                        .is_ok()
+                        tracing::error!("Background indexer failed: {e}");
+                        *phase.write().unwrap() = ci_core::types::IndexingPhase::Failed;
+                        *last_index_error.write().unwrap() = Some(e.clone());
+                        false
                     }
+                };
+                // Opt-in semantic embeddings, after the graph is built.
+                if semantic.enabled {
+                    bootstrap_embeddings(&conn, &semantic, &embedder, &embed_status);
                 }
-            } else {
-                tracing::info!("No existing index — running full index");
-                ci_core::indexer::pipeline::run_indexing_pipeline(
-                    &mut conn,
-                    &indexer_root,
-                    phase.clone(),
-                )
-                .is_ok()
-            };
 
-            if index_ok {
-                tracing::info!("Background indexing completed");
-            } else {
-                tracing::error!("Background indexer failed");
-                // Reset to Scanning so callers don't see BuildingEdges forever on failure.
-                *phase.write().unwrap() = ci_core::types::IndexingPhase::Scanning;
-            }
-            // Opt-in semantic embeddings, after the graph is built.
-            if semantic.enabled {
-                bootstrap_embeddings(&conn, &semantic, &embedder, &embed_status);
-            }
-
-            #[cfg(feature = "scip-overlay")]
-            if index_ok {
-                let rust_cfg = ci_core::config::load_config(&indexer_root)
-                    .map(|c| c.rust)
-                    .unwrap_or_default();
-                let dirty = ci_core::scip::rust_source_dirty_keys(&conn);
-                match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg, &dirty) {
-                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
-                        // caller_count was computed by rebuild_graph before this
-                        // overlay flipped edge_confidence/ruled_out_by_scip on
-                        // some edges — refresh it or it goes stale again
-                        // immediately relative to the columns it's filtered on.
-                        if let Err(e) = ci_core::indexer::pipeline::refresh_caller_counts(&conn) {
-                            tracing::warn!("caller_count refresh after SCIP overlay failed: {e}");
+                #[cfg(feature = "scip-overlay")]
+                if index_ok {
+                    let rust_cfg = ci_core::config::load_config(&indexer_root)
+                        .map(|c| c.rust)
+                        .unwrap_or_default();
+                    let dirty = ci_core::scip::rust_source_dirty_keys(&conn);
+                    match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg, &dirty) {
+                        Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                            // caller_count was computed by rebuild_graph before this
+                            // overlay flipped edge_confidence/ruled_out_by_scip on
+                            // some edges — refresh it or it goes stale again
+                            // immediately relative to the columns it's filtered on.
+                            if let Err(e) = ci_core::indexer::pipeline::refresh_caller_counts(&conn)
+                            {
+                                tracing::warn!(
+                                    "caller_count refresh after SCIP overlay failed: {e}"
+                                );
+                            }
+                            tracing::info!(
+                                "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
+                                stats.upgraded,
+                                stats.ruled_out
+                            );
                         }
-                        tracing::info!(
-                            "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
-                            stats.upgraded,
-                            stats.ruled_out
-                        );
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                 }
+                #[cfg(not(feature = "scip-overlay"))]
+                let _ = index_ok;
             }
+            // Watch for edits and incrementally reindex (and re-embed) until shutdown.
+            watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct, watch_embedder);
+        });
+        // Await (rather than discard) the indexer thread's handle so a panic
+        // inside it — which would otherwise silently strand `phase` at
+        // whatever it was mid-run, with nothing left to ever advance it —
+        // gets reflected as `Failed` instead. Doesn't delay server startup:
+        // this whole block is itself a detached `tokio::spawn`, so `serve`
+        // continues to the transport below immediately either way.
+        if let Err(join_err) = handle.await {
+            tracing::error!("Background indexer thread panicked: {join_err}");
+            *outer_phase.write().unwrap() = ci_core::types::IndexingPhase::Failed;
+            *outer_last_index_error.write().unwrap() =
+                Some(format!("indexer thread panicked: {join_err}"));
         }
-        // Watch for edits and incrementally reindex (and re-embed) until shutdown.
-        watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct, watch_embedder);
     });
 
     let transport = stdio();
@@ -151,7 +221,6 @@ pub async fn serve_stdio_with_preset(
     tracing::info!("Server shut down cleanly");
     Ok(())
 }
-
 /// True when semantic search should stop before ever attempting a network
 /// call: the configured model is the vendored default, that vendored asset
 /// is unusable (see `ci_core::embedding::default_vendored_asset_unusable`),
@@ -255,7 +324,6 @@ pub fn default_db_path(project_root: &std::path::Path) -> PathBuf {
 
 pub fn doctor(project_root: &std::path::Path) -> Result<()> {
     use ci_core::db::schema::init_db;
-    use rusqlite::Connection;
 
     println!("Build: {}", ci_core::BUILD_INFO);
     match current_git_head_short(project_root) {
@@ -286,7 +354,7 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
 
     println!("DB path: {}", db_path.display());
     if db_path.exists() {
-        let conn = Connection::open(&db_path)?;
+        let conn = ci_core::db::conn::open_writer(&db_path)?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
         println!("  symbols: {count}");
         let file_count: i64 =
@@ -307,7 +375,7 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = ci_core::db::conn::open_writer(&db_path)?;
         init_db(&conn)?;
         println!("  created empty DB");
     }

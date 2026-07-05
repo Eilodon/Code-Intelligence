@@ -128,6 +128,10 @@ pub struct CodeIntelligenceServer {
     /// Tools read it to report `indexing_phase` / `edges_ready` honestly instead
     /// of assuming the graph is built.
     phase: Arc<RwLock<IndexingPhase>>,
+    /// Error message from the most recent indexing failure (full index or
+    /// incremental reindex), if `phase` is currently `Failed`. Cleared
+    /// (set back to `None`) whenever a run completes successfully.
+    last_index_error: Arc<RwLock<Option<String>>>,
     /// Loaded embedding model (None until/unless embeddings are enabled+ready),
     /// shared with the background indexer that loads it.
     embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
@@ -1121,6 +1125,59 @@ mod tests {
         assert_eq!(
             v["aggregate_risk"], "low",
             "a scanned-but-empty file must not be treated as unindexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `file_index` row can exist with `language = NULL` — a
+    /// recognized-unparsed extension (see `is_recognized_unparsed_extension`)
+    /// tracked by path only, never by symbols. Must be reported in
+    /// `unindexed_files` with its own "recognized_unparsed" reason (distinct
+    /// from both "pending_scan", which implies it'll resolve on its own, and
+    /// silently falling through as a normal scanned-but-empty file), and must
+    /// not poison `aggregate_risk` the way a genuine "pending_scan" would.
+    #[test]
+    fn diff_impact_recognized_unparsed_extension_file_has_own_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_diff_impact_recognized_unparsed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('contracts/Token.sol', 'deadbeef', NULL, 0, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let diff = "diff --git a/contracts/Token.sol b/contracts/Token.sol\n\
+                     --- a/contracts/Token.sol\n\
+                     +++ b/contracts/Token.sol\n\
+                     @@ -1,1 +1,2 @@\n\
+                      pragma solidity ^0.8.0;\n\
+                     +contract Token {}\n";
+
+        let output = server.diff_impact(DiffImpactParams {
+            diff: Some(diff.to_string()),
+            staged: None,
+            commits: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "contracts/Token.sol", "reason": "recognized_unparsed"}])
+        );
+        assert_eq!(
+            v["aggregate_risk"], "low",
+            "a recognized-unparsed file alone must not force aggregate_risk to unknown"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

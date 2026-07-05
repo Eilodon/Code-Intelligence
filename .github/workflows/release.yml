@@ -42,7 +42,12 @@ jobs:
       # bump it by hand — stamp it from the tag so `ci --version` always
       # matches the artifact it shipped in.
       - name: Set crate version from tag
-        run: sed -i "s/^version = \".*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+        # `-i.bak` (suffix glued to the flag, no space) is the one `sed -i`
+        # spelling both GNU sed (Linux runners) and BSD sed (macOS runner)
+        # accept the same way — a bare `-i` is GNU-only and errors on BSD.
+        run: |
+          sed -i.bak "s/^version = \".*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
 
       # `cross` runs the build in a container that already has the C
       # cross-toolchain tree-sitter / stack-graphs / rusqlite need.

@@ -100,7 +100,7 @@ agent: "I need to change getUserByEmail"
 
 ### Multi-tier indexing
 - **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution.
-- **8 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell — get regex/line-scan symbol extraction (no call graph or import resolution). Built in, no feature flag required.
+- **9 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell, R — get regex/line-scan symbol extraction (no call graph or import resolution) by default, upgraded to full AST parsing, call-graph and import resolution when the matching optional grammar feature is compiled in (on by default via the `tier0-5` feature bundle).
 - **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `calm serve` picks incremental reindex automatically whenever an index already exists.
 
 ### A call graph you can actually trust

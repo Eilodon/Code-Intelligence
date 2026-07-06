@@ -240,6 +240,29 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             class_node_types: &["class_specifier", "struct_specifier", "enum_specifier"],
             class_name_field: "name",
         }),
+        // R: functions are anonymous r-values — `foo <- function(x) {...}` is a
+        // `binary_operator` node (lhs=name, operator="<-"/"<<-"/"="/":=", rhs=
+        // function_definition), or the parenthesized right-assign form
+        // `(function(x) {...}) -> foo` (operator="->"/"->>", name/value sides
+        // swapped; the *unparenthesized* form doesn't work here — see
+        // resolve_name_node's comment for why). Matching bare
+        // `function_definition` would misfire on `resolve_name_node`'s generic
+        // `name_field` lookup below: that node's own "name" field is the
+        // `function`/`\` keyword token, not an identifier, so every anonymous
+        // callback would otherwise mint a fake symbol literally named "function".
+        // See resolve_name_node's "binary_operator" arm for the real name walk.
+        // No class syntax exists (S3/S4/R6/RefClasses are all `setClass()`/
+        // `R6::R6Class()` calls, not grammar nodes) — class_node_types is empty,
+        // same as Go.
+        "r" => Some(LangConstants {
+            function_node_types: &["binary_operator"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["call"],
+            call_function_field: "function",
+            class_node_types: &[],
+            class_name_field: "name",
+        }),
         _ => None,
     }
 }
@@ -305,6 +328,14 @@ pub fn branch_node_kinds(language: &str) -> &'static [&'static str] {
             "catch_clause",
             "ternary_expression",
         ],
+        // `switch()` in R is an ordinary call, not grammar-level branching, so
+        // it's invisible here (same class of gap as R having no class syntax).
+        "r" => &[
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "repeat_statement",
+        ],
         _ => &[],
     }
 }
@@ -332,6 +363,8 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
         "kt" | "kts" => Some("kotlin"),
         "swift" => Some("swift"),
         "php" => Some("php"),
+        // Community convention is capital ".R"; lowercase ".r" also occurs.
+        "r" | "R" => Some("r"),
 
         _ => None,
     }

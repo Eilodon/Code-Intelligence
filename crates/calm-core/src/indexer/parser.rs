@@ -81,6 +81,11 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         "method_declaration" | "method_definition" => SymbolKind::Method,
         // JS/TS `const foo = () => {}` — treated as a variable holding a function.
         "lexical_declaration" => SymbolKind::Variable,
+        // R `foo <- function(x) {...}` — unlike JS's `const`, assignment is R's
+        // *only* function-definition syntax (no separate `function foo() {}`
+        // declaration form exists), so the bound name is treated as a real
+        // Function rather than a Variable-holding-a-closure.
+        "binary_operator" => SymbolKind::Function,
         // Plain function nodes: Method when inside a class/impl, Function otherwise.
         // Also covers TS/JS `generator_function_declaration` (see
         // lang_constants.rs) — a generator is still a plain function/method
@@ -122,6 +127,8 @@ pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
         "c" => tree_sitter_c::LANGUAGE.into(),
         #[cfg(feature = "lang-cpp")]
         "cpp" => tree_sitter_cpp::LANGUAGE.into(),
+        #[cfg(feature = "lang-r")]
+        "r" => tree_sitter_r::LANGUAGE.into(),
         _ => return None,
     };
     let mut parser = tree_sitter::Parser::new();
@@ -217,6 +224,41 @@ fn resolve_name_node<'a>(
             }
             node.child_by_field_name("declarator")
                 .and_then(find_ident_in_declarator)
+        }
+        // R has no named-function syntax at all: `foo <- function(x) {...}`
+        // binds an anonymous `function_definition` r-value to `foo` via a
+        // `binary_operator` (fields lhs/operator/rhs). Only proceed when the
+        // value side really is a function literal (optionally parenthesized),
+        // so `x <- 5` or `a <- b` are never mistaken for symbols — same guard
+        // shape as the `lexical_declaration` arm above.
+        //
+        // Bare right-assign, `function(x) {...} -> foo`, deliberately is NOT
+        // recognized: verified against tree-sitter-r's actual parse that a
+        // function body extends as far right as possible, so `-> foo` binds
+        // *inside* the body (making `foo` part of the function, not its name)
+        // rather than wrapping the definition — a real R precedence gotcha,
+        // not a parser bug. Only the explicitly-parenthesized form,
+        // `(function(x) {...}) -> foo`, is unambiguous and handled here.
+        "binary_operator" => {
+            let op = node.child_by_field_name("operator")?;
+            let (name_side, value_side) = match op.kind() {
+                "<-" | "<<-" | "=" | ":=" => ("lhs", "rhs"),
+                "->" | "->>" => ("rhs", "lhs"),
+                _ => return None,
+            };
+            let mut value = node.child_by_field_name(value_side)?;
+            if value.kind() == "parenthesized_expression" {
+                value = value.child_by_field_name("body")?;
+            }
+            if value.kind() != "function_definition" {
+                return None;
+            }
+            let name = node.child_by_field_name(name_side)?;
+            if name.kind() == "identifier" {
+                Some(name)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -1009,8 +1051,15 @@ fn walk_calls(
     out: &mut Vec<RawCall>,
 ) {
     let mut current = enclosing;
+    // `resolve_name_node` (not a raw `name_field` lookup) so the enclosing
+    // symbol is found the same way `walk_symbols` finds it — e.g. JS/TS
+    // `const foo = () => {...}` (name lives on a `variable_declarator` child,
+    // not directly on `lexical_declaration`) or R `foo <- function(x) {...}`
+    // (name lives on the `binary_operator`'s `lhs`, not a "name" field at
+    // all). Without this, a call made *inside* one of those forms silently
+    // got attributed to no enclosing symbol (or the wrong one).
     if consts.function_node_types.contains(&node.kind())
-        && let Some(name_node) = node.child_by_field_name(consts.name_field)
+        && let Some(name_node) = resolve_name_node(node, consts)
     {
         current = Some((
             source[name_node.byte_range()].to_string(),
@@ -1687,6 +1736,44 @@ fn is_comment_line(trimmed: &str, language: &str) -> bool {
     }
 }
 
+// R has no dedicated function-declaration keyword: `name <- function(...)`
+// is an ordinary assignment. Real-grammar mode (the `lang-r` feature)
+// resolves this precisely via `resolve_name_node`'s "binary_operator" arm;
+// this line-scan fallback only approximates the common left-assign forms
+// (no `->` right-assign support — rare enough in practice to skip here).
+fn detect_r(s: &str) -> Option<(String, SymbolKind)> {
+    for sep in ["<<-", "<-", "="] {
+        let Some(idx) = s.find(sep) else { continue };
+        let lhs = s[..idx].trim();
+        let rhs = s[idx + sep.len()..].trim_start();
+        if !(rhs.starts_with("function(") || rhs.starts_with("function (")) {
+            continue;
+        }
+        let Some(name) = r_ident_at_start(lhs) else {
+            continue;
+        };
+        if name == lhs {
+            return Some((name, SymbolKind::Function));
+        }
+    }
+    None
+}
+
+// Like `ident_at_start`, but also allows `.` — common in idiomatic R names
+// (S3 method dispatch like `print.myclass`, or the `.hidden` "private by
+// convention" prefix), which the shared helper deliberately excludes for
+// the other shallow-mode languages.
+fn r_ident_at_start(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let s = strip_modifiers(trimmed, language);
     match language {
@@ -1697,6 +1784,7 @@ fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)>
         "kotlin" => detect_kotlin(s),
         "swift" => detect_swift(s),
         "php" => detect_php(s),
+        "r" => detect_r(s),
         _ => None,
     }
 }
@@ -2481,6 +2569,12 @@ public class FooTest {
         assert!(parse_tree("int foo() { return 0; }\n", "cpp").is_some());
     }
 
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn test_tier0_5_grammar_loads_r() {
+        assert!(parse_tree("foo <- function(x) {\n  x\n}\n", "r").is_some());
+    }
+
     /// Regression test for the shell-specific bug this guard suite was born
     /// from: with a working grammar, a `NAME=$(...)` / `NAME=(...)` variable
     /// assignment must never be reported as a function symbol, and a real
@@ -2525,6 +2619,40 @@ public class FooTest {
         assert_eq!(find(&symbols, "Foo").kind, SymbolKind::Class);
         assert_eq!(find(&symbols, "Bar").kind, SymbolKind::Struct);
         assert_eq!(find(&symbols, "Color").kind, SymbolKind::Enum);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn test_r_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "os <- 5\nsquare <- function(x) {\n  x * x\n}\ncaller <- function(y) {\n  if (y > 0) {\n    square(y)\n  }\n}\n(function(x) x^3) -> cube\n";
+        let symbols = extract_symbols(code, "r", "a.R").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            !names.contains(&"os"),
+            "plain assignment must not be a symbol"
+        );
+        assert!(names.contains(&"square"));
+        assert!(names.contains(&"caller"));
+        assert!(
+            names.contains(&"cube"),
+            "parenthesized right-assign function definition must be a symbol"
+        );
+
+        let calls = extract_calls(code, "r", "a.R").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "caller" && c.callee == "square"),
+            "caller calling square must produce a call edge"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn test_r_real_grammar_symbol_kinds() {
+        let code = "standalone <- function() {\n  1\n}\n";
+        let symbols = extract_symbols(code, "r", "a.R").unwrap();
         assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
     }
 
@@ -2610,6 +2738,22 @@ public class FooTest {
         assert!(names.contains(&"Animal"), "should detect class");
         assert!(names.contains(&"speak"), "should detect def");
         assert!(names.contains(&"Concerns"), "should detect module");
+    }
+
+    #[test]
+    fn test_shallow_r() {
+        let code = "os <- 5\nsquare <- function(x) {\n  x * x\n}\nprint.myclass = function(x, ...) {\n  cat(x)\n}\n";
+        let syms = extract_symbols_shallow(code, "r", "a.R");
+        let names = shallow_names(&syms);
+        assert!(
+            !names.contains(&"os"),
+            "plain assignment should not be detected as a function"
+        );
+        assert!(names.contains(&"square"), "should detect <- function(...)");
+        assert!(
+            names.contains(&"print.myclass"),
+            "should detect dotted S3-method name via = function(...)"
+        );
     }
 
     #[test]

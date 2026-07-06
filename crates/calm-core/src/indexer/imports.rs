@@ -35,6 +35,14 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
         // `parse_js_require` wants a `require(...)` call RHS).
         "javascript" | "typescript" => &["import_statement", "variable_declarator"],
         "java" => &["import_declaration"],
+        // R has no import statement: `library(pkg)`/`require(pkg)` are ordinary
+        // calls loading an installed CRAN package (never a repo file, so this
+        // never resolves to a cross-file edge the way Python/JS imports can —
+        // it's recorded purely as external-dependency metadata). Every `call`
+        // node is walked and `parse_r_library` rejects the vast majority that
+        // aren't library/require — same cost shape as JS's `variable_declarator`
+        // firing on every declaration to catch the rare `require()` among them.
+        "r" => &["call"],
         _ => &[],
     }
 }
@@ -87,6 +95,7 @@ fn parse_import(text: &str, language: &str) -> Option<ParsedImport> {
         "go" => parse_go_import(text),
         "javascript" | "typescript" => parse_js_import(text),
         "java" => parse_java_import(text),
+        "r" => parse_r_library(text),
         _ => None,
     }
 }
@@ -334,6 +343,30 @@ fn parse_java_import(text: &str) -> Option<ParsedImport> {
     })
 }
 
+fn parse_r_library(text: &str) -> Option<ParsedImport> {
+    // `library(pkg)`, `require(pkg)`, `requireNamespace("pkg")` — argument may
+    // be a bare identifier (NSE convention) or a quoted string; either way
+    // take everything up to the first `,`/`)` as the package name.
+    let rest = text
+        .strip_prefix("library(")
+        .or_else(|| text.strip_prefix("require("))
+        .or_else(|| text.strip_prefix("requireNamespace("))?
+        .trim_start();
+    let end = rest.find([',', ')'])?;
+    let module = rest[..end].trim().trim_matches(['"', '\'']).to_string();
+    if module.is_empty()
+        || !module
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '.')
+    {
+        return None;
+    }
+    Some(ParsedImport {
+        module_name: module,
+        imported_names: Vec::new(),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +478,28 @@ mod tests {
         let i = one("import a.b.C;\n", "java");
         assert_eq!(i.module_name, "a.b.C");
         assert_eq!(i.imported_names, vec!["C"]);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn r_library_call_import() {
+        let i = one("library(dplyr)\n", "r");
+        assert_eq!(i.module_name, "dplyr");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn r_require_quoted_string_import() {
+        let i = one("require(\"ggplot2\")\n", "r");
+        assert_eq!(i.module_name, "ggplot2");
+    }
+
+    /// An ordinary call must not be mistaken for a `library()`/`require()`
+    /// import now that every `call` node is walked for R.
+    #[test]
+    #[cfg(feature = "lang-r")]
+    fn r_ordinary_call_yields_no_import() {
+        let v = extract_imports("mean(x)\n", "r");
+        assert!(v.is_empty(), "expected no import, got {v:?}");
     }
 }

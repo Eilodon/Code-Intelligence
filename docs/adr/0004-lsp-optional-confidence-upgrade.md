@@ -230,12 +230,24 @@ tiền lệ cho live-LSP.
   đi **trước hoặc song song**, không phụ thuộc ADR này — rẻ hơn LSP nhiều bậc, tận dụng đúng
   investment đã có, đóng phần lớn gap accuracy cho 3/6 Tier-0 mà không đổi risk profile.
   **Cập nhật 2026-07-03**: TypeScript đã xong (xem ADR-0002 Update) — rẻ và ít rủi ro đúng như dự
-  đoán, builtins upstream dùng thẳng được, không cần workaround. JavaScript và Java hoá ra khó hơn
-  Python/TypeScript đáng kể — builtins rỗng như Python nhưng cơ chế wiring khác hẳn (JS: builtins
-  gắn trực tiếp vào node `@prog` per-file, không qua file `<builtins>` fallback; Java: `stack-graphs.tsg`
-  không có bất kỳ khái niệm builtins nào cả) — cả hai cần đọc kỹ `.tsg` rules từ đầu trước khi viết
-  fix, không phải port nguyên `PYTHON_BUILTINS_STUB`. Vẫn rẻ hơn LSP, nhưng không rẻ đều như ADR này
-  từng giả định — cần đánh giá lại effort riêng cho JS/Java trước khi cam kết thời điểm.
+  đoán, builtins upstream dùng thẳng được, không cần workaround. JavaScript hoá ra khó hơn
+  Python/TypeScript đáng kể — builtins rỗng như Python nhưng cơ chế wiring khác hẳn (builtins
+  gắn trực tiếp vào node `@prog` per-file, không qua file `<builtins>` fallback) — cần đọc kỹ
+  `.tsg` rules từ đầu trước khi viết fix, không phải port nguyên `PYTHON_BUILTINS_STUB`.
+
+  **Cập nhật 2026-07-06**: Java đã xong (`resolver/formal.rs::load_java`,
+  `build_java_builtins_graph`). Sửa lại nhận định "không có bất kỳ khái niệm builtins nào
+  cả" ở trên — **sai**, hoặc ít nhất chưa đọc đủ sâu: `stack-graphs.tsg` của Java có rule
+  `(program (package_declaration)? @package) @prog { if none @package { edge ROOT_NODE ->
+  @prog.defs } ... }` — một file KHÔNG có `package` declaration thì toàn bộ top-level
+  declarations của nó nối thẳng vào `ROOT_NODE`, và mọi file khác (có package hay không)
+  luôn có `lexical_scope -> ROOT_NODE` nên plain-identifier reference nào cũng chạm được tới
+  đó. Kết quả: `build_java_builtins_graph` port gần như nguyên xi `build_python_builtins_graph`
+  (source stub Java không package, không cần `<builtins>`/FILE_PATH-anchored pop_symbol trick
+  như Python) — verify bằng `test_resolve_file_resolves_java_builtins` (System/Object resolve
+  qua formal tier). Effort thực tế: S/M đúng như dự đoán ban đầu của ADR này, không phải L
+  như ghi chú 2026-07-04 ở trên từng lo ngại — ghi chú đó áp dụng đúng cho JavaScript, sai
+  khi gộp chung với Java. Go vẫn chưa có formal tier — xem Pilot Plan ở trên.
 - Thêm một trục vận hành mới (subprocess LSP theo ngôn ngữ) cần giám sát riêng: leak process nếu
   server crash giữa chừng, version drift giữa gopls trên máy user và version đã test.
 - `stack-graphs` upstream đã archived (ADR-0002 Consequences) — rủi ro dài hạn cho formal tier

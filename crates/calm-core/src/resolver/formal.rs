@@ -173,6 +173,98 @@ fn build_python_builtins_graph(sgl: &StackGraphLanguage) -> anyhow::Result<Stack
     Ok(graph)
 }
 
+/// Stub source for a virtual, unpackaged Java compilation unit, standing in
+/// for `tree-sitter-stack-graphs-java` 0.5.0's own bundled `src/builtins.java`
+/// (which ships empty, like Python's did — see `build_python_builtins_graph`).
+/// Unlike Python, no `<builtins>`/`FILE_PATH` naming trick is needed: the
+/// Java TSG's own `(program (package_declaration)? @package) @prog` rule
+/// wires `ROOT_NODE -> @prog.defs` directly whenever `@package` is absent, so
+/// an unpackaged file's top-level declarations become reachable from any
+/// other file's plain-identifier reference (which always chains up through
+/// `lexical_scope` to `ROOT_NODE`, regardless of that other file's own
+/// package). Covers the bulk of `java.lang` (auto-imported in every `.java`
+/// file, no `import` needed) — not exhaustive, but the names most likely to
+/// show up in real code. Bodies are empty (`{}`) — only the *names* need to
+/// exist as top-level definitions for references to resolve to.
+const JAVA_BUILTINS_STUB: &str = r#"
+class Object {}
+class String {}
+class StringBuilder {}
+class StringBuffer {}
+class Boolean {}
+class Byte {}
+class Short {}
+class Character {}
+class Integer {}
+class Long {}
+class Float {}
+class Double {}
+class Number {}
+class Math {}
+class System {}
+class Class {}
+class Void {}
+class Thread {}
+class ThreadLocal {}
+class Runtime {}
+class Enum {}
+class Record {}
+class Throwable {}
+class Exception {}
+class RuntimeException {}
+class Error {}
+class NullPointerException {}
+class IllegalArgumentException {}
+class IllegalStateException {}
+class IndexOutOfBoundsException {}
+class ArrayIndexOutOfBoundsException {}
+class StringIndexOutOfBoundsException {}
+class ClassCastException {}
+class NumberFormatException {}
+class UnsupportedOperationException {}
+class ArithmeticException {}
+class CloneNotSupportedException {}
+class InterruptedException {}
+class SecurityException {}
+class OutOfMemoryError {}
+class StackOverflowError {}
+class AssertionError {}
+interface Runnable {}
+interface Comparable {}
+interface CharSequence {}
+interface Iterable {}
+interface AutoCloseable {}
+interface Cloneable {}
+interface Appendable {}
+@interface Override {}
+@interface Deprecated {}
+@interface SuppressWarnings {}
+@interface FunctionalInterface {}
+@interface SafeVarargs {}
+"#;
+
+/// Builds a `StackGraph` holding definitions for `JAVA_BUILTINS_STUB`, reusing
+/// the same compiled TSG rules (`sgl`) the upstream crate uses for ordinary
+/// files. The virtual file has no package declaration, so its top-level
+/// classes/interfaces/annotations attach directly to `ROOT_NODE` — see
+/// `JAVA_BUILTINS_STUB`'s doc comment for why that alone makes them visible
+/// from any other file's unqualified references.
+fn build_java_builtins_graph(sgl: &StackGraphLanguage) -> anyhow::Result<StackGraph> {
+    let mut graph = StackGraph::new();
+    let file = graph.get_or_create_file("<builtins>.java");
+
+    let mut globals = Variables::new();
+    globals
+        .add("FILE_PATH".into(), "<builtins>.java".into())
+        .map_err(|_| anyhow::anyhow!("Failed to set FILE_PATH global for builtins"))?;
+
+    let deadline = TsgCancelAfterDuration::new(RESOLVE_TIMEOUT);
+    sgl.build_stack_graph_into(&mut graph, file, JAVA_BUILTINS_STUB, &globals, &deadline)
+        .map_err(|e| anyhow::anyhow!("Failed to build Java builtins stack graph: {e:?}"))?;
+
+    Ok(graph)
+}
+
 /// Same as `ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file`
 /// (stack-graphs 0.14), but with `max_work_per_phase` bounded — see
 /// `MAX_WORK_PER_PHASE` for why.
@@ -310,6 +402,30 @@ impl FormalResolver {
                     sgl: lc_tsx.sgl,
                     builtins: lc_tsx.builtins,
                 }),
+            },
+        );
+        Ok(())
+    }
+
+    /// Java formal resolution. Unlike Python (`load_python`), no dialect
+    /// variant is needed — Java has no `.tsx`-style split, matching
+    /// TypeScript's own primary (non-tsx) shape. Like Python, upstream's
+    /// bundled builtins source (`tree-sitter-stack-graphs-java`'s
+    /// `src/builtins.java`) ships empty, so `lc.builtins` is replaced with
+    /// `build_java_builtins_graph`'s output — see that function's doc comment
+    /// for why no `<builtins>` path/FILE_PATH trick is needed here, unlike
+    /// Python.
+    pub fn load_java(&mut self) -> anyhow::Result<()> {
+        let lc = tree_sitter_stack_graphs_java::try_language_configuration(cancellation_flag())
+            .map_err(|e| anyhow::anyhow!("Failed to load Java stack-graphs config: {e}"))?;
+        let builtins = build_java_builtins_graph(&lc.sgl)?;
+        self.configs.insert(
+            "java".to_string(),
+            FormalLanguageConfig {
+                sgl: lc.sgl,
+                builtins,
+                no_similar_paths_in_file: lc.no_similar_paths_in_file,
+                tsx: None,
             },
         );
         Ok(())
@@ -770,6 +886,117 @@ function Bar() {
                 "typescript",
                 "test.ts",
                 "function useUndefined() {\n    return totallyUndefinedXyz();\n}\n",
+            )
+            .unwrap();
+
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.reference_symbol == "totallyUndefinedXyz"),
+            "a genuinely undefined name must not resolve. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_java() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_java().unwrap();
+        assert!(resolver.has_language("java"));
+    }
+
+    #[test]
+    fn test_resolve_simple_java_def_ref() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_java().unwrap();
+        let source = r#"
+class Foo {
+    static void greet() {}
+
+    static void run() {
+        greet();
+    }
+}
+"#;
+        let edges = resolver.resolve_file("java", "Foo.java", source).unwrap();
+        let has_greet_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "greet" || e.reference_symbol == "greet");
+        assert!(
+            has_greet_edge,
+            "Should resolve greet() call to greet definition. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_java_class() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_java().unwrap();
+        let source = r#"
+class MyClass {
+    void method() {}
+}
+
+class UseClass {
+    void useClass() {
+        MyClass obj = new MyClass();
+    }
+}
+"#;
+        let edges = resolver
+            .resolve_file("java", "MyClass.java", source)
+            .unwrap();
+        let has_class_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "MyClass" || e.reference_symbol == "MyClass");
+        assert!(
+            has_class_edge,
+            "Should resolve MyClass reference to class definition. Edges: {edges:?}"
+        );
+    }
+
+    /// Mirrors `test_resolve_file_resolves_python_builtins`: `System` and
+    /// `Object` (both `java.lang`, implicitly visible with no `import`) must
+    /// resolve through the formal tier via `JAVA_BUILTINS_STUB`, not just
+    /// merge into the graph without crashing.
+    #[test]
+    fn test_resolve_file_resolves_java_builtins() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_java().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "java",
+                "Foo.java",
+                "class Foo {\n    void bar() {\n        Object o = new Object();\n        System.out.println(o);\n    }\n}\n",
+            )
+            .unwrap();
+
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "Object" && e.definition_symbol == "Object"),
+            "Object must resolve through the formal tier. Edges: {edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.reference_symbol == "System" && e.definition_symbol == "System"),
+            "System must resolve through the formal tier. Edges: {edges:?}"
+        );
+    }
+
+    /// A genuinely undefined name must still fail to resolve — the builtins
+    /// fix must not make FormalResolver resolve *everything*.
+    #[test]
+    fn test_resolve_java_does_not_resolve_undefined_name() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_java().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "java",
+                "Foo.java",
+                "class Foo {\n    void bar() {\n        totallyUndefinedXyz();\n    }\n}\n",
             )
             .unwrap();
 

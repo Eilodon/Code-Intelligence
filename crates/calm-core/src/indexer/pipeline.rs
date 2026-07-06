@@ -1060,6 +1060,7 @@ pub fn run_indexing_pipeline(
     let mut formal = crate::resolver::formal::FormalResolver::new();
     let _ = formal.load_python(); // non-fatal: falls back silently on error
     let _ = formal.load_typescript(); // non-fatal: falls back silently on error
+    let _ = formal.load_java(); // non-fatal: falls back silently on error
 
     let mut files = Vec::new();
     collect_source_files(project_root, &ignore_patterns, &mut files);
@@ -1151,6 +1152,7 @@ pub fn reindex_changed(
     let mut formal = crate::resolver::formal::FormalResolver::new();
     let _ = formal.load_python();
     let _ = formal.load_typescript();
+    let _ = formal.load_java();
 
     let existing: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM file_index")?;

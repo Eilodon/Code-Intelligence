@@ -233,6 +233,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-stack-graphs",
+ "tree-sitter-stack-graphs-java",
  "tree-sitter-stack-graphs-python",
  "tree-sitter-stack-graphs-typescript",
  "tree-sitter-typescript",
@@ -2642,9 +2643,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-java"
-version = "0.23.5"
+version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+checksum = "6f9b24494d5f386acb2c086e0541c1b145692e0e012101ddb8257737b83c2803"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -2751,6 +2752,16 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-graph",
  "tree-sitter-loader",
+]
+
+[[package]]
+name = "tree-sitter-stack-graphs-java"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d36213fcb299a43a136cfd7fd695da1da399591da6674690eb1bdeab4207e2"
+dependencies = [
+ "tree-sitter-java",
+ "tree-sitter-stack-graphs",
 ]
 
 [[package]]

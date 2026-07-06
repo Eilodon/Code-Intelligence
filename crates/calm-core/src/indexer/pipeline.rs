@@ -1432,6 +1432,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `.toml` specifically (not just the abstract extension registry) must
+    /// earn a `file_index` row the same way `Token.sol` does above — this is
+    /// the concrete case that motivated adding `toml` to
+    /// `is_recognized_unparsed_extension`: `Cargo.toml`/`rust-toolchain.toml`
+    /// were previously invisible to `file_index` entirely, which made
+    /// `diff_impact` misreport an edit to them as "out_of_scope" instead of
+    /// "recognized_unparsed", and `search(kind="glob")` couldn't find them by
+    /// path at all.
+    #[test]
+    fn test_run_indexing_pipeline_tracks_toml_as_recognized_unparsed() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_toml_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def hello():\n    pass\n").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1); // only a.py::hello
+
+        let toml_language: Option<String> = conn
+            .query_row(
+                "SELECT language FROM file_index WHERE path = 'Cargo.toml'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            toml_language, None,
+            "Cargo.toml must be tracked as recognized-unparsed (language = NULL)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for B4: known FNV-1a 64-bit test vectors (from the FNV
     /// reference test suite), independent of this codebase's own algorithm —
     /// confirms `hash_content` is a real, portable FNV-1a and not just

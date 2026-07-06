@@ -63,6 +63,14 @@ impl CodeIntelligenceServer {
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
     ) -> String {
+        // Serialize the whole read -> hash-check -> write -> reindex sequence:
+        // rmcp dispatches tool calls concurrently, and locking only the write
+        // phase left the read+hash-check racy (TOCTOU) -- two concurrent calls
+        // could both read the pre-edit snapshot, both pass hash validation,
+        // and the second writer's full-file replace would silently discard
+        // the first writer's change even on disjoint line ranges.
+        let _guard = self.edit_lock.lock().unwrap();
+
         let full_path = self.project_root.join(path);
         let original = match std::fs::read_to_string(&full_path) {
             Ok(s) => s,
@@ -142,11 +150,6 @@ impl CodeIntelligenceServer {
                 true,
             );
         }
-
-        // Serialize the write+reindex sequence — rmcp dispatches tool calls
-        // concurrently, and this is the one section that touches both the
-        // filesystem and the DB's single-writer slot.
-        let _guard = self.edit_lock.lock().unwrap();
 
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
             drop(_guard);

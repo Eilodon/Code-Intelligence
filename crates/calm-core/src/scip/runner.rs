@@ -14,13 +14,16 @@ pub const SCIP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Resolve a usable rust-analyzer binary path. Tries, in order: an explicit
 /// override, `PATH`, `rustup which`, and the VS Code extension bundle.
-pub fn resolve_binary(override_bin: Option<&str>) -> Option<PathBuf> {
+/// `root` scopes the `rustup which` probe to the project directory so a
+/// `rust-toolchain.toml` override there is honored instead of whatever
+/// toolchain happens to be active in the server process's own cwd.
+pub fn resolve_binary(override_bin: Option<&str>, root: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(b) = override_bin {
         candidates.push(PathBuf::from(b));
     }
     candidates.push(PathBuf::from("rust-analyzer")); // PATH lookup via which-style probe
-    if let Some(path) = rustup_which() {
+    if let Some(path) = rustup_which(root) {
         candidates.push(path);
     }
     if let Some(home) = dirs_home()
@@ -86,12 +89,36 @@ pub fn binary_version(bin: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// `rustc --version --verbose` run from `root`, trimmed, or `""` if it can't
+/// be run. Used alongside `binary_version` in the overlay cache key:
+/// `binary_version` fingerprints the rust-analyzer binary doing the
+/// analysis, this fingerprints the toolchain/edition semantics of the
+/// project being analyzed — switching active toolchain (`rustup default`,
+/// `rust-toolchain.toml`) without changing which rust-analyzer binary
+/// resolves must still invalidate the cache. `current_dir(root)` is what
+/// makes rustup's shim resolve the project's local override instead of
+/// whatever's active for the server process's own cwd.
+pub fn active_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 /// `rustup which rust-analyzer` — resolves the toolchain-managed binary when
-/// it's not directly on `PATH`. Absent/failing `rustup` is not an error here;
-/// `binary_runs` is the real gate.
-fn rustup_which() -> Option<PathBuf> {
+/// it's not directly on `PATH`. Run from `root` (not the server process's own
+/// cwd) and without a hardcoded `--toolchain`, so rustup's own override
+/// resolution (`rust-toolchain.toml`, `RUSTUP_TOOLCHAIN`, `rustup override`)
+/// picks the project's actual pinned toolchain instead of always `stable`.
+/// Absent/failing `rustup` is not an error here; `binary_runs` is the real gate.
+fn rustup_which(root: &Path) -> Option<PathBuf> {
     let out = Command::new("rustup")
-        .args(["which", "--toolchain", "stable", "rust-analyzer"])
+        .args(["which", "rust-analyzer"])
+        .current_dir(root)
         .output()
         .ok()?;
     if !out.status.success() {

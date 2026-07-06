@@ -337,19 +337,22 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// File extensions recognized as meaningful source for a language this
-/// indexer has no extraction support for at all — no tree-sitter grammar, no
-/// shallow regex fallback (`language_for_extension` returns `None` for all of
-/// these). A match still earns the file a `file_index` row (path, hash, mtime,
-/// `language = NULL`, `symbol_count = 0`) via `collect_source_files`, so it's
-/// visible to `dependencies`/`repo_overview`/`diff_impact` as "recognized but
+/// File extensions recognized as meaningful but not source-parsed: either a
+/// language this indexer has no extraction support for at all (no
+/// tree-sitter grammar, no shallow regex fallback — `language_for_extension`
+/// returns `None` for all of these), or a config/data format like TOML that
+/// isn't a programming language and never will have one. A match still earns
+/// the file a `file_index` row (path, hash, mtime, `language = NULL`,
+/// `symbol_count = 0`) via `collect_source_files`, so it's visible to
+/// `dependencies`/`repo_overview`/`diff_impact`/`search` as "recognized but
 /// unparsed" rather than being indistinguishable from a truly invisible file
 /// (an image, a lockfile, a doc) that still gets no row at all. Deliberately
 /// narrow — this is not a general "track every file" catch-all, just enough to
-/// give diff_impact an honest, non-misleading signal for these languages
-/// until real extraction support exists.
+/// give diff_impact an honest, non-misleading signal (e.g. a `Cargo.toml` edit
+/// no longer reads as "out of scope") until real extraction support exists
+/// for the language entries.
 pub fn is_recognized_unparsed_extension(ext: &str) -> bool {
-    matches!(ext, "sol" | "circom" | "move" | "cairo" | "vy")
+    matches!(ext, "sol" | "circom" | "move" | "cairo" | "vy" | "toml")
 }
 
 #[cfg(test)]
@@ -358,7 +361,7 @@ mod tests {
 
     #[test]
     fn is_recognized_unparsed_extension_matches_known_registry() {
-        for ext in ["sol", "circom", "move", "cairo", "vy"] {
+        for ext in ["sol", "circom", "move", "cairo", "vy", "toml"] {
             assert!(
                 is_recognized_unparsed_extension(ext),
                 "{ext} should be recognized"
@@ -375,7 +378,7 @@ mod tests {
     /// entry here.
     #[test]
     fn is_recognized_unparsed_extension_never_overlaps_language_for_extension() {
-        for ext in ["sol", "circom", "move", "cairo", "vy"] {
+        for ext in ["sol", "circom", "move", "cairo", "vy", "toml"] {
             assert!(
                 language_for_extension(ext).is_none(),
                 "{ext} must not also be a language_for_extension entry"

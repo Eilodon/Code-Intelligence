@@ -22,8 +22,9 @@ use crate::config::RustConfig;
 /// silent (finding nothing is the common, expected case for a checkout that
 /// never configured this at all, not worth a log line every session).
 ///
-/// Caches on (rust-analyzer version, Cargo.lock hash, `dirty`): an unchanged
-/// toolchain, dependency set, and Rust source state means a re-run would find
+/// Caches on (rust-analyzer version, active toolchain fingerprint, Cargo.lock
+/// hash, Cargo.toml hash, `dirty`): an unchanged toolchain, dependency set,
+/// edition/workspace shape, and Rust source state means a re-run would find
 /// the same call graph, so the (comparatively expensive) rust-analyzer pass
 /// is skipped and the previous upgrades — already persisted as
 /// `formal`/`ruled_out_by_scip` in the DB — stand. `dirty` is the caller's
@@ -42,7 +43,7 @@ pub fn run_overlay(
     if rust.scip.enabled == Some(false) {
         return Ok(ingest::IngestStats::default());
     }
-    let Some(bin) = runner::resolve_binary(rust.scip.binary.as_deref()) else {
+    let Some(bin) = runner::resolve_binary(rust.scip.binary.as_deref(), root) else {
         if rust.scip.enabled == Some(true) {
             tracing::info!("SCIP overlay enabled but no rust-analyzer found — skipping");
         }
@@ -50,7 +51,13 @@ pub fn run_overlay(
     };
 
     let cache_path = root.join(".calm").join("scip.cache");
-    let key = cache::overlay_cache_key(&runner::binary_version(&bin), &lockfile_hash(root), dirty);
+    let key = cache::overlay_cache_key(
+        &runner::binary_version(&bin),
+        &runner::active_toolchain_fingerprint(root),
+        &lockfile_hash(root),
+        &cargo_toml_hash(root),
+        dirty,
+    );
     if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
         tracing::info!("SCIP overlay: cache key unchanged, skipping rust-analyzer run");
         return Ok(ingest::IngestStats::default());
@@ -85,6 +92,17 @@ pub fn run_overlay(
 /// still changes the moment one appears.
 fn lockfile_hash(root: &Path) -> String {
     std::fs::read_to_string(root.join("Cargo.lock"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// Hash of `Cargo.toml`'s contents, or `""` when absent. Catches `edition`
+/// and workspace-member changes that `lockfile_hash` won't: bumping
+/// `edition = "2021"` -> `"2024"` changes name resolution/macro semantics
+/// rust-analyzer relies on, without necessarily touching `Cargo.lock` or any
+/// `.rs` file.
+fn cargo_toml_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("Cargo.toml"))
         .map(|s| crate::indexer::pipeline::hash_content(&s))
         .unwrap_or_default()
 }
@@ -125,14 +143,16 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
     if rust.scip.enabled == Some(false) {
         return None;
     }
-    let bin = runner::resolve_binary(rust.scip.binary.as_deref());
+    let bin = runner::resolve_binary(rust.scip.binary.as_deref(), root);
     let available = bin.is_some();
     let up_to_date = match &bin {
         Some(bin) => {
             let dirty = rust_source_dirty_keys(conn);
             let key = cache::overlay_cache_key(
                 &runner::binary_version(bin),
+                &runner::active_toolchain_fingerprint(root),
                 &lockfile_hash(root),
+                &cargo_toml_hash(root),
                 &dirty,
             );
             let cache_path = root.join(".calm").join("scip.cache");

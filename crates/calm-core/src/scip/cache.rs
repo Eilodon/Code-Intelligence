@@ -60,10 +60,20 @@ mod tests {
     /// change the key on its own, independent of lockfile/version.
     #[test]
     fn cache_key_changes_with_dirty_content_alone() {
-        let a =
-            overlay_cache_key("1.96.0", "tc1", "hashAAA", "cargoA", &["src/x.rs@hash1".into()]);
-        let b =
-            overlay_cache_key("1.96.0", "tc1", "hashAAA", "cargoA", &["src/x.rs@hash2".into()]);
+        let a = overlay_cache_key(
+            "1.96.0",
+            "tc1",
+            "hashAAA",
+            "cargoA",
+            &["src/x.rs@hash1".into()],
+        );
+        let b = overlay_cache_key(
+            "1.96.0",
+            "tc1",
+            "hashAAA",
+            "cargoA",
+            &["src/x.rs@hash2".into()],
+        );
         assert_ne!(
             a, b,
             "same version + lockfile but different file content must not collide"

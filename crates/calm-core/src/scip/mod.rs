@@ -68,7 +68,7 @@ pub fn run_overlay(
         tracing::warn!("SCIP overlay run failed, keeping syntactic graph: {e}");
         return Ok(ingest::IngestStats::default());
     }
-    let occ = match parse::parse_scip_file(tmp.path()) {
+    let occ = match parse::parse_scip_file(tmp.path(), Path::new("")) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("SCIP parse failed: {e}");

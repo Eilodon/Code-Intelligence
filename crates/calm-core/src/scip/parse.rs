@@ -15,7 +15,17 @@ pub struct ScipOccurrence {
     pub is_local: bool,
 }
 
-pub fn parse_index(index: &scip::types::Index) -> Vec<ScipOccurrence> {
+pub fn parse_index(
+    index: &scip::types::Index,
+    rebase_prefix: &std::path::Path,
+) -> Vec<ScipOccurrence> {
+    // Some indexers run against a subdirectory rather than the repo root
+    // CALM's DB paths are keyed on (e.g. a `go.work` module, or a nested
+    // Maven module) — `rebase_prefix` is that subdirectory, relative to the
+    // repo root, so occurrences land on the same path convention as the rest
+    // of the graph. Empty prefix (Rust's runner today, which always runs at
+    // the repo root) is the identity transform: behavior unchanged.
+    let project_root = file_uri_to_path(&index.metadata.project_root);
     let mut out = Vec::new();
     for doc in &index.documents {
         for occ in &doc.occurrences {
@@ -25,8 +35,16 @@ pub fn parse_index(index: &scip::types::Index) -> Vec<ScipOccurrence> {
                 continue;
             };
             let is_def = occ.symbol_roles & (scip::types::SymbolRole::Definition as i32) != 0;
+            // A handful of indexers emit an absolute `relative_path` instead
+            // of a true relative one — strip the index's own project root
+            // first so both shapes end up rebased the same way.
+            let relative = if std::path::Path::new(&doc.relative_path).is_absolute() {
+                strip_project_root(&doc.relative_path, project_root.as_deref())
+            } else {
+                doc.relative_path.as_str()
+            };
             out.push(ScipOccurrence {
-                file: doc.relative_path.clone(),
+                file: rebase_path(relative, rebase_prefix),
                 line: (start_line as usize) + 1,
                 symbol: occ.symbol.clone(),
                 is_def,
@@ -37,11 +55,112 @@ pub fn parse_index(index: &scip::types::Index) -> Vec<ScipOccurrence> {
     out
 }
 
-pub fn parse_scip_file(path: &std::path::Path) -> anyhow::Result<Vec<ScipOccurrence>> {
+/// Join `prefix` onto a (already project-root-relative) SCIP path and
+/// normalize the result to a `/`-separated string with no `.`/`..`
+/// segments, so it matches the plain relative-path convention the rest of
+/// the graph (`file_index`, `call_edges`) is keyed on. `prefix` empty is the
+/// identity transform.
+fn rebase_path(relative_path: &str, prefix: &std::path::Path) -> String {
+    let joined = if prefix.as_os_str().is_empty() {
+        std::path::PathBuf::from(relative_path)
+    } else {
+        prefix.join(relative_path)
+    };
+    normalize_to_slash_path(&joined)
+}
+
+fn normalize_to_slash_path(path: &std::path::Path) -> String {
+    // Tracked separately from `parts` (rather than pushed as an empty
+    // sentinel) so a `..` component can never accidentally pop off the
+    // "this path is absolute" marker itself.
+    let mut is_absolute = false;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(s) => parts.push(s.to_os_string()),
+            std::path::Component::RootDir => is_absolute = true,
+            // Windows drive letters — this feature targets Linux/macOS
+            // indexers only; ignore rather than mishandle.
+            std::path::Component::Prefix(_) => {}
+        }
+    }
+    let joined = parts
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    // Preserve absoluteness: an unresolved absolute path (unknown
+    // project_root, see `strip_project_root`) must stay visibly absolute
+    // rather than silently degrade into a relative-looking string that
+    // could spuriously collide with an unrelated real file at that path.
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// Make an absolute SCIP `relative_path` (some indexers emit one instead of
+/// a true relative path) relative to `project_root`, so it can be rebased
+/// like a normal one. Falls back to the original string, unchanged, when
+/// `project_root` is unknown or isn't actually a prefix of `abs_path` — a
+/// best-effort degrade rather than a hard failure over one malformed field.
+fn strip_project_root<'a>(abs_path: &'a str, project_root: Option<&std::path::Path>) -> &'a str {
+    let Some(root) = project_root else {
+        return abs_path;
+    };
+    match std::path::Path::new(abs_path).strip_prefix(root) {
+        Ok(stripped) => stripped.to_str().unwrap_or(abs_path),
+        Err(_) => abs_path,
+    }
+}
+
+/// Percent-decode a `file://` URI, as emitted in SCIP's
+/// `Metadata.project_root`, into a plain filesystem path. Only unescapes the
+/// minimal `%XX` sequences real indexers actually emit (e.g. spaces as
+/// `%20`) — not a full URI parser, since pulling in a URL crate for this one
+/// field isn't worth it. Returns `None` for an empty/missing `project_root`
+/// (some indexers, or hand-built test fixtures, don't set it) or one that
+/// isn't a `file://` URI.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(percent_decode(rest)))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn parse_scip_file(
+    path: &std::path::Path,
+    rebase_prefix: &std::path::Path,
+) -> anyhow::Result<Vec<ScipOccurrence>> {
     let bytes = std::fs::read(path)?;
     use protobuf::Message;
     let index = scip::types::Index::parse_from_bytes(&bytes)?;
-    Ok(parse_index(&index))
+    Ok(parse_index(&index, rebase_prefix))
 }
 
 #[cfg(test)]
@@ -64,7 +183,7 @@ mod tests {
         doc.occurrences = vec![def, rf];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index);
+        let occ = parse_index(&index, std::path::Path::new(""));
         assert_eq!(occ.len(), 2);
         let def = occ.iter().find(|o| o.is_def).unwrap();
         assert_eq!(def.file, "core/src/engine.rs");
@@ -73,5 +192,93 @@ mod tests {
             def.symbol,
             "rust-analyzer cargo demo-core 0.1.0 engine/impl#[Engine]start()."
         );
+    }
+
+    #[test]
+    fn rebase_prefix_joins_onto_a_subroot() {
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "helper.go".into();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 0, 4];
+        def.symbol = "go gomod example.com/mod v0.0.0 helper.".into();
+        def.symbol_roles = scip::types::SymbolRole::Definition as i32;
+        doc.occurrences = vec![def];
+        index.documents = vec![doc];
+
+        let occ = parse_index(&index, std::path::Path::new("services/api"));
+        assert_eq!(occ.len(), 1);
+        assert_eq!(occ[0].file, "services/api/helper.go");
+    }
+
+    #[test]
+    fn rebase_prefix_normalizes_dot_segments() {
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "./helper.go".into();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 0, 4];
+        def.symbol = "go gomod example.com/mod v0.0.0 helper.".into();
+        doc.occurrences = vec![def];
+        index.documents = vec![doc];
+
+        let occ = parse_index(&index, std::path::Path::new("services/api/"));
+        assert_eq!(occ[0].file, "services/api/helper.go");
+    }
+
+    #[test]
+    fn absolute_relative_path_is_stripped_of_project_root_then_rebased() {
+        // Some indexers emit an absolute `relative_path` instead of a true
+        // relative one; `Metadata.project_root` is the file:// URI the
+        // ingester strips it against before rebasing onto `prefix`.
+        let mut index = scip::types::Index::new();
+        index.metadata.mut_or_insert_default().project_root = "file:///repo/services/api".into();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "/repo/services/api/helper.go".into();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 0, 4];
+        def.symbol = "go gomod example.com/mod v0.0.0 helper.".into();
+        doc.occurrences = vec![def];
+        index.documents = vec![doc];
+
+        let occ = parse_index(&index, std::path::Path::new("services/api"));
+        assert_eq!(occ[0].file, "services/api/helper.go");
+    }
+
+    #[test]
+    fn absolute_relative_path_with_unknown_project_root_falls_back_unchanged() {
+        // No project_root at all (some indexers/fixtures omit it) — the
+        // absolute path can't be safely stripped, so it degrades to
+        // passing the raw absolute string through `rebase_path` rather
+        // than panicking or silently dropping the occurrence.
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "/some/other/tree/helper.go".into();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 0, 4];
+        def.symbol = "go gomod example.com/mod v0.0.0 helper.".into();
+        doc.occurrences = vec![def];
+        index.documents = vec![doc];
+
+        let occ = parse_index(&index, std::path::Path::new(""));
+        assert_eq!(occ[0].file, "/some/other/tree/helper.go");
+    }
+
+    #[test]
+    fn empty_prefix_is_identity_rust_runner_behavior_unchanged() {
+        assert_eq!(
+            rebase_path("core/src/engine.rs", std::path::Path::new("")),
+            "core/src/engine.rs"
+        );
+    }
+
+    #[test]
+    fn file_uri_to_path_decodes_percent_escapes() {
+        assert_eq!(
+            file_uri_to_path("file:///repo%20dir/sub"),
+            Some(std::path::PathBuf::from("/repo dir/sub"))
+        );
+        assert_eq!(file_uri_to_path(""), None);
+        assert_eq!(file_uri_to_path("not-a-uri"), None);
     }
 }

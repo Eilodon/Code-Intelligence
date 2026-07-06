@@ -294,7 +294,8 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "scip-overlay")]
         Commands::ScipDump { scip_path } => {
-            let occ = calm_core::scip::parse::parse_scip_file(&scip_path)?;
+            let occ =
+                calm_core::scip::parse::parse_scip_file(&scip_path, std::path::Path::new(""))?;
             let stdout = std::io::stdout();
             let mut w = stdout.lock();
             for o in &occ {

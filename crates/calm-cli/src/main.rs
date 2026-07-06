@@ -164,6 +164,40 @@ async fn main() -> Result<()> {
                     {{\"semantic_search\":{{\"enabled\":true}}}} to config.json to activate it."
                 );
             }
+
+            // SCIP overlay: upgrade edges to `formal` confidence using an
+            // external compiler-grade indexer (rust-analyzer for Rust today).
+            // Mirrors the background-indexer path in `calm-server`'s
+            // `serve_stdio_with_preset` (crates/calm-server/src/lib.rs) so the
+            // one-shot `calm index` CLI gets the same upgrade the MCP server
+            // does. Runs after the base graph + embeddings are built;
+            // fail-silent by design (see `run_overlay`'s doc comment) — a
+            // missing rust-analyzer or any overlay error leaves the syntactic
+            // graph untouched.
+            #[cfg(feature = "scip-overlay")]
+            {
+                let rust_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.rust)
+                    .unwrap_or_default();
+                let dirty = calm_core::scip::rust_source_dirty_keys(&conn);
+                match calm_core::scip::run_overlay(&conn, &root, &rust_cfg, &dirty) {
+                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                        // caller_count was computed by rebuild_graph before this
+                        // overlay flipped edge_confidence/ruled_out_by_scip on
+                        // some edges — refresh it or it goes stale immediately
+                        // relative to the columns it's filtered on.
+                        if let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(&conn) {
+                            tracing::warn!("caller_count refresh after SCIP overlay failed: {e}");
+                        }
+                        println!(
+                            "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out.",
+                            stats.upgraded, stats.ruled_out
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
+                }
+            }
         }
         Commands::Doctor { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;

@@ -84,6 +84,13 @@ Open the environment settings dialog (cloud icon → environment selector →
 settings icon) for the environment used to run sessions against this repo,
 and put this in the **Setup script** field:
 
+**Do not put backticks (`` ` ``) anywhere in the script below**, comments
+included. Confirmed incident: Claude Code's cloud Setup Script field runs
+this text through something that evaluates backtick command substitution
+even inside a `#` comment, silently corrupting the script — exit 127,
+with `command not found` errors for words that only ever appeared between
+backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
+
 ```bash
 #!/bin/bash
 # Ensure cargo is in PATH — setup scripts run as non-login root shells,
@@ -93,13 +100,13 @@ and put this in the **Setup script** field:
 # Resolve Git LFS assets BEFORE building — a checkout without git-lfs
 # installed leaves ~130-byte pointer stubs in place of the vendored
 # embedding model (crates/calm-core/assets/potion-code-16m/) and the prebuilt
-# .calm-bin/ binary. The build still "succeeds" either way (`include_bytes!`
+# .calm-bin/ binary. The build still "succeeds" either way (include_bytes!
 # just bakes whatever is on disk into the binary) — this is a real incident,
 # not a hypothetical: it silently degrades semantic search to
-# `embeddings_status: "failed"` at runtime instead of failing the build
-# where it'd be noticed. Best-effort, same `|| true` philosophy as the build
-# below — `Embedder::load`'s own network-fallback and
-# `embeddings_status: "offline_unavailable"` messaging are the safety net
+# embeddings_status: "failed" at runtime instead of failing the build
+# where it'd be noticed. Best-effort, same || true fallback as the build
+# below — Embedder::load's own network-fallback and
+# embeddings_status: "offline_unavailable" messaging are the safety net
 # if this doesn't fully resolve it.
 if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
   if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -110,7 +117,7 @@ if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/
   fi
 fi
 
-# Build the calm-cli binary. The `|| true` is CRITICAL: setup scripts that
+# Build the calm-cli binary. The || true is CRITICAL: setup scripts that
 # exit non-zero prevent the session from starting entirely (confirmed in
 # the official docs). A failed build here is non-fatal — the MCP server
 # simply won't connect, which is recoverable; a dead session is not.

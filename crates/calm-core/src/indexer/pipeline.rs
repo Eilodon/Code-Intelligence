@@ -35,12 +35,24 @@ fn signature_returns_option_or_result(sig: &str) -> bool {
         return false;
     }
     let ret = ret.trim_start();
-    ret.starts_with("Option<")
-        || ret.starts_with("Option ")
-        || ret.starts_with("Result<")
-        || ret.starts_with("Result ")
-        || ret == "Option"
-        || ret == "Result"
+    // Take the return type's own name only — up to its first generic `<`,
+    // a following space (e.g. a `where` clause or the opening `{`), or `(`
+    // (a tuple/unit return) — then strip any module qualification down to
+    // the final `::`-segment. Real-world Result/Option returns are routinely
+    // qualified (`rusqlite::Result<()>`, `anyhow::Result<T>`,
+    // `std::io::Result<T>`, a crate's own `Result<T> = ...` alias used via
+    // its module path) rather than bare `Result`/`Option` — matching only
+    // the bare form silently dropped every qualified case as a false
+    // exclusion (verified: `crate::config::load_config`'s real
+    // `anyhow::Result<Config>` return was being excluded here, deleting a
+    // real call edge). Anchoring on the first `<`/space/`(` — not a naive
+    // whole-string split on `::` — also keeps this correct for a qualified
+    // path *inside* the generic args (`Result<foo::Bar, baz::Error>`), which
+    // a blind `rsplit("::")` over the whole return-type string would corrupt.
+    let type_name_end = ret.find(['<', ' ', '(']).unwrap_or(ret.len());
+    let type_name = &ret[..type_name_end];
+    let base = type_name.rsplit("::").next().unwrap_or(type_name);
+    base == "Option" || base == "Result"
 }
 
 /// Files are parsed+resolved (and then persisted) in chunks of this size
@@ -2840,6 +2852,32 @@ impl StructB {
         ));
         assert!(!signature_returns_option_or_result(
             "pub fn foo(f: impl Fn() -> Option<i32>) -> i32 {"
+        ));
+        // Regression: module-qualified Result/Option aliases (the norm, not
+        // the exception, for any crate with its own error type) used to be
+        // silently excluded — see this function's doc comment for the real
+        // `load_config`/`remove_file_rows` call edges this was dropping.
+        assert!(signature_returns_option_or_result(
+            "fn load_config(project_root: &Path) -> anyhow::Result<Config> {"
+        ));
+        assert!(signature_returns_option_or_result(
+            "fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<()> {"
+        ));
+        assert!(signature_returns_option_or_result(
+            "fn foo() -> std::result::Result<T, E> {"
+        ));
+        // A qualified path *inside* the generic args must not corrupt the
+        // module-qualification strip on the outer type.
+        assert!(signature_returns_option_or_result(
+            "fn foo() -> Result<foo::Bar, baz::Error> {"
+        ));
+        // Must not false-positive just because "Option"/"Result" is a prefix
+        // of a longer, unrelated type name.
+        assert!(!signature_returns_option_or_result(
+            "fn foo() -> OptionalConfig<T> {"
+        ));
+        assert!(!signature_returns_option_or_result(
+            "fn foo() -> my_crate::OptionalThing<T> {"
         ));
     }
 

@@ -2395,6 +2395,62 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // P1.4: `shape->area()` — C/C++'s pointer-member-access form. Regression
+    // test for the `split_receiver_callee` gap this session found: `->` was
+    // never recognized at all (only `.`/`::`), so this call previously
+    // extracted callee="shape" (the receiver text, truncated at the first
+    // non-ident byte) with no receiver, not callee="area" with receiver
+    // "shape" — meaning C/C++ member calls via `->` never had a chance to
+    // reach Tier-2 at all, regardless of type_map support.
+    fn test_cpp_pointer_member_call_resolves_via_field_type() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_cpp_typemap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("circle.cpp"),
+            "struct Circle {\n    double area() { return 1.0; }\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("square.cpp"),
+            "struct Square {\n    double area() { return 2.0; }\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.cpp"),
+            "struct Container {\n    Circle *shape;\n    void run() {\n        shape->area();\n    }\n};\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'area' AND class_context = 'Circle')",
+            ),
+            1,
+            "shape->area() must resolve to Circle::area via the field's declared pointer type"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'area' AND class_context = 'Square')",
+            ),
+            0,
+            "shape->area() must NOT also fan out to the unrelated Square::area"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Same fan-out bug, `by_name_class` variant: two unrelated types in
     /// different files that happen to share both a type name AND a method
     /// name (e.g. two local `struct Handler` in different modules, each with

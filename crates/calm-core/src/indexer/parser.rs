@@ -908,9 +908,29 @@ fn leading_ident(seg: &str) -> Option<String> {
 /// resolve against; `mod::func` → (None, "func", false) — a lowercase
 /// segment reads as a module, not a type (see `is_type_like`).
 fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
-    if let Some(dot) = raw.rfind('.') {
-        let (left, right) = raw.split_at(dot);
-        let callee = leading_ident(&right[1..])?;
+    // `.` and `->` (C/C++ pointer member access) are treated as the same
+    // priority tier — whichever is rightmost when both appear (e.g. a
+    // mixed chain like `a.b->c()`) is the outermost/immediate access.
+    // `->` is safe to add generically here (this function has no language
+    // parameter, it's shared by every `walk_calls` caller): no currently
+    // supported language's *call-expression* text ever contains a literal
+    // `->` for any other reason — Rust's `->` only appears in a function
+    // signature's return-type position, never inside a call's callee
+    // expression. `::` stays strictly lower-priority than `.`/`->`, exactly
+    // as before this change, so it still only fires when neither is present
+    // — this preserves e.g. Rust turbofish `foo.bar::<T>()` resolving via
+    // the dot branch (as it always has), not being hijacked by the `::`.
+    let dot = raw.rfind('.').map(|i| (i, i + 1));
+    let arrow = raw.rfind("->").map(|i| (i, i + 2));
+    let dot_or_arrow = match (dot, arrow) {
+        (Some(d), Some(a)) => Some(if a.0 > d.0 { a } else { d }),
+        (Some(d), None) => Some(d),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    if let Some((idx, end)) = dot_or_arrow {
+        let (left, right) = raw.split_at(idx);
+        let callee = leading_ident(&right[end - idx..])?;
         // Immediate receiver = last segment of the left side.
         let recv = left.rsplit(['.', ':']).next().and_then(leading_ident);
         Some((recv, callee, false))
@@ -924,7 +944,6 @@ fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
         Some((None, leading_ident(raw)?, false))
     }
 }
-
 /// The module-path segment `split_receiver_callee` discards for a lowercase
 /// (non-type-like) `::`-qualified callee, e.g. `crate::telemetry::timed_tool`
 /// or `telemetry::timed_tool` → `Some("telemetry")`.
@@ -1199,6 +1218,12 @@ pub fn extract_type_map_from_tree(
         "rust" => &["parameter", "let_declaration", "field_declaration"],
         "go" => &["parameter_declaration", "var_spec", "field_declaration"],
         "java" => &["formal_parameter", "field_declaration"],
+        // C/C++: local variable declarations (`Circle *c;`) and struct/class
+        // field declarations (`Circle *c;` inside a `class`/`struct` body)
+        // share the same `type`+`declarator` shape — see
+        // `binding_names_and_type`'s "c" | "cpp" arm for how the name is
+        // pulled out of the (possibly pointer-wrapped) declarator.
+        "c" | "cpp" => &["declaration", "field_declaration"],
         _ => return map, // javascript: no static annotations
     };
 
@@ -1247,7 +1272,6 @@ pub fn extract_type_map_from_tree(
     }
     map
 }
-
 /// The type constructed by a Rust expression used as a `let` initializer (or,
 /// via `assignment_expression` in `extract_type_map_from_tree`, a later
 /// reassignment): `Foo::new(..)` / `Foo::default()` / `Foo::with_x(..)` ->
@@ -1311,10 +1335,28 @@ fn binding_names_and_type(
         return Vec::new();
     };
     // Strip a leading `:` (TS type_annotation) and surrounding whitespace.
-    let ty = source[type_node.byte_range()]
-        .trim_start_matches(':')
-        .trim()
-        .to_string();
+    // C's `struct Shape *s;` / C++'s `class Foo { ... };` field types are a
+    // whole `struct_specifier`/`class_specifier`/`union_specifier`/
+    // `enum_specifier` node — its raw text is "struct Shape", not just
+    // "Shape" — so pull the tag's own `name` field instead of using the
+    // whole node's text (which would then never match a symbol's
+    // `class_context`, itself just the bare tag name). Falls back to the
+    // whole text for an anonymous struct/union (no `name` child), which
+    // simply won't match any real class_context — harmless.
+    let ty = if matches!(
+        type_node.kind(),
+        "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier"
+    ) {
+        type_node
+            .child_by_field_name("name")
+            .map(|n| source[n.byte_range()].trim().to_string())
+            .unwrap_or_else(|| source[type_node.byte_range()].trim().to_string())
+    } else {
+        source[type_node.byte_range()]
+            .trim_start_matches(':')
+            .trim()
+            .to_string()
+    };
     if ty.is_empty() {
         return Vec::new();
     }
@@ -1353,6 +1395,19 @@ fn binding_names_and_type(
                 .map(|n| source[n.byte_range()].to_string())
                 .collect()
         }
+        // C/C++: the name lives inside the `declarator` field, which for a
+        // pointer/reference/array declaration wraps another `declarator`
+        // around the actual `identifier`/`field_identifier` (`Circle *c` is
+        // a `pointer_declarator` around `identifier "c"`) — unwrap down to
+        // it. `children_by_field_name` (not `child_by_field_name`) so a
+        // multi-declarator statement (`Circle *a, *b;`) yields every name,
+        // not just the first.
+        "c" | "cpp" => {
+            let mut cur = node.walk();
+            node.children_by_field_name("declarator", &mut cur)
+                .filter_map(|d| innermost_c_declarator_identifier(d, source))
+                .collect()
+        }
         // TS/Rust use a `pattern` field for parameters; Java's
         // `formal_parameter` and every field-declaration kind added above
         // (TS `public_field_definition`/`property_signature`, Rust/Go
@@ -1373,6 +1428,20 @@ fn binding_names_and_type(
         .collect()
 }
 
+/// Unwrap a C/C++ declarator chain (`pointer_declarator`, `reference_declarator`,
+/// `array_declarator`, `parenthesized_declarator`, `init_declarator` — any
+/// wrapper that itself has a `declarator` field) down to the innermost
+/// `identifier`/`field_identifier`, returning its text. `None` for a
+/// declarator shape with no plain identifier at its core (e.g. a function
+/// pointer declarator) — those simply don't contribute a type_map entry.
+fn innermost_c_declarator_identifier(node: tree_sitter::Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some(source[node.byte_range()].to_string()),
+        _ => node
+            .child_by_field_name("declarator")
+            .and_then(|d| innermost_c_declarator_identifier(d, source)),
+    }
+}
 // ---------------------------------------------------------------------------
 // Tier-0.5: lightweight regex/heuristic symbol extraction for languages that
 // have no tree-sitter grammar registered in this build. Returns function and

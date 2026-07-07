@@ -43,10 +43,13 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
         // aren't library/require — same cost shape as JS's `variable_declarator`
         // firing on every declaration to catch the rare `require()` among them.
         "r" => &["call"],
+        // C/C++ `#include "x.h"` — see `parse_c_include` for why `<...>`
+        // system headers never even produce a `ParsedImport` (skipped there,
+        // not here, so both languages share one node-kind list).
+        "c" | "cpp" => &["preproc_include"],
         _ => &[],
     }
 }
-
 pub fn extract_imports(source: &str, language: &str) -> Vec<ParsedImport> {
     let types = import_node_types(language);
     if types.is_empty() {
@@ -96,10 +99,10 @@ fn parse_import(text: &str, language: &str) -> Option<ParsedImport> {
         "javascript" | "typescript" => parse_js_import(text),
         "java" => parse_java_import(text),
         "r" => parse_r_library(text),
+        "c" | "cpp" => parse_c_include(text),
         _ => None,
     }
 }
-
 /// `name as alias` / `name` → the bound identifier (alias wins).
 fn bound_name(segment: &str) -> Option<String> {
     let seg = segment.trim();
@@ -367,6 +370,43 @@ fn parse_r_library(text: &str) -> Option<ParsedImport> {
         imported_names: Vec::new(),
     })
 }
+
+/// C/C++ `#include "x.h"` — quoted (repo-local) includes only; `#include
+/// <sys/header.h>` system/library headers are deliberately skipped (never a
+/// repo file, and there's no compiler include-path to search here anyway).
+/// `imported_names` stays empty: unlike Python/JS's per-name imports, a C
+/// `#include` doesn't bind any single identifier into scope — it's a raw
+/// textual paste of the whole header, so every name it declares becomes
+/// available, not just one. That means this doesn't help Tier-1's
+/// `import_map` lookup (bare C function calls were never scoped by an import
+/// name to begin with — see 8-language plan P1.3's same-dir tier for the
+/// actual fix there); its value is the file-level `import_edges` row itself
+/// (`dependencies` tool, hub/coreness graph) once `resolve_import_targets`
+/// resolves `to_path`.
+fn parse_c_include(text: &str) -> Option<ParsedImport> {
+    let rest = text.trim().strip_prefix("#include")?.trim();
+    let path = rest.strip_prefix('"')?.split('"').next()?;
+    if path.is_empty() {
+        return None;
+    }
+    // Route through the relative-import branch of `resolve_module_to_path`
+    // (pipeline.rs) rather than its dotted/scoped-module branch — the latter
+    // would mangle a literal '.' in "helper.h" into a fake path segment
+    // ("helper/h"). A leading "./"/"../" is preserved as written (a header
+    // can legitimately `#include "../shared/x.h"`); a bare filename gets one
+    // synthesized so it still resolves relative to the including file's own
+    // directory, the C convention for quoted includes.
+    let module_name = if path.starts_with("./") || path.starts_with("../") {
+        path.to_string()
+    } else {
+        format!("./{path}")
+    };
+    Some(ParsedImport {
+        module_name,
+        imported_names: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +541,32 @@ mod tests {
     fn r_ordinary_call_yields_no_import() {
         let v = extract_imports("mean(x)\n", "r");
         assert!(v.is_empty(), "expected no import, got {v:?}");
+    }
+
+    #[test]
+    fn c_include_quoted_header() {
+        let i = one("#include \"helper.h\"\n", "c");
+        assert_eq!(i.module_name, "./helper.h");
+        assert!(
+            i.imported_names.is_empty(),
+            "a bare #include doesn't bind any single name into scope"
+        );
+    }
+
+    #[test]
+    fn cpp_include_quoted_header_preserves_subdir_and_dotdot() {
+        let i = one("#include \"sub/x.h\"\n", "cpp");
+        assert_eq!(i.module_name, "./sub/x.h");
+        let i = one("#include \"../shared/y.h\"\n", "cpp");
+        assert_eq!(i.module_name, "../shared/y.h");
+    }
+
+    #[test]
+    fn c_include_system_header_yields_no_import() {
+        let v = extract_imports("#include <stdio.h>\n", "c");
+        assert!(
+            v.is_empty(),
+            "system/library headers are never a repo file — expected no import, got {v:?}"
+        );
     }
 }

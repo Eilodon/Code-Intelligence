@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Resolution — multi-language call-graph tier baseline.
+
+Usage:
+    benchmarks/.venv/bin/python benchmarks/resolution/run_benchmark.py [--lang go,java,...]
+
+Companion to B2 (`benchmarks/b2_call_graph_quality/`, Rust-only, precision/
+recall vs a `rust-analyzer scip` oracle). This benchmark has a different job:
+it measures `calm`'s **tier distribution** (formal/resolved/inferred/textual/
+ambiguous/unresolved — see `EdgeConfidence`) on real, external, pinned OSS
+repos across the 8 languages targeted by
+`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md`, with **no
+oracle** (none of Go/Java/C#/C/C++/JS/PHP/SQL has a SCIP provider wired up
+yet — see that plan's Phase 2/3). It exists to answer one question before
+Phase 2 lands: how much did Phase 0/1's heuristics (same-dir tier, type_map,
+PSR-4, stack-graphs JS, ...) already move the needle per language, so Phase 2
+effort can be prioritized by actual remaining gap instead of guesswork.
+
+Requires:
+  - `cargo build --release -p calm-cli` (no `scip-overlay` feature needed —
+    Phase 2 providers don't exist yet, so there is nothing for it to overlay
+    on non-Rust corpora; the Rust ScipProvider still runs harmlessly and
+    contributes 0 edges against foreign-language repos).
+  - `git` on PATH with network access to GitHub (shallow-clones each corpus
+    once into `benchmarks/resolution/corpus/<lang>/`, gitignored, reused on
+    subsequent runs unless `--fresh-clone` is passed).
+
+Methodology:
+  1. For each language, shallow-clone (`--depth 1`) a small pinned real OSS
+     repo (see CORPORA below) into `corpus/<lang>/` if not already present,
+     and record the resolved commit SHA for reproducibility (we pin to
+     "whatever HEAD of default branch resolved to on first clone", not a
+     hand-picked release tag -- recorded in the output so a re-run knows
+     exactly what was measured).
+  2. Write `<corpus>/.calm/config.json` with `semantic_search.enabled=false`
+     before indexing -- this benchmark only reads `call_edges`/`symbols`,
+     and embeddings add real wall-clock (~30s+ per medium repo) for a signal
+     nobody reads here.
+  3. Run `calm index --project-root <corpus>`, timing wall-clock.
+  4. Read `.calm/index.db`: join `call_edges.from_symbol` to
+     `symbols.qualified_name` to get `symbols.language`, filter to the
+     corpus's own designated language (foreign-language noise inside a repo,
+     e.g. a JS build script in a Go repo, is dropped from that language's own
+     row -- it would show up under its own language if that language were
+     also in CORPORA).
+  5. `formal_pct`/`resolved_pct` etc. are edge-count share per confidence
+     tier. `overlay_match_rate` is reported `null` for every language here
+     **on purpose** -- no Phase 2 SCIP provider exists for any of them yet,
+     so there is nothing to report; do not confuse this with "0 edges
+     upgraded", which would imply a provider ran and failed to help.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Corpus key -> the `symbols.language` string `language_for_extension`
+# (lang_constants.rs) actually assigns. Most match the corpus key 1:1; JS is
+# the one mismatch (`.js` maps to `"javascript"`, not `"js"`) -- get this
+# wrong and the benchmark silently reports 0 edges for a real corpus, not a
+# real 0 (this bit us on the first real run against express).
+DB_LANGUAGE: dict[str, str] = {
+    "js": "javascript",
+}
+
+
+def db_language(lang: str) -> str:
+    return DB_LANGUAGE.get(lang, lang)
+
+
+# lang key -> (git clone url, human label for the README/table)
+CORPORA: dict[str, tuple[str, str]] = {
+    "go": ("https://github.com/gin-gonic/gin.git", "gin"),
+    "java": ("https://github.com/spring-projects/spring-petclinic.git", "spring-petclinic"),
+    "csharp": ("https://github.com/dotnet-architecture/eShopOnWeb.git", "eShopOnWeb"),
+    "c": ("https://github.com/redis/redis.git", "redis"),
+    "cpp": ("https://github.com/fmtlib/fmt.git", "fmt"),
+    "js": ("https://github.com/expressjs/express.git", "express"),
+    "php": ("https://github.com/monicahq/monica.git", "monica"),
+    "sql": ("https://github.com/jOOQ/sakila.git", "sakila (multi-dialect mirror)"),
+}
+
+
+def repo_root_from_here() -> Path:
+    # benchmarks/resolution/run_benchmark.py -> repo root is 2 levels up
+    return Path(__file__).resolve().parents[2]
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def ensure_corpus(lang: str, corpus_dir: Path, fresh_clone: bool) -> str:
+    url, _label = CORPORA[lang]
+    target = corpus_dir / lang
+    if fresh_clone and target.exists():
+        shutil.rmtree(target)
+    if not target.exists():
+        print(f"[{lang}] cloning {url} ...")
+        run(["git", "clone", "--depth", "1", "--single-branch", url, str(target)])
+    sha = run(["git", "-C", str(target), "rev-parse", "HEAD"]).stdout.strip()
+    return sha
+
+
+def write_disable_embeddings_config(corpus_path: Path) -> None:
+    calm_dir = corpus_path / ".calm"
+    calm_dir.mkdir(exist_ok=True)
+    cfg_path = calm_dir / "config.json"
+    cfg = {}
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            cfg = {}
+    cfg.setdefault("semantic_search", {})["enabled"] = False
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+
+
+def index_corpus(calm_bin: Path, corpus_path: Path) -> float:
+    """Removes any stale `.calm/index.db` (keeps our config.json), runs
+    `calm index`, returns wall-clock seconds."""
+    db_path = corpus_path / ".calm" / "index.db"
+    if db_path.exists():
+        db_path.unlink()
+    start = time.monotonic()
+    run([str(calm_bin), "index", "--project-root", str(corpus_path)])
+    return time.monotonic() - start
+
+
+TIERS = ["formal", "resolved", "inferred", "textual", "ambiguous", "unresolved"]
+
+
+def read_tier_histogram(db_path: Path, lang: str) -> dict:
+    db_lang = db_language(lang)
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT ce.edge_confidence, COUNT(*) "
+        "FROM call_edges ce "
+        "JOIN symbols s ON s.qualified_name = ce.from_symbol "
+        "WHERE s.language = ? "
+        "GROUP BY ce.edge_confidence",
+        (db_lang,),
+    ).fetchall()
+    file_stats = conn.execute(
+        "SELECT COUNT(DISTINCT path), COUNT(*) FROM symbols WHERE language = ?",
+        (db_lang,),
+    ).fetchone()
+    conn.close()
+    histogram = {tier: 0 for tier in TIERS}
+    for confidence, count in rows:
+        histogram[confidence] = histogram.get(confidence, 0) + count
+    total = sum(histogram.values())
+    pct = {f"{tier}_pct": (histogram[tier] / total if total else 0.0) for tier in TIERS}
+    return {
+        "edges_total": total,
+        "tier_histogram": histogram,
+        "files_with_symbols": file_stats[0] or 0,
+        "symbols_total": file_stats[1] or 0,
+        **pct,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--lang",
+        type=str,
+        default=None,
+        help="Comma-separated subset of languages to run (default: all in CORPORA)",
+    )
+    parser.add_argument(
+        "--calm-bin",
+        type=Path,
+        default=repo_root_from_here() / "target" / "release" / "calm",
+        help="Path to a `calm` binary (default features are enough)",
+    )
+    parser.add_argument(
+        "--corpus-dir",
+        type=Path,
+        default=Path(__file__).parent / "corpus",
+        help="Where per-language corpora live (gitignored)",
+    )
+    parser.add_argument(
+        "--fresh-clone",
+        action="store_true",
+        help="Delete and re-clone each corpus before indexing",
+    )
+    args = parser.parse_args()
+
+    calm_bin = args.calm_bin.resolve()
+    if not calm_bin.exists():
+        sys.exit(f"{calm_bin} not found. Build it first:\n  cargo build --release -p calm-cli")
+
+    langs = args.lang.split(",") if args.lang else list(CORPORA.keys())
+    unknown = [l for l in langs if l not in CORPORA]
+    if unknown:
+        sys.exit(f"Unknown language(s): {unknown}. Known: {list(CORPORA.keys())}")
+
+    args.corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for lang in langs:
+        _url, label = CORPORA[lang]
+        print(f"\n=== {lang} ({label}) ===")
+        sha = ensure_corpus(lang, args.corpus_dir, args.fresh_clone)
+        corpus_path = args.corpus_dir / lang
+        write_disable_embeddings_config(corpus_path)
+        wall_time = index_corpus(calm_bin, corpus_path)
+        db_path = corpus_path / ".calm" / "index.db"
+        stats = read_tier_histogram(db_path, lang)
+        row = {
+            "lang": lang,
+            "corpus_label": label,
+            "commit": sha,
+            "wall_time_sec": round(wall_time, 2),
+            "overlay_match_rate": None,  # no Phase 2 SCIP provider exists for any of these yet
+            **stats,
+        }
+        results.append(row)
+        print(
+            f"  {stats['symbols_total']} symbols, {stats['edges_total']} call edges, "
+            f"wall={wall_time:.1f}s"
+        )
+        if stats["edges_total"]:
+            print(
+                "  tiers: "
+                + ", ".join(f"{t}={stats['tier_histogram'][t]}" for t in TIERS if stats["tier_histogram"][t])
+            )
+
+    print(f"\n{'lang':<8} {'edges':>8} {'formal%':>8} {'resolved%':>10} {'ambiguous%':>11} {'wall(s)':>8}")
+    for r in results:
+        print(
+            f"{r['lang']:<8} {r['edges_total']:>8} {r['formal_pct']*100:>7.1f}% "
+            f"{r['resolved_pct']*100:>9.1f}% {r['ambiguous_pct']*100:>10.1f}% {r['wall_time_sec']:>8.1f}"
+        )
+
+    out_path = Path(__file__).parent / "results.json"
+    out_path.write_text(json.dumps(results, indent=2))
+    print(f"\nWrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()

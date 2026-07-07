@@ -262,8 +262,24 @@ fn extract_file_data(
             None => format!("{}::{}", rel, s.name),
         };
         if !seen.insert(s.qualified_name.clone()) {
-            s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
-            seen.insert(s.qualified_name.clone());
+            // More than 2 symbols can share (name, line_start) -- e.g. a C
+            // function-pointer typedef mentioning the same forward-declared
+            // struct type as two different parameters on one line (`struct
+            // redisObject *fromkey, struct redisObject *tokey`), which this
+            // extractor (over-eagerly, but not fixed here) treats as two
+            // `redisObject` symbol occurrences at the identical line. A
+            // single `#{line}` suffix collides right back in that case, and
+            // an unhandled INSERT there previously hard-crashed the entire
+            // `calm index` run (found indexing a real ~4700-line C header,
+            // not a synthetic fixture). Loop until genuinely unique instead.
+            let base = format!("{}#{}", s.qualified_name, s.line_start);
+            let mut candidate = base.clone();
+            let mut suffix = 2;
+            while !seen.insert(candidate.clone()) {
+                candidate = format!("{}#{}", base, suffix);
+                suffix += 1;
+            }
+            s.qualified_name = candidate;
         }
         if !s.is_entry_point
             && entry_point_patterns
@@ -2469,6 +2485,52 @@ impl StructB {
             ),
             0,
             "shape->area() must NOT also fan out to the unrelated Square::area"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Regression: a real ~4700-line redis header (server.h) crashed `calm
+    // index` outright with "UNIQUE constraint failed: symbols.qualified_name"
+    // -- found by the resolution benchmark on a real external C repo, not a
+    // synthetic fixture. Root cause: a forward-declared struct type
+    // mentioned as a parameter type in a function-pointer typedef (e.g.
+    // `struct redisObject *`) is extracted as a "symbol" occurrence at that
+    // mention's line, and C headers routinely mention the same struct type
+    // as *two different parameters on the same line* (e.g. a copy(from, to)
+    // style signature) -- producing 3+ symbols sharing the exact same
+    // (name, line_start). The old dedup only tried one `#{line}` suffix,
+    // which collided right back for the 3rd+ occurrence and left an
+    // unhandled INSERT error to abort the whole indexing run. This does not
+    // fix the over-eager extraction (a type *reference* still isn't a real
+    // symbol) -- it only ensures the dedup loop can never crash on it.
+    fn test_c_same_line_triple_name_collision_does_not_crash_indexing() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_c_n_way_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("test.h"),
+            "typedef void (*fn1)(struct Foo *a);\n\
+             typedef void (*fn2)(struct Foo *a);\n\
+             typedef void (*fn3)(struct Foo *a);\n\
+             typedef void (*fn4)(struct Foo *a);\n\
+             typedef void (*fn5)(struct Foo *a, struct Foo *b);\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase())
+            .expect("must not crash on a same-line, same-name symbol collision");
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name LIKE 'test.h::Foo%'"
+            ),
+            6,
+            "all 6 Foo-named occurrences must land as distinct rows, not be dropped or crash"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

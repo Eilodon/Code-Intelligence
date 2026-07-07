@@ -19,6 +19,13 @@ thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cá
 | B10 | Real Competitor A/B | `calm` vs CodeGraph vs Semble — tool call thật trên cả 3 MCP server thật (không phải số tự báo cáo) | **Superseded by B11** — [`b10_real_competitor_ab/`](b10_real_competitor_ab/) (giữ lại, xem B11 cho methodology đã fix) |
 | B11 | Extended Real Competitor A/B | `calm` vs CodeGraph vs Semble vs grepai vs Serena — sửa các lỗ hổng methodology của B10 (oracle đúng-sai cho mọi task, N=5 thay vì N=1, thêm task risk_gate_refusal + memory_recall test thật tính năng khác biệt của `calm`) | **Implemented** — [`b11_extended_competitor_ab/`](b11_extended_competitor_ab/) |
 
+Ngoài chuỗi B1-B11 (đo lợi thế `calm` so với naive/competitor), còn một track riêng đo **chất lượng
+resolution đa ngôn ngữ** cho kế hoạch 8-ngôn-ngữ Formal-tier
+(`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md`) — không thuộc số B, vì trục đo khác
+hẳn (độ rộng/độ chính xác hỗ trợ ngôn ngữ, không phải calm-vs-naive): **Resolution** — tier
+distribution (formal/resolved/inferred/textual/ambiguous) trên 8 repo OSS thật (không oracle, khác
+B2) — [`resolution/`](resolution/). Đây chính là corpus "Phase 2" mà B2's Giới hạn từng nhắc tới.
+
 Nguồn cảm hứng B6-B9: xem phần "Nghiên cứu competitor" bên dưới. Khác với B6 (dùng ý tưởng đo của
 CodeGraph nhưng chỉ chạy `calm`), B10/B11 cài thật các competitor và gọi tool thật của từng cái — xem
 B11's README (methodology hiện hành) cho lý do vì sao ratio thô không nên đọc như bảng xếp hạng, và

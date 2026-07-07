@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. Phase 2/3 CHƯA thực thi. Xem §3/§4 để biết chi tiết những gì đã làm; đừng làm lại.
+> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. **`benchmarks/resolution/` (§7) ĐÃ XONG** — baseline thật 8/8 ngôn ngữ đo xong, kèm 1 bug crash thật tìm+sửa (C, xem §7). Phase 2/3 CHƯA thực thi. Xem §3/§4/§7 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -213,8 +213,35 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 
 ## 7. Benchmark & telemetry (xuyên suốt, bắt đầu từ P0.3)
 
-- `benchmarks/resolution/`: harness clone repo OSS pinned tag mỗi ngôn ngữ — go: gin; java: guava (hoặc spring-petclinic cho nhẹ); csharp: eShopOnWeb; c: redis; cpp: fmt; js: express; php: monica (hoặc 1 plugin WP); sql: sakila. Chạy `calm index` (± providers) → JSON `{lang, edges_total, tier_histogram, formal_pct, overlay_match_rate, wall_time}`.
-- DoD tổng mỗi ngôn ngữ = fixture xanh **và** formal_pct/resolved_pct trên repo chuẩn đạt ngưỡng thống nhất (đặt sau lần đo baseline đầu; gợi ý mục tiêu: Go/Java/C# formal ≥60% call edges nội-repo khi indexer có mặt).
+- ✅ **`benchmarks/resolution/`** — ĐÃ XONG (2026-07-07, cùng phiên với việc audit file này). Corpus
+  thật: go=gin, java=spring-petclinic (nhẹ, đúng nhánh gợi ý), csharp=eShopOnWeb, c=redis, cpp=fmt,
+  js=express, php=monica, sql=sakila (mirror đa dialect). Output JSON đúng schema gốc
+  `{lang, edges_total, tier_histogram, formal_pct, overlay_match_rate, wall_time}` — xem
+  `benchmarks/resolution/results.json` (mỗi lần chạy) và README's bảng cho số baseline đầu tiên.
+  **`overlay_match_rate` = `null` cho mọi ngôn ngữ, có chủ đích** (chưa Phase 2 provider nào tồn
+  tại — không phải `0.0`, tránh nhầm với "provider chạy nhưng không giúp được gì").
+  **Phát hiện quan trọng nhất của lần đo này: một bug crash thật** — index redis (C, `server.h`
+  ~4700 dòng) crash toàn bộ với `UNIQUE constraint failed: symbols.qualified_name`, không sinh ra
+  số nào. Root cause (xác nhận bằng bisection nhị phân + debug print tạm): C's symbol extractor
+  coi mỗi lần *nhắc tên* một struct forward-declare làm tham số con trỏ là 1 symbol occurrence
+  riêng; khi 1 dòng nhắc cùng tên struct 2 lần (2 tham số cùng kiểu, vd
+  `moduleTypeCopyFunc(struct redisObject *fromkey, struct redisObject *tokey, ...)`), dedup nội bộ
+  của `extract_file_data` (`pipeline.rs`) — vốn chỉ thử **một lần** hậu tố `#{line_start}` — đụng
+  lại chính nó ở lần thử thứ 2, để lại 1 INSERT lỗi UNIQUE constraint không được xử lý, crash toàn
+  bộ lần index (không riêng file đó). **Đã sửa**: vòng lặp dedup giờ thử hậu tố tăng dần cho đến
+  khi thật sự unique. Test hồi quy `test_c_same_line_triple_name_collision_does_not_crash_indexing`
+  (`pipeline.rs`) tái tạo tối thiểu pattern này, xác nhận crash y hệt nếu tắt fix. 527 test workspace
+  xanh, clippy/fmt sạch sau fix. **Chưa sửa** (ngoài phạm vi, ghi rõ trong benchmark's README): root
+  cause đầu tiên (coi type reference là symbol) vẫn còn — số `symbols_total`/`ambiguous` của C/C++
+  trong benchmark này có nhiễu thật chưa định lượng được.
+  **Phát hiện số liệu quan trọng thứ nhì**: `ambiguous` (không phải `textual`) là tier chiếm áp đảo
+  ở hầu hết ngôn ngữ (go 54.3%, cpp 92.5%, js 66.7%) — xác nhận trực tiếp bằng số đo thật rằng
+  `MAX_CALLEE_CANDIDATES=20` fan-out (§1.2) là trần chính xác cần Phase 2 lấp, không phải điều suy
+  luận lý thuyết. `formal_pct=0.0%` mọi ngôn ngữ (đúng kỳ vọng — chưa Phase 2 provider nào tồn tại).
+  SQL=0 symbols thật (P3.3 chưa làm, `.sql` chưa có trong `language_for_extension`), không phải lỗi.
+  Đừng làm lại phần harness — muốn đo lại (vd sau khi Phase 2 provider đầu tiên hạ cánh), chạy lại
+  `benchmarks/.venv/bin/python benchmarks/resolution/run_benchmark.py` trực tiếp.
+- DoD tổng mỗi ngôn ngữ = fixture xanh **và** formal_pct/resolved_pct trên repo chuẩn đạt ngưỡng thống nhất (đặt sau lần đo baseline đầu — **đã có baseline thật ở trên**; gợi ý mục tiêu: Go/Java/C# formal ≥60% call edges nội-repo khi indexer có mặt — vẫn cần Phase 2 provider để đo được `formal_pct` > 0).
 
 ## 8. Rủi ro & guardrails
 
@@ -235,7 +262,7 @@ P1.1 ✅ ∥ P1.2 ✅ ∥ P1.3 ✅ ∥ P1.4 ✅ ∥ P1.5 ✅ (partial, xem ghi c
 sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (CÓ THỂ BẮT ĐẦU NGAY — P0.4 đã xong)
 sau P2: P3.1 ∥ P3.2
 P3.3 (SQL): bất kỳ lúc nào — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc gì thêm
-Benchmark harness: CÓ THỂ DỰNG NGAY (P0.5 xong) — đo baseline trước khi bắt đầu Phase 2 để có số so sánh
+Benchmark harness: ✅ XONG (2026-07-07) — xem §7, kết quả baseline đầu tiên đã đo thật, 8/8 ngôn ngữ
 P1.5's "using→namespace" nửa còn lại: mở, cần 1 pre-pass kiến trúc mới (xem ghi chú trong mục P1.5)
 ```
 
@@ -254,6 +281,8 @@ Phát hiện kiến trúc quan trọng từ phiên này, áp dụng cho MỌI ng
 Không còn phụ thuộc kỹ thuật nào chặn bất kỳ nhánh nào bên dưới — lựa chọn tiếp theo thuần là ưu tiên, không phải trình tự bắt buộc:
 1. **Phase 2 provider đầu tiên** (khuyến nghị Go — `scip-go` đơn giản nhất, không cần build-tool network resolve như Java/C#) — có thể cắm thẳng vào bảng `ScipProvider` (P0.4 đã tổng quát hoá) mà không cần sửa lại `mod.rs`/`runner.rs`, chỉ thêm 1 entry + config `GoConfig` khi cần.
 2. **P3.3 (SQL)** — độc lập hoàn toàn, effort M-L riêng.
-3. **Benchmark harness** (`benchmarks/resolution/`) — đo baseline trước khi Phase 2 đổ vào, để có số so sánh "trước/sau" thật — giờ có nhiều heuristic Phase 1 hơn để đo giá trị cộng thêm.
+3. ~~Benchmark harness~~ ✅ ĐÃ XONG (2026-07-07) — xem §7 cho kết quả baseline thật trên 8 ngôn ngữ +
+   1 bug crash thật tìm thấy (C, đã sửa). Phát hiện chính: `ambiguous` (fan-out), không phải
+   `textual`, là trần chính Phase 2 cần lấp — xác nhận bằng số đo thật, không phải suy luận.
 4. Xác nhận `.github/workflows/scip-nightly.yml` chạy xanh thật trên GitHub Actions (push + đợi lịch hoặc `workflow_dispatch` thủ công) — chưa phiên nào verify tương đương ngoài local.
 5. P1.5's "using→namespace-to-files" nửa còn lại (namespace không map trực tiếp thư mục cho C#) — cần pre-pass kiến trúc mới, xem ghi chú trong mục P1.5.

@@ -26,6 +26,9 @@ benchmarks/**/results.json
 benchmarks/scratch/*.json
 __pycache__/
 
+# resolution benchmark's cloned OSS corpora — external repos, not ours to commit
+benchmarks/resolution/corpus/
+
 # OS / editor
 .DS_Store
 Thumbs.db

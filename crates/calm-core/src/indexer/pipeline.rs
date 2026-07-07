@@ -454,6 +454,7 @@ fn rebuild_graph(
     tx: &rusqlite::Transaction,
     hub_config: &crate::config::HubThresholdConfig,
     crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
 ) -> rusqlite::Result<()> {
     // name → [(qn, path, language)] for tier-1; (name, class) → [(qn, path,
     // language)] for tier-2. `language` rides along so a call site can never
@@ -727,7 +728,7 @@ fn rebuild_graph(
         [],
     )?;
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map)?;
+    resolve_import_targets(tx, crate_map, psr4)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     Ok(())
@@ -767,6 +768,7 @@ pub fn refresh_caller_counts(conn: &rusqlite::Connection) -> rusqlite::Result<()
 fn resolve_import_targets(
     tx: &rusqlite::Transaction,
     crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
 ) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
@@ -790,7 +792,9 @@ fn resolve_import_targets(
     // `known` set, so it runs in parallel; the UPDATE loop stays sequential.
     let targets: Vec<Option<String>> = rows
         .par_iter()
-        .map(|(_, from_path, module)| resolve_module_to_path(from_path, module, &known, crate_map))
+        .map(|(_, from_path, module)| {
+            resolve_module_to_path(from_path, module, &known, crate_map, psr4)
+        })
         .collect();
 
     let mut ustmt = tx.prepare("UPDATE import_edges SET to_path = ?1 WHERE id = ?2")?;
@@ -801,7 +805,6 @@ fn resolve_import_targets(
     }
     Ok(())
 }
-
 /// Resolve a Rust `use` module path to an indexed file, using the workspace
 /// crate map. Handles `crate::`, `self::`, an external crate-name prefix, and a
 /// best-effort `super::`. Returns `None` for paths that leave the workspace
@@ -939,6 +942,7 @@ fn resolve_module_to_path(
     module: &str,
     known: &HashSet<String>,
     crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
@@ -949,6 +953,22 @@ fn resolve_module_to_path(
     // even when the crate map is empty).
     if from_path.ends_with(".rs")
         && let Some(hit) = resolve_rust_module(from_path, m, crate_map, known)
+    {
+        return Some(hit);
+    }
+
+    // PHP: a `use App\Service\Foo;`-style backslash-separated namespace path
+    // needs PSR-4 (composer.json's `autoload.psr-4` prefix→dir table) to
+    // resolve at all — PHP namespaces don't reliably mirror directory
+    // structure the way Go packages do, so the generic dotted-module scan
+    // below (which doesn't even split on `\`) can't find these. Falls
+    // through to that generic scan (a harmless no-op for a `\`-containing
+    // module) if PSR-4 is empty (no composer.json) or the prefix doesn't
+    // match anything.
+    if from_path.ends_with(".php")
+        && m.contains('\\')
+        && let Some(hit) = psr4.resolve(m)
+        && known.contains(&hit)
     {
         return Some(hit);
     }
@@ -1034,7 +1054,6 @@ fn resolve_module_to_path(
     }
     None
 }
-
 /// Strips a compiled/emitted JS-family extension (`.mjs`/`.cjs`/`.jsx`/`.js`)
 /// from a relative import specifier, or `None` if it doesn't end in one.
 fn strip_js_emit_extension(m: &str) -> Option<&str> {
@@ -1173,7 +1192,8 @@ pub fn run_indexing_pipeline(
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
     let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-    rebuild_graph(&tx, &config.hub_threshold, &crate_map)?;
+    let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
+    rebuild_graph(&tx, &config.hub_threshold, &crate_map, &psr4)?;
     tx.commit()?;
 
     *phase.write().unwrap() = IndexingPhase::Ready;
@@ -1296,7 +1316,8 @@ pub fn reindex_changed(
 
     if !summary.is_noop() {
         let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-        rebuild_graph(&tx, &config.hub_threshold, &crate_map)?;
+        let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
+        rebuild_graph(&tx, &config.hub_threshold, &crate_map, &psr4)?;
     }
     tx.commit()?;
     Ok(summary)
@@ -2519,6 +2540,225 @@ impl StructB {
                 "{wrong_count_desc} must NOT also fan out to the unrelated Square::Area"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.2 step 1 (pipeline-level): PHP's `Foo::bar()` (scoped_call_expression)
+    // resolves via receiver_is_type_path exactly like Rust's `Type::method()` —
+    // no type_map needed for this shape, since the receiver names the class
+    // directly in the source text. Two classes sharing a method name in
+    // different files must not fan out.
+    fn test_php_scoped_call_resolves_via_type_path_not_fanned_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_php_scoped_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("foo.php"),
+            "<?php\nclass Foo {\n    static function bar() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("baz.php"),
+            "<?php\nclass Baz {\n    static function bar() {\n        return 2;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.php"),
+            "<?php\nclass Caller {\n    function run() {\n        Foo::bar();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'bar' AND class_context = 'Foo')",
+            ),
+            1,
+            "Foo::bar() must resolve to Foo's own bar() via the scoped type path"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'bar' AND class_context = 'Baz')",
+            ),
+            0,
+            "Foo::bar() must NOT also fan out to the unrelated Baz::bar()"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.2 step 3: `use App\Service\Foo;` resolves to a real file only via
+    // PSR-4 (composer.json's autoload.psr-4) — the generic dotted-module
+    // scan `resolve_module_to_path` uses for other languages doesn't even
+    // split on PHP's `\` separator, so this import_edge would otherwise
+    // never get a `to_path` at all.
+    fn test_php_psr4_resolves_use_import_to_real_file() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_php_psr4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/Service")).unwrap();
+        std::fs::write(
+            dir.join("composer.json"),
+            r#"{"autoload": {"psr-4": {"App\\": "src/"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/Service/Foo.php"),
+            "<?php\nnamespace App\\Service;\nclass Foo {\n    static function bar() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.php"),
+            "<?php\nuse App\\Service\\Foo;\nclass Caller {\n    function run() {\n        Foo::bar();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: String = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'index.php' AND module_name = 'App\\Service\\Foo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_path, "src/Service/Foo.php",
+            "PSR-4 must resolve the App\\ prefix to src/, landing on the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.2 end-to-end DoD: all 4 steps together on one small PHP project —
+    // require_once resolves its import_edge; a typed property's
+    // `$this->helper->run()` resolves via tier-2 (confidence "inferred") to
+    // the right class without fanning out to an unrelated same-named
+    // method; `use` + PSR-4 resolves a namespaced class's import_edge and
+    // its `Foo::bar()` scoped call.
+    fn test_php_p1_2_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_php_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/Service")).unwrap();
+        std::fs::write(
+            dir.join("composer.json"),
+            r#"{"autoload": {"psr-4": {"App\\": "src/"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("helper.php"),
+            "<?php\nclass Helper {\n    function run() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("other.php"),
+            "<?php\nclass Other {\n    function run() {\n        return 2;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/Service/Foo.php"),
+            "<?php\nnamespace App\\Service;\nclass Foo {\n    static function make() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.php"),
+            "<?php\n\
+             require_once 'helper.php';\n\
+             use App\\Service\\Foo;\n\
+             class Container {\n\
+             \x20   private Helper $helper;\n\
+             \x20   function m() {\n\
+             \x20       $this->helper->run();\n\
+             \x20       Foo::make();\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // Step 2/3: require_once and use+PSR-4 both resolve their import_edge.
+        let require_to_path: String = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'main.php' AND module_name = './helper.php'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(require_to_path, "helper.php");
+        let use_to_path: String = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'main.php' AND module_name = 'App\\Service\\Foo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(use_to_path, "src/Service/Foo.php");
+
+        // Step 1+4: $this->helper->run() resolves via the typed property's
+        // type_map to Helper::run specifically (not the unrelated Other::run),
+        // at "inferred" confidence (tier-2).
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'm') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run' AND class_context = 'Helper')",
+            ),
+            1,
+            "$this->helper->run() must resolve to Helper::run via the typed property"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'm') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run' AND class_context = 'Other')",
+            ),
+            0,
+            "must NOT also fan out to the unrelated Other::run"
+        );
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'm') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run' AND class_context = 'Helper')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "inferred");
+
+        // Step 1: Foo::make() (use+PSR-4-imported, scoped call) resolves too.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'm') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'make' AND class_context = 'Foo')",
+            ),
+            1,
+            "Foo::make() must resolve via the scoped type path"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

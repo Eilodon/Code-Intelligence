@@ -47,6 +47,16 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
         // system headers never even produce a `ParsedImport` (skipped there,
         // not here, so both languages share one node-kind list).
         "c" | "cpp" => &["preproc_include"],
+        // PHP: 4 distinct node kinds, one per keyword (confirmed via the
+        // real grammar — no single "require-like" wrapper node exists), plus
+        // `use App\Service\Foo;` (`namespace_use_declaration`).
+        "php" => &[
+            "require_expression",
+            "require_once_expression",
+            "include_expression",
+            "include_once_expression",
+            "namespace_use_declaration",
+        ],
         _ => &[],
     }
 }
@@ -100,6 +110,7 @@ fn parse_import(text: &str, language: &str) -> Option<ParsedImport> {
         "java" => parse_java_import(text),
         "r" => parse_r_library(text),
         "c" | "cpp" => parse_c_include(text),
+        "php" => parse_php_import(text),
         _ => None,
     }
 }
@@ -407,6 +418,87 @@ fn parse_c_include(text: &str) -> Option<ParsedImport> {
     })
 }
 
+fn parse_php_import(text: &str) -> Option<ParsedImport> {
+    if text.starts_with("use") {
+        parse_php_use(text)
+    } else {
+        parse_php_require(text)
+    }
+}
+
+/// `require`/`require_once`/`include`/`include_once` — confirmed via the
+/// real grammar that these are 4 distinct node kinds (no shared wrapper),
+/// so `import_node_types` lists all 4 and this dispatches on whichever
+/// keyword prefix matched.
+fn parse_php_require(text: &str) -> Option<ParsedImport> {
+    let rest = text
+        .strip_prefix("require_once")
+        .or_else(|| text.strip_prefix("include_once"))
+        .or_else(|| text.strip_prefix("require"))
+        .or_else(|| text.strip_prefix("include"))?
+        .trim();
+    // The require/include target is always a quoted string literal
+    // somewhere in `rest` — either standalone ('x.php') or the tail of a
+    // `__DIR__ . '/x.php'` concatenation (confirmed the most common real
+    // pattern via the real grammar). Take the first quoted string's content
+    // either way; `__DIR__` (or its absence) doesn't change the module path
+    // text itself, only anchors resolution to the including file's own
+    // directory — which the "./" prefix below already does via
+    // `resolve_module_to_path`'s relative-import branch, mirroring
+    // `parse_c_include`.
+    let quote_idx = rest.find(['\'', '"'])?;
+    let quote_char = rest.as_bytes()[quote_idx] as char;
+    let path = rest[quote_idx + 1..].split(quote_char).next()?;
+    if path.is_empty() {
+        return None;
+    }
+    // `__DIR__ . '/x.php'`-style concatenation's string half conventionally
+    // starts with '/' (it's just the tail after __DIR__, not an absolute
+    // filesystem path) — strip it before prefixing "./" so this doesn't
+    // produce a doubled ".//x.php".
+    let module_name = if path.starts_with("./") || path.starts_with("../") {
+        path.to_string()
+    } else if let Some(rest) = path.strip_prefix('/') {
+        format!("./{rest}")
+    } else {
+        format!("./{path}")
+    };
+    Some(ParsedImport {
+        module_name,
+        imported_names: Vec::new(), // pastes the whole file, binds no single name
+    })
+}
+/// `use App\Service\Foo;` / `use App\Service\Foo as Bar;` /
+/// `use function App\helper;` / `use const App\FOO;`. `module_name` keeps
+/// the raw backslash-separated namespace path as written — resolving it to
+/// a real file needs PSR-4 (composer.json's `autoload.psr-4`), not the
+/// generic dotted-module convention scan `resolve_module_to_path` already
+/// does for other languages (that scan only replaces `::`/`.`, not PHP's
+/// `\`, and has no PSR-4 prefix→dir table to consult) — see the PSR-4
+/// resolver this module's `imported_names` feeds into.
+fn parse_php_use(text: &str) -> Option<ParsedImport> {
+    let rest = text.strip_prefix("use")?.trim();
+    let rest = rest
+        .strip_prefix("function ")
+        .or_else(|| rest.strip_prefix("const "))
+        .unwrap_or(rest)
+        .trim();
+    let (path, alias) = match rest.split_once(" as ") {
+        Some((p, a)) => (p.trim(), Some(a.trim())),
+        None => (rest, None),
+    };
+    let path = path.trim_start_matches('\\'); // a leading \ is a no-op fully-qualified marker
+    if path.is_empty() {
+        return None;
+    }
+    let name = alias
+        .map(str::to_string)
+        .or_else(|| ident(path.rsplit('\\').next().unwrap_or(path)));
+    Some(ParsedImport {
+        module_name: path.to_string(),
+        imported_names: name.into_iter().collect(),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +659,39 @@ mod tests {
         assert!(
             v.is_empty(),
             "system/library headers are never a repo file — expected no import, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn php_require_once_dir_concat() {
+        let i = one("<?php\nrequire_once __DIR__ . '/x.php';\n", "php");
+        assert_eq!(i.module_name, "./x.php");
+        assert!(i.imported_names.is_empty());
+    }
+    #[test]
+    fn php_require_bare_string() {
+        let i = one("<?php\nrequire 'config.php';\n", "php");
+        assert_eq!(i.module_name, "./config.php");
+    }
+    #[test]
+    fn php_include_once_bare_string() {
+        let i = one("<?php\ninclude_once 'y.php';\n", "php");
+        assert_eq!(i.module_name, "./y.php");
+    }
+    #[test]
+    fn php_use_qualified_name() {
+        let i = one("<?php\nuse App\\Service\\Foo;\n", "php");
+        assert_eq!(i.module_name, "App\\Service\\Foo");
+        assert_eq!(i.imported_names, vec!["Foo".to_string()]);
+    }
+    #[test]
+    fn php_use_with_alias() {
+        let i = one("<?php\nuse App\\Service\\Foo as Bar;\n", "php");
+        assert_eq!(i.module_name, "App\\Service\\Foo");
+        assert_eq!(
+            i.imported_names,
+            vec!["Bar".to_string()],
+            "an alias binds the alias name, not the original"
         );
     }
 }

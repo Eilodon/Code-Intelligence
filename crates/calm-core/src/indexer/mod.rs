@@ -5,3 +5,4 @@ pub mod imports;
 pub mod lang_constants;
 pub mod parser;
 pub mod pipeline;
+pub mod psr4;

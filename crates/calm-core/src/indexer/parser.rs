@@ -855,6 +855,7 @@ fn detect_is_test(
 /// `enclosing_name`/`enclosing_line` identify the caller symbol; `enclosing_class`
 /// is the class it lives in (for `self`/`this` resolution); `receiver` is the
 /// object of a method call (`recv.method()`), enabling tier-2 type resolution.
+#[derive(Debug)]
 pub struct RawCall {
     pub enclosing_name: String,
     pub enclosing_line: usize,
@@ -1095,10 +1096,54 @@ fn walk_calls(
 
     if consts.call_node_types.contains(&node.kind())
         && let Some((enc_name, enc_line)) = &current
-        && let Some(fn_node) = node.child_by_field_name(consts.call_function_field)
-        && let Some((receiver, callee, receiver_is_type_path)) =
+        && let field_name = consts
+            .call_function_field_by_kind
+            .iter()
+            .find(|(kind, _)| *kind == node.kind())
+            .map_or(consts.call_function_field, |(_, f)| f)
+        && let Some(fn_node) = node.child_by_field_name(field_name).or_else(|| {
+            // Fallback for a callee that isn't a named field at all — PHP's
+            // `object_creation_expression` (`new Foo(...)`) names its callee
+            // as a plain positional child of node-KIND "name" (confirmed via
+            // the real grammar: no "type"/"name" field exists on this node),
+            // not a field. Reuses `field_name` as the node-kind to search
+            // for, so this only ever changes behavior for a
+            // `call_function_field_by_kind` entry that's already known not
+            // to resolve as a field — every pre-existing (call kind, field)
+            // pairing still resolves via the field lookup above, unchanged.
+            let mut cur = node.walk();
+            node.children(&mut cur).find(|c| c.kind() == field_name)
+        })
+        && let Some((mut receiver, callee, mut receiver_is_type_path)) =
             split_receiver_callee(&source[fn_node.byte_range()])
     {
+        // Some grammars keep the receiver and the bare callee name as two
+        // SEPARATE fields on the call node itself ("object"/"scope" + the
+        // `call_function_field`) rather than one combined dotted-path field
+        // the way Rust's `field_expression`/Go's `selector_expression` do —
+        // confirmed via the real grammar for PHP's
+        // `member_call_expression`/`nullsafe_member_call_expression`
+        // ("object" + "name") and `scoped_call_expression` ("scope" +
+        // "name"), and for Java's `method_invocation` ("object" + "name",
+        // same latent gap — `helper.run()` never carried a receiver before
+        // this, only ever a bare "run"). `call_function_field`'s own text is
+        // then just the bare callee, so `split_receiver_callee` above finds
+        // no separator and returns `receiver: None` even though there
+        // really is one. Fall back to the call node's own "object"/"scope"
+        // field in that case: "object"'s last identifier segment is the
+        // immediate receiver (mirrors the "receiver = last segment" rule
+        // `split_receiver_callee` already uses for chained access); "scope"
+        // additionally marks a type-path call (`Foo::bar()`), like Rust's
+        // `::`.
+        if receiver.is_none() {
+            if let Some(obj) = node.child_by_field_name("object") {
+                receiver = last_ident_segment(&source[obj.byte_range()]);
+            } else if let Some(scope) = node.child_by_field_name("scope") {
+                let seg = last_ident_segment(&source[scope.byte_range()]);
+                receiver_is_type_path = seg.as_deref().is_some_and(is_type_like);
+                receiver = if receiver_is_type_path { seg } else { None };
+            }
+        }
         out.push(RawCall {
             enclosing_name: enc_name.clone(),
             enclosing_line: *enc_line,
@@ -1125,6 +1170,18 @@ fn walk_calls(
     }
 }
 
+/// The immediate (rightmost) identifier segment of a receiver/scope
+/// expression's raw text — e.g. "helper" from PHP's "$this->helper" (a
+/// nested property access used as another call's receiver), "Foo" from a
+/// bare "Foo" scope. Strips a leading `$` (PHP variable sigil) since
+/// tier-2 type_map lookup keys on the plain variable name either way.
+fn last_ident_segment(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let arrow_end = raw.rfind("->").map(|i| i + 2);
+    let colon_end = raw.rfind("::").map(|i| i + 2);
+    let start = arrow_end.into_iter().chain(colon_end).max().unwrap_or(0);
+    leading_ident(raw[start..].trim_start_matches('$'))
+}
 /// Extract call sites from a source file, each attributed to its enclosing function.
 /// Top-level calls (outside any function) are skipped — they have no caller symbol.
 pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<RawCall>, String> {
@@ -1232,6 +1289,14 @@ pub fn extract_type_map_from_tree(
         // `local_declaration_statement` arm needed. `parameter` names/types
         // itself directly and falls through to the generic arm below.
         "csharp" => &["parameter", "variable_declaration"],
+        // PHP: typed property declarations (`private Foo $helper;`) and
+        // simple typed parameters (`function m(Foo $x)`) — confirmed via
+        // the real grammar that both have their type directly on a "type"
+        // field (a `named_type` node whose own text is just the bare class
+        // name, e.g. "Foo" — no unwrapping needed unlike C's struct_specifier).
+        // Untyped `$x = new Foo();` locals are handled separately below
+        // (constructor inference), not through this generic path.
+        "php" => &["simple_parameter", "property_declaration"],
         _ => return map, // javascript: no static annotations
     };
 
@@ -1301,6 +1366,22 @@ pub fn extract_type_map_from_tree(
                     map.insert(source[name_node.byte_range()].to_string(), ty);
                 }
             }
+        }
+        // PHP constructor inference: `$x = new Foo();` — an untyped local
+        // has no typed-property/parameter annotation to read, so this is
+        // the only way its type becomes known for tier-2. Every PHP
+        // assignment (there's no `let`/`var` declaration keyword the way
+        // Rust/JS have) goes through `assignment_expression`, so one check
+        // covers both a fresh binding and a later reassignment.
+        if language == "php"
+            && node.kind() == "assignment_expression"
+            && let Some(lhs) = node.child_by_field_name("left")
+            && lhs.kind() == "variable_name"
+            && let Some(rhs) = node.child_by_field_name("right")
+            && let Some(ty) = php_constructor_type(rhs, source)
+        {
+            let var = source[lhs.byte_range()].trim_start_matches('$').to_string();
+            map.insert(var, ty);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -1457,6 +1538,25 @@ fn binding_names_and_type(
                 .map(|n| source[n.byte_range()].to_string())
                 .collect()
         }
+        // PHP `simple_parameter`: "name" field is a `variable_name` node
+        // whose own text includes the `$` sigil ("$x") — strip it since
+        // tier-2 type_map lookup keys on the bare variable name.
+        "php" if node.kind() == "simple_parameter" => node
+            .child_by_field_name("name")
+            .map(|n| source[n.byte_range()].trim_start_matches('$').to_string())
+            .into_iter()
+            .collect(),
+        // PHP `property_declaration` shares one type across one-or-more
+        // `property_element` children (`private Foo $a, $b;`) — each
+        // element's own "name" field is again a `$`-prefixed `variable_name`.
+        "php" if node.kind() == "property_declaration" => {
+            let mut cur = node.walk();
+            node.children(&mut cur)
+                .filter(|c| c.kind() == "property_element")
+                .filter_map(|el| el.child_by_field_name("name"))
+                .map(|n| source[n.byte_range()].trim_start_matches('$').to_string())
+                .collect()
+        }
         // C/C++: the name lives inside the `declarator` field, which for a
         // pointer/reference/array declaration wraps another `declarator`
         // around the actual `identifier`/`field_identifier` (`Circle *c` is
@@ -1530,6 +1630,19 @@ fn csharp_constructor_type(value: tree_sitter::Node, source: &str) -> Option<Str
     Some(source[ty.byte_range()].trim().to_string())
 }
 
+/// PHP constructor inference for `$x = new Foo();` — `object_creation_expression`
+/// names its type as a positional child of node-kind "name" (confirmed via
+/// the real grammar: no "type"/"name" *field* exists on this node, same gap
+/// `walk_calls`' `object_creation_expression` fallback works around), not a
+/// field lookup.
+fn php_constructor_type(value: tree_sitter::Node, source: &str) -> Option<String> {
+    if value.kind() != "object_creation_expression" {
+        return None;
+    }
+    let mut cur = value.walk();
+    let name_node = value.children(&mut cur).find(|c| c.kind() == "name")?;
+    Some(source[name_node.byte_range()].to_string())
+}
 // ---------------------------------------------------------------------------
 // Tier-0.5: lightweight regex/heuristic symbol extraction for languages that
 // have no tree-sitter grammar registered in this build. Returns function and
@@ -2000,6 +2113,7 @@ mod tests {
             ("class C { void m(Foo x) {} }\n", "java"),
             ("function f(x: Foo) {}\n", "typescript"),
             ("class C { void M(Foo x) {} }\n", "csharp"),
+            ("<?php\nfunction f(Foo $x) {}\n", "php"),
         ];
         for (src, lang) in cases {
             let m = extract_type_map(src, lang);
@@ -2015,6 +2129,26 @@ mod tests {
         assert_eq!(m.get("y"), Some(&"Foo".to_string()));
         // JavaScript has no static types.
         assert!(extract_type_map("function f(x) {}\n", "javascript").is_empty());
+    }
+
+    #[test]
+    fn php_property_declaration_shares_one_type_across_elements() {
+        let m = extract_type_map("<?php\nclass C { private Foo $a, $b; }\n", "php");
+        assert_eq!(m.get("a"), Some(&"Foo".to_string()));
+        assert_eq!(m.get("b"), Some(&"Foo".to_string()));
+    }
+
+    #[test]
+    fn php_assignment_infers_type_from_constructor() {
+        let m = extract_type_map(
+            "<?php\nclass C { function m() { $x = new Foo(); } }\n",
+            "php",
+        );
+        assert_eq!(
+            m.get("x"),
+            Some(&"Foo".to_string()),
+            "$x = new Foo() must infer x: Foo from the constructor"
+        );
     }
 
     #[test]
@@ -2035,6 +2169,63 @@ mod tests {
             m.get("x"),
             Some(&"Foo".to_string()),
             "var x = new Foo() must infer x: Foo from the constructor, not bind x: \"var\""
+        );
+    }
+
+    #[test]
+    // P1.2 step 1: PHP's member_call_expression/nullsafe_member_call_expression/
+    // scoped_call_expression all name their callee via a "name" field
+    // separate from the receiver ("object"/"scope") — confirmed via the real
+    // grammar. Checks RawCall directly (cheaper/more precise than a full
+    // pipeline test for this specific concern) that receiver+callee both
+    // come through correctly for all three shapes, plus object_creation_expression.
+    fn php_call_extraction_captures_receiver_for_all_call_kinds() {
+        let src = "<?php\n\
+            class C {\n\
+                function m() {\n\
+                    $this->helper->run();\n\
+                    $obj?->run();\n\
+                    Foo::bar();\n\
+                    $y = new Foo();\n\
+                }\n\
+            }\n";
+        let calls = extract_calls(src, "php", "c.php").unwrap();
+        let find = |callee: &str, receiver: Option<&str>| {
+            calls
+                .iter()
+                .find(|c| c.callee == callee && c.receiver.as_deref() == receiver)
+        };
+
+        let run1 = find("run", Some("helper"));
+        assert!(
+            run1.is_some(),
+            "$this->helper->run() must extract receiver=helper (last segment), callee=run; got {calls:?}"
+        );
+        assert!(!run1.unwrap().receiver_is_type_path);
+
+        let run2 = find("run", Some("obj"));
+        assert!(
+            run2.is_some(),
+            "$obj?->run() (nullsafe) must extract receiver=obj, callee=run; got {calls:?}"
+        );
+
+        let bar = find("bar", Some("Foo"));
+        assert!(
+            bar.is_some(),
+            "Foo::bar() must extract receiver=Foo, callee=bar; got {calls:?}"
+        );
+        assert!(
+            bar.unwrap().receiver_is_type_path,
+            "Foo::bar()'s receiver must be marked a type-path (scoped_call_expression), \
+             like Rust's Type::method()"
+        );
+
+        let ctor = calls
+            .iter()
+            .find(|c| c.callee == "Foo" && c.receiver.is_none());
+        assert!(
+            ctor.is_some(),
+            "new Foo() must extract as a call to bare name Foo (no receiver); got {calls:?}"
         );
     }
 

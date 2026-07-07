@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) ĐÃ XONG toàn bộ — nền tảng hoàn tất. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: cùng phiên với P0 hoàn tất (xem lịch sử git — commit gộp, chưa tách theo từng mục). Phase 1/2/3 CHƯA thực thi. Xem §3 để biết chi tiết những gì đã làm; đừng làm lại.
+> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. Phase 2/3 CHƯA thực thi. Xem §3/§4 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -116,11 +116,19 @@ Phiên sau đọc mục này thay vì tự khảo sát lại:
 
 ## 4. PHASE 1 — Zero external deps (song song được, sau P0)
 
-### P1.1 — JavaScript stack-graphs (XS→S)
-- **Option A (khuyến nghị):** thêm dep `tree-sitter-stack-graphs-javascript = "0.3.0"` (workspace); `formal.rs` thêm `load_javascript()` mirror `load_typescript` (crate JS xử lý CommonJS require); wire tại mọi nơi gọi `load_typescript` (dùng `callers` tool để liệt kê ~8 site). `.jsx` → kiểm tra `language_for_extension`; nếu cần grammar variant thì mirror cơ chế `TsxVariant`.
-- **Option B (fallback nếu version conflict):** đăng ký khoá `"javascript"` trỏ cùng SGL/builtins đã build cho TS.
-- **Lưu ý:** upstream archived — đây là giải pháp giữ chỗ; đường dài là P3.2 (scip-typescript). KHÔNG đầu tư viết .tsg mới.
-- **DoD:** fixture js def/ref → edge `formal` (`formal_source='stack_graphs'`).
+### P1.1 — ✅ ĐÃ XONG — JavaScript stack-graphs (XS→S)
+- **Option A đi đúng như dự kiến, không conflict version:** thêm `tree-sitter-stack-graphs-javascript = "0.3"` (workspace + calm-core) — `cargo build` resolve sạch ngay lần đầu, không cần Option B fallback. `formal.rs` thêm `FormalResolver::load_javascript()` (mirror `load_typescript` nhưng đơn giản hơn — xem điểm dưới).
+- **Khác dự kiến ở 2 điểm, cả 2 đều xác minh qua source code thật của crate (không đoán):**
+  1. Hàm thật là `try_language_configuration()` (KHÔNG có hậu tố `_javascript`) — chỉ đăng ký 1 file type `"js"`. Không có cặp hàm variant kiểu `_typescript`/`_tsx`.
+  2. **Không cần `JsxVariant`:** `tree-sitter-javascript` (grammar nền của crate JS) parse JSX ngay trong 1 grammar duy nhất — không có nhập nhằng generic-`<T>`-vs-JSX-tag như TypeScript (lý do TS cần 2 grammar riêng). `ci`'s `lang_constants.rs` đã map `.js|.jsx|.mjs|.cjs` → cùng 1 string `"javascript"` từ trước — nên chỉ cần **1 entry** `FormalLanguageConfig` (`tsx: None`), test xác nhận `.jsx` resolve def/ref bình thường qua cùng entry đó.
+  - `builtins.js` của crate này **RỖNG** (0 dòng) — khác Python/TS đều có builtins thật (len/print/Array.isArray...). Không có gì để test "builtin resolve qua formal tier" cho JS.
+- **Wire:** chỉ 2 call site SẢN XUẤT thật (`run_indexing_pipeline`, `reindex_changed`) cần `formal.load_javascript()` thêm cạnh `load_typescript()` — 6 "site" còn lại trong ước tính gốc ("~8 site") là test riêng của TypeScript (`test_resolve_tsx_def_ref` etc.), không liên quan đến JS.
+- **DoD đạt được ở mức cơ chế (FormalResolver), KHÔNG đạt đúng nguyên văn ở mức pipeline — lý do xác minh thật, không phải thiếu sót:** đã verify bằng `calm index` thật trên fixture JS đơn giản (`run()` gọi `helper()` cùng file) → `edge_confidence='resolved'`, KHÔNG phải `'formal'`. Nguyên nhân: `extract_symbols` của `ci` gom MỌI function declaration cùng file vào 1 `file_symbols` set phẳng bất kể độ sâu lồng nhau → Tier-1 đã "resolved" được các case intra-file trước khi formal tier (stack-graphs, chỉ hoạt động per-file, không cross-file) có cơ hội nâng cấp gì thêm — và vì `builtins.js` rỗng, không có case kiểu `Array.isArray` (TS) để ép ra transition "textual→formal" thật. Mức "def/ref → formal" ĐÃ được chứng minh đúng ở tầng `FormalResolver::resolve_file()` (4 test mới trong `formal.rs`, gọi thẳng không qua Tier-1) — đây chính là cơ chế P1.1 cần lắp, chỉ là pipeline hiện tại không có input nào lộ ra transition đó cho JS cụ thể.
+- **Lưu ý:** upstream archived — đây là giải pháp giữ chỗ; đường dài là P3.2 (scip-typescript, cũng phủ JS). KHÔNG đầu tư viết .tsg mới.
+- **Verify:** `test_load_javascript`, `test_resolve_simple_javascript_def_ref`, `test_resolve_javascript_does_not_resolve_undefined_name`, `test_resolve_javascript_def_ref_in_jsx_file` (formal.rs, tất cả gọi `resolve_file` trực tiếp) + `test_javascript_formal_resolver_wired_into_pipeline` (pipeline.rs, integration — mirror đúng tinh thần pragmatic của `test_formal_tier_upgrades_textual_python_call` đã có sẵn cho Python, cùng lý do). Toàn bộ workspace 526 test xanh, clippy `-D warnings` sạch, fmt sạch.
+- Đừng làm lại.
+
+**→ Phase 1 (P1.1-P1.5) ĐÃ XONG TOÀN BỘ.**
 
 ### P1.2 — ✅ ĐÃ XONG — PHP heuristics (S/M) — ĐÚNG THỨ TỰ
 1. **Call extraction — ✅.** `lang_constants.rs`'s `"php"` entry: thêm `member_call_expression`, `scoped_call_expression`, `nullsafe_member_call_expression`, `object_creation_expression` vào `call_node_types`. **Phát hiện kiến trúc thật (lớn hơn dự kiến của bullet ⚠️ gốc):** `call_function_field` là 1 string DÙNG CHUNG cho MỌI node kind trong 1 ngôn ngữ — không đủ để biểu diễn PHP cần 2 field khác nhau (`function_call_expression`="function", còn lại="name") cùng lúc. Đã thêm field mới `LangConstants.call_function_field_by_kind: &[(&str, &str)]` (override theo node kind, rỗng cho mọi ngôn ngữ khác) + sửa `walk_calls` tra cứu field đó trước khi fallback về `call_function_field`. `object_creation_expression`'s callee ("Foo" trong `new Foo()`) hoá ra KHÔNG phải field nào cả (xác nhận qua dump AST thật) — là positional child kind="name" — `walk_calls` có thêm 1 fallback nữa: nếu field lookup thất bại, tìm child đầu tiên có `kind() == field_name`.
@@ -222,23 +230,30 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 ## 9. Thứ tự thực thi khuyến nghị (dependency graph)
 
 ```
-P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ✅ → P0.5 ✅   (P0 XONG TOÀN BỘ — xem banner đầu file)
-sau P0: P1.1 ∥ P1.2 ∥ P1.3 ∥ P1.4 ∥ P1.5  (song song — CÓ THỂ BẮT ĐẦU NGAY)
+P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ✅ → P0.5 ✅   (P0 XONG TOÀN BỘ)
+P1.1 ✅ ∥ P1.2 ✅ ∥ P1.3 ✅ ∥ P1.4 ✅ ∥ P1.5 ✅ (partial, xem ghi chú)   (PHASE 1 XONG TOÀN BỘ)
 sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (CÓ THỂ BẮT ĐẦU NGAY — P0.4 đã xong)
 sau P2: P3.1 ∥ P3.2
 P3.3 (SQL): bất kỳ lúc nào — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc gì thêm
-Benchmark harness: CÓ THỂ DỰNG NGAY (P0.5 xong) — đo baseline trước khi bắt đầu Phase 1/2 để có số so sánh
+Benchmark harness: CÓ THỂ DỰNG NGAY (P0.5 xong) — đo baseline trước khi bắt đầu Phase 2 để có số so sánh
+P1.5's "using→namespace" nửa còn lại: mở, cần 1 pre-pass kiến trúc mới (xem ghi chú trong mục P1.5)
 ```
 
 Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người (P0.1-P0.3 đã xong trong 1 phiên); P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
 
-## 10. Điểm dừng phiên này (2026-07-07, phiên tiếp — sau khi P0.4/P0.5 hoàn tất)
+## 10. Điểm dừng phiên này (2026-07-07, phiên tiếp — sau khi Phase 0 VÀ Phase 1 hoàn tất toàn bộ)
 
-Toàn bộ Phase 0 (P0.1-P0.5) đã xong và verify (build/test/clippy/fmt xanh + smoke test thật trên fixture cho re-run; xem §3 P0.4/P0.5). Thay đổi CHƯA commit tại thời điểm ghi chú này — người dùng chọn gộp P0.4+P0.5 vào 1 commit thay vì tách như P0.1-P0.3, xem lịch sử git để biết commit thật đã tạo chưa.
+Phase 0 (P0.1-P0.5) và Phase 1 (P1.1-P1.5, P1.5 partial) đã xong và verify đầy đủ (build/test/clippy/fmt xanh sau MỖI mục, không chỉ ở cuối). Mỗi mục Phase 1 đã có commit riêng (P1.3 `fdf0aaf`, P1.4 `7ba5fb5`, P1.5 `d7178b9`, P1.2 `7b7dec7`; P1.1 xem git log). Toàn bộ workspace ở lần verify cuối: 526 test, 0 fail.
+
+Phát hiện kiến trúc quan trọng từ phiên này, áp dụng cho MỌI ngôn ngữ còn lại (Phase 2/3):
+- `LangConstants.call_function_field` (1 string/ngôn ngữ) không đủ khi 1 ngôn ngữ có nhiều node kind gọi hàm với field khác nhau — đã tổng quát bằng `call_function_field_by_kind`. Kiểm tra field thật của MỌI node kind mới trước khi thêm vào `call_node_types`, đừng giả định giống node đã có.
+- `split_receiver_callee` giờ nhận `.`/`->`/`::` (trước chỉ `.`/`::`) — có thể còn ngôn ngữ khác dùng separator khác chưa phát hiện (vd Kotlin `?.`, Swift chưa xem qua receiver thật).
+- `walk_calls` giờ có fallback "tìm child theo kind khi field lookup thất bại" — hữu ích cho các node kind PHP-style tách object/scope+name làm 2, hoặc node có callee là positional child không field.
+- Luôn dump AST thật (temporary `#[test]` + `eprintln!`, xoá sau khi verify) trước khi viết code dựa trên giả định field/node-kind — phiên này bắt được ít nhất 4 giả định sai (PHP object_creation_expression, C# variable_declaration initializer field, C struct_specifier text, Java method_invocation receiver) chỉ nhờ dump thật thay vì đoán.
 
 Không còn phụ thuộc kỹ thuật nào chặn bất kỳ nhánh nào bên dưới — lựa chọn tiếp theo thuần là ưu tiên, không phải trình tự bắt buộc:
-1. **Phase 1** (P1.1 JS stack-graphs · P1.2 PHP · P1.3 Tier-1.5 same-dir · P1.4 C/C++ · P1.5 C#) — song song hoá tốt, mỗi mục effort S/M, không cần binary ngoài, giá trị thấy ngay trên fixture nội bộ.
-2. **Phase 2 provider đầu tiên** (khuyến nghị Go — `scip-go` đơn giản nhất, không cần build-tool network resolve như Java/C#) — giờ có thể cắm thẳng vào bảng `ScipProvider` (P0.4 đã tổng quát hoá) mà không cần sửa lại `mod.rs`/`runner.rs`, chỉ thêm 1 entry + config `GoConfig` khi cần.
-3. **P3.3 (SQL)** — độc lập hoàn toàn, effort M-L riêng, có thể làm song song với 1/2.
-4. **Benchmark harness** (`benchmarks/resolution/`) — đo baseline trước khi Phase 1/2 đổ vào, để có số so sánh "trước/sau" thật.
-5. Xác nhận `.github/workflows/scip-nightly.yml` chạy xanh thật trên GitHub Actions (push + đợi lịch hoặc `workflow_dispatch` thủ công) — phiên này chỉ verify tương đương ở local.
+1. **Phase 2 provider đầu tiên** (khuyến nghị Go — `scip-go` đơn giản nhất, không cần build-tool network resolve như Java/C#) — có thể cắm thẳng vào bảng `ScipProvider` (P0.4 đã tổng quát hoá) mà không cần sửa lại `mod.rs`/`runner.rs`, chỉ thêm 1 entry + config `GoConfig` khi cần.
+2. **P3.3 (SQL)** — độc lập hoàn toàn, effort M-L riêng.
+3. **Benchmark harness** (`benchmarks/resolution/`) — đo baseline trước khi Phase 2 đổ vào, để có số so sánh "trước/sau" thật — giờ có nhiều heuristic Phase 1 hơn để đo giá trị cộng thêm.
+4. Xác nhận `.github/workflows/scip-nightly.yml` chạy xanh thật trên GitHub Actions (push + đợi lịch hoặc `workflow_dispatch` thủ công) — chưa phiên nào verify tương đương ngoài local.
+5. P1.5's "using→namespace-to-files" nửa còn lại (namespace không map trực tiếp thư mục cho C#) — cần pre-pass kiến trúc mới, xem ghi chú trong mục P1.5.

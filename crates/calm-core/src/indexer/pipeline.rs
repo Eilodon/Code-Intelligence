@@ -1121,6 +1121,7 @@ pub fn run_indexing_pipeline(
     let mut formal = crate::resolver::formal::FormalResolver::new();
     let _ = formal.load_python(); // non-fatal: falls back silently on error
     let _ = formal.load_typescript(); // non-fatal: falls back silently on error
+    let _ = formal.load_javascript(); // non-fatal: falls back silently on error
     let _ = formal.load_java(); // non-fatal: falls back silently on error
 
     let mut files = Vec::new();
@@ -1214,6 +1215,7 @@ pub fn reindex_changed(
     let mut formal = crate::resolver::formal::FormalResolver::new();
     let _ = formal.load_python();
     let _ = formal.load_typescript();
+    let _ = formal.load_javascript();
     let _ = formal.load_java();
 
     let existing: HashMap<String, String> = {
@@ -2759,6 +2761,76 @@ impl StructB {
             1,
             "Foo::make() must resolve via the scoped type path"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.1: the JS stack-graphs formal resolver is wired into the real
+    // indexing pipeline (not just FormalResolver::resolve_file in
+    // isolation, already covered in resolver/formal.rs's own tests) — a
+    // simple def/ref pair in a .js file produces a real call_edges row, and
+    // if the formal tier is what produced it (edge_confidence='formal'),
+    // formal_source must say so.
+    //
+    // Note on scope: this repo's own `extract_symbols` captures every
+    // same-file function declaration into a flat `file_symbols` name set
+    // regardless of nesting depth, so an intra-file call to another
+    // declared function already resolves at tier-1 ("resolved") before
+    // stack-graphs is ever consulted — unlike TypeScript/Python's own
+    // formal-tier tests, JS's `builtins.js` (upstream) ships empty, so
+    // there's no builtin-call case available to force a genuine
+    // textual->formal transition the way `Array.isArray` does for TS. This
+    // test therefore checks integration (the edge exists, confidence is at
+    // least "resolved", and IF formal then formal_source is stack_graphs),
+    // mirroring `test_formal_tier_upgrades_textual_python_call`'s own
+    // pragmatic scope for the same reason.
+    fn test_javascript_formal_resolver_wired_into_pipeline() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_js_formal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mod.js"),
+            "function helper() {\n    return 1;\n}\n\nfunction run() {\n    return helper();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol LIKE '%::run' AND to_symbol LIKE '%::helper'",
+            ),
+            1,
+            "run() -> helper() must produce exactly one call edge"
+        );
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol LIKE '%::run' AND to_symbol LIKE '%::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(confidence.as_str(), "resolved" | "formal"),
+            "expected 'resolved' or 'formal', got: {confidence}"
+        );
+        if confidence == "formal" {
+            let formal_source: Option<String> = conn
+                .query_row(
+                    "SELECT formal_source FROM call_edges \
+                     WHERE from_symbol LIKE '%::run' AND to_symbol LIKE '%::helper'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(formal_source.as_deref(), Some("stack_graphs"));
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

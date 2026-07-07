@@ -407,6 +407,39 @@ impl FormalResolver {
         Ok(())
     }
 
+    /// JS gap (8-language plan P1.1): `ci`'s own `lang_constants.rs` maps
+    /// `.js`/`.jsx`/`.mjs`/`.cjs` all to the single "javascript" language
+    /// string — unlike TypeScript/TSX, `tree-sitter-javascript` parses JSX
+    /// directly in its one grammar (no generic-vs-JSX-angle-bracket
+    /// ambiguity the way TS has), so there's no `TsxVariant`-style split to
+    /// make here: one `FormalLanguageConfig` entry, `tsx: None`, covers all
+    /// four extensions. Confirmed via the real crate source that
+    /// `try_language_configuration` only ever registers the "js" file type
+    /// itself — `ci` doesn't route through that, so this is harmless (its
+    /// own `lang_constants.rs` mapping is what actually decides which files
+    /// reach `resolve_file("javascript", ...)`).
+    ///
+    /// stack-graphs itself is archived upstream — this is a stopgap so JS
+    /// gets *some* formal tier rather than none, not a long-term bet; the
+    /// real exit is scip-typescript (P3.2), which also covers JS.
+    pub fn load_javascript(&mut self) -> anyhow::Result<()> {
+        let lc =
+            tree_sitter_stack_graphs_javascript::try_language_configuration(cancellation_flag())
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to load JavaScript stack-graphs config: {e}")
+                })?;
+
+        self.configs.insert(
+            "javascript".to_string(),
+            FormalLanguageConfig {
+                sgl: lc.sgl,
+                builtins: lc.builtins,
+                no_similar_paths_in_file: lc.no_similar_paths_in_file,
+                tsx: None,
+            },
+        );
+        Ok(())
+    }
     /// Java formal resolution. Unlike Python (`load_python`), no dialect
     /// variant is needed — Java has no `.tsx`-style split, matching
     /// TypeScript's own primary (non-tsx) shape. Like Python, upstream's
@@ -894,6 +927,76 @@ function Bar() {
                 .iter()
                 .any(|e| e.reference_symbol == "totallyUndefinedXyz"),
             "a genuinely undefined name must not resolve. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_javascript() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_javascript().unwrap();
+        assert!(resolver.has_language("javascript"));
+    }
+
+    #[test]
+    fn test_resolve_simple_javascript_def_ref() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_javascript().unwrap();
+        let source = r#"
+function foo() {}
+
+function bar() {
+    foo();
+}
+"#;
+        let edges = resolver
+            .resolve_file("javascript", "test.js", source)
+            .unwrap();
+        let has_foo_edge = edges
+            .iter()
+            .any(|e| e.definition_symbol == "foo" || e.reference_symbol == "foo");
+        assert!(
+            has_foo_edge,
+            "Should resolve foo() call to foo definition. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_javascript_does_not_resolve_undefined_name() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_javascript().unwrap();
+
+        let edges = resolver
+            .resolve_file(
+                "javascript",
+                "test.js",
+                "function useUndefined() {\n    return totallyUndefinedXyz();\n}\n",
+            )
+            .unwrap();
+
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.reference_symbol == "totallyUndefinedXyz"),
+            "a genuinely undefined name must not resolve. Edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    // P1.1: CALM's own lang_constants.rs maps .jsx to the same "javascript"
+    // language string as .js — confirms the single (non-Tsx-split) grammar
+    // config resolves a JSX file's plain function call too, not just .js.
+    fn test_resolve_javascript_def_ref_in_jsx_file() {
+        let mut resolver = FormalResolver::new();
+        resolver.load_javascript().unwrap();
+        let source = "function foo() {}\nfunction bar() {\n    foo();\n}\n";
+        let edges = resolver
+            .resolve_file("javascript", "test.jsx", source)
+            .unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.definition_symbol == "foo" || e.reference_symbol == "foo"),
+            "Should resolve foo() call to foo definition in a .jsx file too. Edges: {edges:?}"
         );
     }
 

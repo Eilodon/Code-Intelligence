@@ -260,6 +260,105 @@ pub fn python_toolchain_fingerprint(root: &Path) -> String {
     String::new()
 }
 
+/// Total wall-clock budget for one `scip-typescript index` pass. TS
+/// type-checking (the `tsc`-driven pass scip-typescript wraps) is
+/// comparable in cost to Go's compiler-driven pass, so this reuses Go's
+/// budget rather than Python's larger one; still bounded so a pathological
+/// project graph can't hang the watcher/CLI indefinitely.
+pub const JS_SCIP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Resolve a way to run `scip-typescript`: an explicit override, then a
+/// standalone binary on `PATH` (e.g. `npm install -g @sourcegraph/scip-typescript`),
+/// then `npx` as a proxy for "run the npm package on demand" — same
+/// reasoning and fallback shape as `python_resolve_binary`, since most
+/// checkouts won't have it installed globally either.
+pub fn js_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-typescript")); // PATH lookup via which-style probe
+    if let Some(c) = candidates.into_iter().find(|c| binary_runs(c)) {
+        return Some(c);
+    }
+    let npx = PathBuf::from("npx");
+    npx_can_run_scip_typescript(&npx).then_some(npx)
+}
+
+/// Whether `npx --yes @sourcegraph/scip-typescript --version` succeeds —
+/// same `--yes` auto-confirm reasoning as `npx_can_run_scip_python`.
+fn npx_can_run_scip_typescript(npx: &Path) -> bool {
+    Command::new(npx)
+        .args(["--yes", "@sourcegraph/scip-typescript", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `scip-typescript index --infer-tsconfig --cwd <root> --output <out>
+/// --no-progress-bar`. `--infer-tsconfig` lets plain-JS projects (no
+/// `tsconfig.json`) index without one, which is the common case for the
+/// `MAX_CALLEE_CANDIDATES` fixture-style projects this overlay targets first
+/// — confirmed experimentally against this exact package version on a
+/// `tsconfig`-less fixture (a `tsconfig.json` is generated as a side effect,
+/// harmless). Unlike `scip-go`/`scip-python`, this CLI has no `--quiet`
+/// flag at all (confirmed via `--help` against this exact package version —
+/// passing one makes the whole command fail with `unknown option
+/// '--quiet'`, silently no-op'd by `run_indexer`'s fail-open error
+/// handling); `--no-progress-bar` is the closest real flag, and stdout/
+/// stderr are still redirected below regardless.
+pub fn js_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    if is_npx(bin) {
+        cmd.args(["--yes", "@sourcegraph/scip-typescript"]);
+    }
+    cmd.arg("index")
+        .arg("--infer-tsconfig")
+        .arg("--no-progress-bar")
+        .arg("--cwd")
+        .arg(root)
+        .arg("--output")
+        .arg(out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// scip-typescript's own `--version` output, trimmed, or `""` if it can't be
+/// run — routed through `npx` (same package-name prefix as
+/// `js_build_command`) when `bin` is the `npx` proxy, mirroring
+/// `python_binary_version`.
+pub fn js_binary_version(bin: &Path) -> String {
+    let mut cmd = Command::new(bin);
+    if is_npx(bin) {
+        cmd.args(["--yes", "@sourcegraph/scip-typescript", "--version"]);
+    } else {
+        cmd.arg("--version");
+    }
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// `node --version`, trimmed, or `""` if it can't be run. Part of the JS/TS
+/// overlay cache key alongside `js_binary_version` — a different active
+/// Node runtime can change scip-typescript's TS-compiler-driven inference
+/// even with the same scip-typescript version.
+pub fn js_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("node")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn binary_runs(path: &Path) -> bool {
     Command::new(path)
         .arg("--version")
@@ -389,5 +488,16 @@ mod tests {
         assert!(is_npx(Path::new("/usr/local/bin/npx")));
         assert!(!is_npx(Path::new("scip-python")));
         assert!(!is_npx(Path::new("/usr/local/bin/scip-python")));
+    }
+
+    /// Same invariant as `go_binary_runs_rejects_a_nonexistent_path`, pinned
+    /// at the underlying probe for the same reason: a sandbox with a real
+    /// `scip-typescript` reachable via `npx` would make an end-to-end
+    /// `js_resolve_binary(...).is_none()` assertion flaky.
+    #[test]
+    fn js_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!binary_runs(Path::new(
+            "definitely-not-a-real-scip-typescript-binary-xyz"
+        )));
     }
 }

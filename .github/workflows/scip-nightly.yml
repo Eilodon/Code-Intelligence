@@ -23,12 +23,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # Only rust-analyzer is installed today, covering the P0.1-P0.4
-      # `#[ignore]`d tests (real rust-analyzer end-to-end). Add each Phase 2
-      # provider's own toolchain/binary install step here as it lands — Go
-      # toolchain + scip-go, JDK + Gradle/Maven + scip-java, .NET SDK +
-      # scip-dotnet, etc. `cargo test --workspace -- --ignored` below picks
-      # up their new `#[ignore]`d tests (likely pointed at
+      # `go` and `node`/`npm` are preinstalled on the `ubuntu-latest` runner
+      # image (github.com/actions/runner-images) — no `actions/setup-*` step
+      # needed for either, so nothing new to SHA-pin here. `scip-go` (P2.1)
+      # is a real `go install`; `scip-python` (P2.4) and `scip-typescript`
+      # (P3.2) run through `npx` on demand (see `runner.rs`'s
+      # `python_resolve_binary`/`js_resolve_binary`) and need no separate
+      # install step at all — only network access to the npm registry, which
+      # this runner already has.
+      - name: Install scip-go
+        run: go install github.com/scip-code/scip-go/cmd/scip-go@latest
+
+      # Still missing: JDK + Gradle/Maven + scip-java (P2.2), .NET SDK +
+      # scip-dotnet (P2.3), scip-php (P2.5), compile_commands.json + clang +
+      # scip-clang (P3.1). Add each provider's own toolchain/binary install
+      # step here as it lands. `cargo test --workspace -- --ignored` below
+      # picks up their new `#[ignore]`d tests (pointed at
       # `crates/calm-core/tests/fixtures/multi_lang_workspace/`) the moment
       # they exist — no other change needed in this file.
       - name: Run real-indexer integration tests

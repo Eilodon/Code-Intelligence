@@ -1,3 +1,7 @@
 const { greet } = require("./helper");
 
-console.log(greet("world"));
+function run() {
+  console.log(greet("world"));
+}
+
+run();

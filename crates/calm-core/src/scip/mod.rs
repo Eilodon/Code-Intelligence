@@ -363,6 +363,44 @@ pub fn run_java_overlay_and_log(
     run_and_refresh(&provider::JAVA, conn, root, &cfg.scip, false)
 }
 
+/// Run the C# overlay (`provider::CSHARP`) — same shape as
+/// `run_go_overlay_and_log`/`run_java_overlay_and_log`. No pre-existing
+/// formal tier to coexist with (C# was never in `resolver::formal`'s
+/// stack-graphs registrations — confirmed against the real registration
+/// list in `formal.rs`, unlike the Java doc comment above which got this
+/// wrong on the first pass), so there's no provenance-override concern.
+pub fn run_csharp_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::CSharpConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    run_and_refresh(&provider::CSHARP, conn, root, &cfg.scip, false)
+}
+
+/// Run the PHP overlay (`provider::PHP`) — same shape as the other
+/// providers. Like C#, PHP has no pre-existing formal tier to coexist with.
+pub fn run_php_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::PhpConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    run_and_refresh(&provider::PHP, conn, root, &cfg.scip, false)
+}
+
+/// Run the C/C++ overlay (`provider::CLANG`) — same shape as the other
+/// providers, but see `provider::CLANG`'s own doc comment: this session
+/// could not obtain a real `scip-clang` binary (GitHub Releases blocked,
+/// no Bazel), so this path is exercised only by unit tests, never a real
+/// external indexer, in this checkout's CI. Like C#/PHP, C/C++ has no
+/// pre-existing formal tier to coexist with.
+pub fn run_clang_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::ClangConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    run_and_refresh(&provider::CLANG, conn, root, &cfg.scip, false)
+}
+
 /// Manually refresh one or every SCIP provider right now, bypassing
 /// `cfg.policy`'s automatic-run gate (`force: true` — see
 /// `run_overlay_for`) — the shared entry point behind `calm scip run` and
@@ -380,7 +418,16 @@ pub fn refresh_language(
     config: &crate::config::Config,
     lang: Option<&str>,
 ) -> anyhow::Result<Vec<(String, ingest::IngestStats)>> {
-    let all = ["rust", "go", "python", "javascript", "java"];
+    let all = [
+        "rust",
+        "go",
+        "python",
+        "javascript",
+        "java",
+        "csharp",
+        "php",
+        "c",
+    ];
     let want: &[&str] = match lang {
         None | Some("all") => &all,
         Some(l) if all.contains(&l) => std::slice::from_ref(
@@ -389,7 +436,7 @@ pub fn refresh_language(
                 .expect("just checked contains"),
         ),
         Some(other) => anyhow::bail!(
-            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, all"
+            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, csharp, php, c, all"
         ),
     };
     let mut out = Vec::with_capacity(want.len());
@@ -401,7 +448,10 @@ pub fn refresh_language(
             "javascript" => {
                 run_and_refresh(&provider::TYPESCRIPT, conn, root, &config.js.scip, true)?
             }
+            "csharp" => run_and_refresh(&provider::CSHARP, conn, root, &config.csharp.scip, true)?,
             "java" => run_and_refresh(&provider::JAVA, conn, root, &config.java.scip, true)?,
+            "php" => run_and_refresh(&provider::PHP, conn, root, &config.php.scip, true)?,
+            "c" => run_and_refresh(&provider::CLANG, conn, root, &config.clang.scip, true)?,
             _ => unreachable!("want is filtered to `all` above"),
         };
         out.push((lang.to_string(), stats));
@@ -620,6 +670,63 @@ mod tests {
         );
     }
 
+    /// Same guarantee, for the C# provider added in P2.3.
+    #[test]
+    fn csharp_explicit_off_is_a_noop_even_when_scip_dotnet_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let csharp = crate::config::CSharpConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        assert_eq!(
+            run_csharp_overlay_and_log(&conn, Path::new("."), &csharp).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
+    /// Same guarantee, for the PHP provider added in P2.5.
+    #[test]
+    fn php_explicit_off_is_a_noop_even_when_scip_php_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let php = crate::config::PhpConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        assert_eq!(
+            run_php_overlay_and_log(&conn, Path::new("."), &php).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
+    /// Same guarantee, for the C/C++ provider added in P3.1.
+    #[test]
+    fn clang_explicit_off_is_a_noop_even_when_scip_clang_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let clang = crate::config::ClangConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        assert_eq!(
+            run_clang_overlay_and_log(&conn, Path::new("."), &clang).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
     /// A project with zero indexed files of a provider's language(s) must
     /// short-circuit to a no-op *before* ever probing for a binary — even
     /// with `enabled: Some(true)`, which would otherwise log a "not found"
@@ -664,7 +771,7 @@ mod tests {
     }
 
     /// `None`/`Some("all")` runs every provider in the table, in the same
-    /// fixed order, one result per provider — all 5 configs are disabled so
+    /// fixed order, one result per provider — all 8 configs are disabled so
     /// this is deterministic regardless of what's installed on this machine.
     #[test]
     fn refresh_language_all_covers_every_provider_in_order() {
@@ -681,11 +788,26 @@ mod tests {
         config.go.scip = off.clone();
         config.python.scip = off.clone();
         config.js.scip = off.clone();
-        config.java.scip = off;
+        config.java.scip = off.clone();
+        config.csharp.scip = off.clone();
+        config.php.scip = off.clone();
+        config.clang.scip = off;
 
         let results = refresh_language(&conn, Path::new("."), &config, None).unwrap();
         let langs: Vec<&str> = results.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(langs, vec!["rust", "go", "python", "javascript", "java"]);
+        assert_eq!(
+            langs,
+            vec![
+                "rust",
+                "go",
+                "python",
+                "javascript",
+                "java",
+                "csharp",
+                "php",
+                "c"
+            ]
+        );
         assert!(
             results
                 .iter()
@@ -694,7 +816,7 @@ mod tests {
 
         let results_explicit_all =
             refresh_language(&conn, Path::new("."), &config, Some("all")).unwrap();
-        assert_eq!(results_explicit_all.len(), 5);
+        assert_eq!(results_explicit_all.len(), 8);
     }
 
     /// A specific `lang` runs only that one provider.
@@ -981,5 +1103,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-dotnet` against
+    /// `multi_lang_workspace/csharp` (P2.3). Ignored by default — requires a
+    /// `scip-dotnet` launcher on `PATH` (`dotnet tool install --global
+    /// scip-dotnet` — a real published NuGet package, no bespoke bootstrap
+    /// needed unlike scip-java) plus a .NET SDK reachable on `PATH` —
+    /// `scip-dotnet` drives a real `dotnet restore` + build.
+    #[test]
+    #[ignore]
+    fn csharp_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/csharp");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let csharp = crate::config::CSharpConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        let stats = run_csharp_overlay_and_log(&conn, &fixture, &csharp).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'Program.cs::Program::Main' \
+                   AND to_symbol = 'Helper.cs::Helper::Greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-php` against `multi_lang_workspace/php`
+    /// (P2.5). Ignored by default — requires `composer` and a `scip-php`
+    /// launcher on `PATH` (`composer install` inside a checkout of
+    /// `davidrjenni/scip-php`, then this test's own `composer install` step
+    /// below to give the *fixture* its own `vendor/autoload.php`, which
+    /// `php_resolve_binary` gates on).
+    ///
+    /// Real bugs found in the session that wrote this test:
+    ///
+    /// 1. `scip-php` itself crashes (`TypeError: Cannot assign null to
+    ///    Composer::$pkgVersion`) when the project it indexes has no git
+    ///    commit reference at all (Composer's generated
+    ///    `vendor/composer/installed.php` sets the root package's
+    ///    `reference` to `null` outside any VCS) — there's no CLI flag to
+    ///    work around this, unlike scip-python's `--project-version`. This
+    ///    fixture works specifically *because* it lives inside CALM's own
+    ///    git checkout (Composer's VCS detection walks up to the nearest
+    ///    `.git`, which it finds at the repo root) — confirmed by
+    ///    reproducing the crash against an out-of-repo copy of this same
+    ///    fixture and getting a real `index.scip` against the in-repo path
+    ///    unchanged.
+    /// 2. `scip-php`'s `Types::type()` (`src/Types/Types.php`) has no
+    ///    local-variable data-flow analysis: a plain `Variable` node only
+    ///    resolves when its name is literally `this`, so
+    ///    `$helper = new Helper(); $helper->greet();` never resolves
+    ///    `$helper`'s type and silently emits no occurrence for the
+    ///    `->greet()` call at all — no crash, just a missing reference. It
+    ///    *does* resolve a `New_` expression inline, so this fixture calls
+    ///    `(new Helper())->greet(...)` directly (see `index.php`) to stay
+    ///    within what the tool can actually type-check, rather than
+    ///    asserting on a call shape it cannot resolve.
+    #[test]
+    #[ignore]
+    fn php_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/php");
+        // Composer-managed `vendor/` is gitignored and not committed (see
+        // .gitignore) — regenerate it here, matching what a real project's
+        // own setup step would already have done before enabling this
+        // overlay. No network round-trip: the fixture's composer.json
+        // declares zero external dependencies, so this only builds the
+        // PSR-4 autoloader from `composer.lock`.
+        let status = std::process::Command::new("composer")
+            .args(["install", "--no-interaction"])
+            .current_dir(&fixture)
+            .status()
+            .expect("composer must be on PATH for this ignored test");
+        assert!(status.success(), "composer install failed");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let php = crate::config::PhpConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        let stats = run_php_overlay_and_log(&conn, &fixture, &php).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'index.php::run' \
+                   AND to_symbol = 'src/Helper.php::Helper::greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+
+        // Best-effort cleanup so a local `--ignored` run doesn't leave
+        // gitignored-but-real build artifacts sitting in a tracked fixture
+        // directory indefinitely between runs.
+        let _ = std::fs::remove_dir_all(fixture.join("vendor"));
+        let _ = std::fs::remove_file(fixture.join("composer.lock"));
+        let _ = std::fs::remove_file(fixture.join("index.scip"));
     }
 }

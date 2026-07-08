@@ -80,12 +80,53 @@ jobs:
           chmod +x "$HOME/.local/bin/scip-java"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # Still missing: .NET SDK + scip-dotnet (P2.3), scip-php (P2.5),
-      # compile_commands.json + clang + scip-clang (P3.1). Add each
-      # provider's own toolchain/binary install step here as it lands.
-      # `cargo test --workspace -- --ignored` below picks up their new
-      # `#[ignore]`d tests (pointed at
-      # `crates/calm-core/tests/fixtures/multi_lang_workspace/`) the moment
-      # they exist — no other change needed in this file.
+      # .NET SDK is preinstalled on the `ubuntu-latest` runner image
+      # (github.com/actions/runner-images ships several SDK versions) — no
+      # separate `actions/setup-dotnet` step needed, matching the JDK/Go/Node
+      # comment above. `scip-dotnet` (P2.3) is a real NuGet-published
+      # `dotnet tool`, confirmed by installing and running it for real in the
+      # session that added this step (see the 8-language plan's P2.3) — no
+      # bespoke Maven-style bootstrap needed the way `scip-java` above is.
+      - name: Install scip-dotnet
+        run: |
+          set -euo pipefail
+          dotnet tool install --global scip-dotnet
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # PHP + Composer are preinstalled on the `ubuntu-latest` runner image.
+      # `scip-php` (P2.5) is a real Packagist package (`davidrjenni/scip-php`)
+      # confirmed by actually installing and running it for real in the
+      # session that added this step (see the 8-language plan's P2.5).
+      # Installed as a Composer *global* dependency (distinct from a
+      # project-local `vendor/bin/scip-php`, which `php_resolve_binary` tries
+      # first) so it's on `PATH` for whichever fixture the ignored tests
+      # point at.
+      - name: Install scip-php
+        run: |
+          set -euo pipefail
+          composer global require davidrjenni/scip-php
+          echo "$(composer global config bin-dir --absolute)" >> "$GITHUB_PATH"
+
+      # scip-clang (P3.1) is deliberately NOT installed here. This session's
+      # own sandbox could not obtain a real `scip-clang` binary at all —
+      # prebuilt binaries are published as GitHub Release assets, and this
+      # environment's egress policy returns a hard 403 for both
+      # `api.github.com` and `github.com/*/releases/*` (confirmed via the
+      # proxy's own status endpoint, a real policy denial, not a transient
+      # failure); building from source needs Bazel, not available here
+      # either. `provider::CLANG` (`crates/calm-core/src/scip/provider.rs`)
+      # is therefore scaffolding validated by unit tests only — there is no
+      # `#[ignore]`d live-binary integration test for this provider the way
+      # every other one above has, so installing a binary here wouldn't add
+      # any real coverage yet regardless. A genuine GitHub Actions runner has
+      # unrestricted internet access and could plausibly `curl` a release
+      # asset from https://github.com/sourcegraph/scip-clang/releases
+      # directly, but writing that step blind — never having verified the
+      # download URL, that the binary actually runs, or that a real
+      # `compile_commands.json` fixture resolves through it — would be
+      # untested CI surface pretending to be tested. Add this step for real,
+      # alongside the matching `#[ignore]`d test, once a future session can
+      # verify the whole path end to end the way every step above was
+      # earned.
       - name: Run real-indexer integration tests
         run: cargo test --workspace -- --ignored

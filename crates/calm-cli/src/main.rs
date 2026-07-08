@@ -100,8 +100,9 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
-        /// Which provider to refresh: rust, go, python, javascript, java, or
-        /// "all" (default) for every provider in the table.
+        /// Which provider to refresh: rust, go, python, javascript, java,
+        /// csharp, php, c, or "all" (default) for every provider in the
+        /// table.
         #[arg(long)]
         lang: Option<String>,
     },
@@ -329,6 +330,60 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::warn!("SCIP overlay (java) error (base graph intact): {e}")
+                    }
+                }
+
+                let csharp_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.csharp)
+                    .unwrap_or_default();
+                match calm_core::scip::run_csharp_overlay_and_log(&conn, &root, &csharp_cfg) {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
+                        println!(
+                            "SCIP overlay (csharp): {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("SCIP overlay (csharp) error (base graph intact): {e}")
+                    }
+                }
+
+                let php_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.php)
+                    .unwrap_or_default();
+                match calm_core::scip::run_php_overlay_and_log(&conn, &root, &php_cfg) {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
+                        println!(
+                            "SCIP overlay (php): {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("SCIP overlay (php) error (base graph intact): {e}")
+                    }
+                }
+
+                let clang_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.clang)
+                    .unwrap_or_default();
+                match calm_core::scip::run_clang_overlay_and_log(&conn, &root, &clang_cfg) {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
+                        println!(
+                            "SCIP overlay (c): {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("SCIP overlay (c) error (base graph intact): {e}")
                     }
                 }
             }

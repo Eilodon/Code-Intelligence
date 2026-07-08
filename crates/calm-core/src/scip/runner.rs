@@ -421,6 +421,330 @@ pub fn java_toolchain_fingerprint(root: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Total wall-clock budget for one `scip-dotnet index` pass. Like
+/// `scip-java`, this drives a real build (`dotnet restore` + Roslyn
+/// compilation) rather than an incremental analysis, so it gets a
+/// comparably large budget — smaller than Java's only because `dotnet
+/// restore` is typically faster than a Maven/Gradle build resolving from
+/// scratch.
+pub const CSHARP_SCIP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Resolve a usable `scip-dotnet` launcher: an explicit override, then
+/// `PATH`, then `$HOME/.dotnet/tools` (where `dotnet tool install --global
+/// scip-dotnet` lands when that directory isn't already on `PATH` — the
+/// common case for a freshly installed SDK, mirroring `go_resolve_binary`'s
+/// `$HOME/go/bin` fallback for the same reason).
+pub fn csharp_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-dotnet")); // PATH lookup via which-style probe
+    if let Some(home) = dirs_home() {
+        candidates.push(home.join(".dotnet").join("tools").join("scip-dotnet"));
+    }
+    candidates.into_iter().find(|c| binary_runs(c))
+}
+
+/// The `.sln`/`.csproj` file `scip-dotnet index` should be pointed at —
+/// unlike every other provider here, `scip-dotnet`'s `index` subcommand
+/// takes a project/solution *file* as a positional argument, not just a
+/// directory (confirmed via `scip-dotnet index --help`: `<projects>` is
+/// "Path to the .sln (solution) or .csproj/.vbproj file"). Prefers a `.sln`
+/// over a bare `.csproj` when both exist at the top level — a solution
+/// covers every project it references, a single `.csproj` covers only
+/// itself; mirrors the "Markers" column's own `*.sln`/`*.csproj` ordering.
+/// V1 simplification (matches Go's "V1 single-module" cut): only the
+/// project root's own top level is scanned, not recursively — a checkout
+/// with its `.sln` nested in a subdirectory needs `binary` override support
+/// added later, not guessed at here.
+pub fn find_csharp_project(root: &Path) -> Option<PathBuf> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    entries
+        .iter()
+        .find(|p| p.extension().is_some_and(|e| e == "sln"))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|p| p.extension().is_some_and(|e| e == "csproj"))
+        })
+        .cloned()
+}
+
+/// `scip-dotnet index <project> --output <out> --working-directory <root>`.
+/// `--working-directory` (rather than relying on cwd) is what lets
+/// `run_indexer`'s spawn work regardless of the calling process's own
+/// working directory, mirroring `go_build_command`'s use of both an
+/// explicit root flag and `current_dir`. When no `.sln`/`.csproj` is found,
+/// points at a sentinel path inside `root` instead of skipping the run
+/// entirely (this fn can't return `Option`/`Result` — `ScipProvider`'s
+/// `build_command` field is infallible) — `scip-dotnet` fails fast on a
+/// nonexistent project file, which `run_indexer` already treats as a
+/// non-fatal warning, same outcome as every other provider's "nothing to
+/// index here" case.
+pub fn csharp_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let project = find_csharp_project(root).unwrap_or_else(|| root.join("__no_project_found__"));
+    let mut cmd = Command::new(bin);
+    cmd.arg("index")
+        .arg(&project)
+        .arg("--output")
+        .arg(out)
+        .arg("--working-directory")
+        .arg(root)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// `dotnet --version`, trimmed, or `""` if it can't be run. Part of the C#
+/// overlay cache key alongside `binary_version` (the scip-dotnet tool
+/// itself) — a different active SDK can change Roslyn compilation output
+/// even with the same scip-dotnet version.
+pub fn csharp_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("dotnet")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Total wall-clock budget for one `scip-php` pass. It's a pure static AST
+/// walk (`nikic/php-parser`, no compiler/build-tool invocation) — the
+/// lightest indexer of any provider here — but still gets a real budget
+/// rather than Rust's 120s baseline, since a large PHP codebase's file
+/// count (not compilation) is what drives its wall time.
+pub const PHP_SCIP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Resolve a usable `scip-php` launcher: an explicit override, then
+/// `<root>/vendor/bin/scip-php` (a project-local Composer dependency,
+/// matching the plan's own stated preference for a per-project pinned
+/// version — this is also where Composer's own bin-proxy mechanism places
+/// it when `davidrjenni/scip-php` is required as a `require-dev`
+/// dependency), then a global `PATH` lookup. Gated on `root` actually
+/// having a usable Composer autoloader first (`vendor/autoload.php`) —
+/// without one, `scip-php`'s `Indexer` can't resolve PSR-4 namespaces to
+/// real files at all, so probing for the binary at all would be pointless
+/// (matches the plan's own "Không autoload → silent skip" prereq).
+pub fn php_resolve_binary(override_bin: Option<&str>, root: &Path) -> Option<PathBuf> {
+    if override_bin.is_none() && !root.join("vendor").join("autoload.php").is_file() {
+        return None;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(root.join("vendor").join("bin").join("scip-php"));
+    candidates.push(PathBuf::from("scip-php")); // PATH lookup
+    candidates.into_iter().find(|c| php_binary_runs(c))
+}
+
+/// `scip-php`'s own probe, deliberately **not** the shared `binary_runs`
+/// (which drives `<bin> --version`) — confirmed via the real CLI that
+/// `scip-php`'s `getopt('h', ['help', 'memory-limit:'])` silently ignores
+/// an unrecognized `--version` flag rather than erroring on it, so that
+/// probe falls through past the help/exit branch and **runs the real
+/// indexer** against whatever the current directory happens to be
+/// (reproduced: `scip-php --version` run from `/tmp` crashed trying to
+/// read a nonexistent `/tmp/composer.json` — proof it had already started
+/// indexing). `--help` is the one flag the CLI does handle safely.
+fn php_binary_runs(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Stand-in for `binary_version` (unusable here for the same `--version`
+/// safety reason `php_binary_runs` documents): hashes the resolved
+/// launcher file's own bytes. V1 limitation, stated plainly: when `bin` is
+/// the thin `vendor/bin/scip-php` proxy Composer generates, this only
+/// reliably changes when Composer regenerates that proxy (e.g. a version
+/// bump via `composer update`), not on every conceivable upstream change —
+/// there's no `--version` output to do better with.
+pub fn php_binary_version(bin: &Path) -> String {
+    std::fs::read(bin)
+        .ok()
+        .map(|bytes| crate::indexer::pipeline::hash_content(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default()
+}
+
+/// `scip-php` has no `--output` flag at all (confirmed via `--help` and its
+/// own source — `bin/scip-php` hardcodes `file_put_contents('index.scip',
+/// ...)` relative to `getcwd()`), unlike every other provider here. Run
+/// through a shell wrapper that `cd`s to `root` (so `getcwd()` inside the
+/// PHP process becomes the project root scip-php's `Metadata.project_root`
+/// needs), runs the indexer, then moves its fixed `index.scip` output to
+/// the caller-chosen `out` path — the only way to satisfy
+/// `ScipProvider::build_command`'s "produces output at `out`" contract
+/// against a tool that can't be told where to write. Paths are
+/// single-quote-shell-escaped (`shell_quote`) since they're interpolated
+/// into a `sh -c` string rather than passed as separate argv entries.
+pub fn php_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let script = format!("{} && mv index.scip {}", shell_quote(bin), shell_quote(out));
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(script)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// POSIX single-quote shell escaping: wrap in `'...'`, and turn any
+/// embedded `'` into `'\''` (close quote, escaped literal quote, reopen
+/// quote) — the standard technique, since single quotes admit no escape
+/// sequences of their own.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// `php --version`'s first line, trimmed, or `""` if it can't be run. Part
+/// of the PHP overlay cache key alongside `php_binary_version` — a
+/// different active PHP runtime can change parser behavior (new syntax
+/// support) even with the same scip-php version.
+pub fn php_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("php")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// The 8th entry's timeout (P3.1) — same 600s budget as Java's, the other
+/// provider `ScipConfig::policy`'s own doc comment names as a "heavy future
+/// provider": `scip-clang` compiles and indexes one translation unit at a
+/// time across a whole `compile_commands.json`, comparable in cost to a
+/// real build rather than a lightweight AST walk.
+pub const CLANG_SCIP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Resolve a usable `scip-clang` binary — **unverified live** (see
+/// `provider::CLANG`'s doc comment for why): this sandbox has no way to
+/// obtain a real `scip-clang` binary at all (GitHub Releases, where
+/// prebuilt binaries are published, returns a hard 403 from this
+/// environment's egress policy; building from source needs Bazel, not
+/// available either). Written to the same shape as every other
+/// `PATH`-lookup provider (`GO`/`CSHARP`) and reusing the shared
+/// `binary_runs` (`<bin> --version`) probe on the (unverified) assumption
+/// `scip-clang` handles `--version` safely the conventional way — unlike
+/// `scip-php`, which this session proved does *not* (see
+/// `php_binary_runs`). Gated on two preconditions before even probing for
+/// the binary, both silent no-ops per the plan's own DoD: the host
+/// platform (`clang_platform_supported`) and a discoverable
+/// `compile_commands.json` (`find_compile_commands`) — `scip-clang` is
+/// unusable without either, so there is no reason to shell out at all when
+/// either is missing.
+pub fn clang_resolve_binary(override_bin: Option<&str>, root: &Path) -> Option<PathBuf> {
+    if !clang_platform_supported() || find_compile_commands(root).is_none() {
+        return None;
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-clang")); // PATH lookup
+    candidates.into_iter().find(|c| binary_runs(c))
+}
+
+/// Per the plan's own P3.1 row: `scip-clang` (built on `clangd`'s
+/// cross-translation-unit indexing) only ships prebuilt binaries for Linux
+/// x86_64 and macOS arm64 — no Windows-native build. Checked before any
+/// binary probe so an unsupported host gets a silent, immediate skip
+/// (matching every other provider's "missing prerequisite" behavior)
+/// instead of a doomed `PATH` lookup.
+fn clang_platform_supported() -> bool {
+    matches!(
+        (std::env::consts::OS, std::env::consts::ARCH),
+        ("linux", "x86_64") | ("macos", "aarch64")
+    )
+}
+
+/// `<root>/compile_commands.json` first (the conventional location a build
+/// system that honors `CMAKE_EXPORT_COMPILE_COMMANDS=ON` — or a manually
+/// generated one via `bear` for Make-based projects — writes to), else
+/// `<root>/build/compile_commands.json` (CMake's own common out-of-tree
+/// build-directory convention). Neither is generated by this codebase —
+/// per the plan, `calm` never invokes CMake/`bear` itself, only detects an
+/// already-generated compilation database.
+pub fn find_compile_commands(root: &Path) -> Option<PathBuf> {
+    [
+        root.join("compile_commands.json"),
+        root.join("build").join("compile_commands.json"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// `scip-clang --compdb-path {compdb} --index-output-path {out} -j {n}`
+/// (flag names per `scip-clang`'s published CLI usage text — **not**
+/// confirmed against a real binary in this sandbox, same caveat as
+/// `clang_resolve_binary`'s doc comment). `-j` is capped at 8 rather than
+/// left unbounded or tied to `available_parallelism()` uncapped: an
+/// indexer running inside `calm`'s own background watcher shouldn't be
+/// free to claim every core on a large CI/dev box the way a foreground
+/// `ninja -j$(nproc)` build reasonably would.
+pub fn clang_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let compdb =
+        find_compile_commands(root).unwrap_or_else(|| root.join("__no_compile_commands_found__"));
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(1);
+    let mut cmd = Command::new(bin);
+    cmd.arg("--compdb-path")
+        .arg(&compdb)
+        .arg("--index-output-path")
+        .arg(out)
+        .arg("-j")
+        .arg(jobs.to_string())
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// `clang --version`'s first line, trimmed, or `""` if it can't be run —
+/// same role as `active_toolchain_fingerprint`/`php_toolchain_fingerprint`:
+/// a different active Clang/LLVM toolchain can change indexing output even
+/// with the same `scip-clang` version and an unchanged
+/// `compile_commands.json`.
+pub fn clang_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("clang")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 fn binary_runs(path: &Path) -> bool {
     Command::new(path)
         .arg("--version")
@@ -571,5 +895,192 @@ mod tests {
         assert!(!binary_runs(Path::new(
             "definitely-not-a-real-scip-java-binary-xyz"
         )));
+    }
+
+    /// Same invariant, for the C# provider added in P2.3.
+    #[test]
+    fn csharp_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!binary_runs(Path::new(
+            "definitely-not-a-real-scip-dotnet-binary-xyz"
+        )));
+    }
+
+    #[test]
+    fn find_csharp_project_prefers_sln_over_csproj() {
+        let dir = std::env::temp_dir().join(format!("ci_find_csproj_sln_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("App.csproj"), "").unwrap();
+        std::fs::write(dir.join("App.sln"), "").unwrap();
+        let found = find_csharp_project(&dir).unwrap();
+        assert_eq!(found.extension().unwrap(), "sln");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_csharp_project_falls_back_to_csproj_when_no_sln() {
+        let dir = std::env::temp_dir().join(format!("ci_find_csproj_only_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("App.csproj"), "").unwrap();
+        let found = find_csharp_project(&dir).unwrap();
+        assert_eq!(found.extension().unwrap(), "csproj");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_csharp_project_returns_none_when_neither_exists() {
+        let dir = std::env::temp_dir().join(format!("ci_find_csproj_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(find_csharp_project(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same invariant as the other providers' equivalents, but pinned at
+    /// `php_binary_runs` (not the shared `binary_runs`) since PHP uses its
+    /// own probe — see `php_binary_runs`'s doc comment for why.
+    #[test]
+    fn php_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!php_binary_runs(Path::new(
+            "definitely-not-a-real-scip-php-binary-xyz"
+        )));
+    }
+
+    /// The real bug this session found: `scip-php --version` is NOT a safe
+    /// probe (silently falls through to a real indexing run instead of
+    /// erroring/printing a version) — pinned here as a regression test
+    /// against ever "simplifying" `php_resolve_binary`/`php_binary_version`
+    /// back to the shared `binary_runs`/`binary_version` helpers.
+    #[test]
+    fn php_binary_runs_uses_help_not_version() {
+        // A minimal script that succeeds on --help but fails (nonzero exit)
+        // on anything else, including --version — mirrors scip-php's real
+        // shape closely enough to prove `php_binary_runs` passes the right
+        // flag, without needing a real PHP interpreter in this unit test.
+        let dir = std::env::temp_dir().join(format!("ci_php_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-scip-php");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; else exit 1; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        assert!(
+            php_binary_runs(&script),
+            "must probe with --help, which this fake binary accepts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        let p = Path::new("/tmp/it's a path/index.scip");
+        let quoted = shell_quote(p);
+        assert_eq!(quoted, r"'/tmp/it'\''s a path/index.scip'");
+    }
+
+    #[test]
+    fn php_resolve_binary_returns_none_without_autoload_even_if_bin_exists() {
+        let dir = std::env::temp_dir().join(format!("ci_php_no_autoload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vendor").join("bin")).unwrap();
+        std::fs::write(
+            dir.join("vendor").join("bin").join("scip-php"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        // No vendor/autoload.php written — the gate must reject this
+        // regardless of the binary being present and runnable.
+        assert!(php_resolve_binary(None, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same invariant as the other providers' equivalents (P3.1) — pinned
+    /// even though the real `scip-clang --version` behavior is unverified
+    /// in this sandbox (see `clang_resolve_binary`'s doc comment): the
+    /// shared `binary_runs` probe must still reject an obviously
+    /// nonexistent path regardless.
+    #[test]
+    fn clang_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!binary_runs(Path::new(
+            "definitely-not-a-real-scip-clang-binary-xyz"
+        )));
+    }
+
+    #[test]
+    fn find_compile_commands_prefers_root_over_build_subdir() {
+        let dir = std::env::temp_dir().join(format!("ci_compdb_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        std::fs::write(dir.join("build").join("compile_commands.json"), "[]").unwrap();
+        let found = find_compile_commands(&dir).unwrap();
+        assert_eq!(found, dir.join("compile_commands.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_compile_commands_falls_back_to_build_subdir() {
+        let dir = std::env::temp_dir().join(format!("ci_compdb_build_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build").join("compile_commands.json"), "[]").unwrap();
+        let found = find_compile_commands(&dir).unwrap();
+        assert_eq!(found, dir.join("build").join("compile_commands.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_compile_commands_returns_none_when_neither_exists() {
+        let dir = std::env::temp_dir().join(format!("ci_compdb_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(find_compile_commands(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clang_resolve_binary` must reject a project with no discoverable
+    /// `compile_commands.json` before ever probing for the binary — same
+    /// "cheap gate before any subprocess" shape `php_resolve_binary` uses
+    /// for `vendor/autoload.php`. Deterministic regardless of platform: an
+    /// absent compdb is a no-op on every OS/arch, so this doesn't need to
+    /// special-case the platform gate.
+    #[test]
+    fn clang_resolve_binary_returns_none_without_compile_commands() {
+        let dir = std::env::temp_dir().join(format!("ci_clang_no_compdb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(clang_resolve_binary(None, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clang_build_command_caps_parallelism_at_eight() {
+        let dir = std::env::temp_dir().join(format!("ci_clang_build_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        let out = dir.join("index.scip");
+        let cmd = clang_build_command(Path::new("scip-clang"), &dir, &out);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let j_pos = args.iter().position(|a| a == "-j").expect("must pass -j");
+        let jobs: usize = args[j_pos + 1].parse().unwrap();
+        assert!(
+            (1..=8).contains(&jobs),
+            "expected 1..=8, got {jobs} (args: {args:?})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

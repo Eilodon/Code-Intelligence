@@ -1,0 +1,50 @@
+name: Publish to MCP Registry
+
+# Manual trigger, not on-push — the npm package this points at
+# (@eilodon/calm-mcp) is published by hand today (npm/README.md documents
+# why: a deliberate human sanity-check before any CI automation touches the
+# real npm registry). The MCP Registry's own validation checks that the
+# npm package at the given version already exists, so this must run *after*
+# that manual `npm publish`, not race it on the same tag push. Once npm
+# publishing itself moves to CI, this can switch to `on: push: tags:` in
+# the same job. Run with: gh workflow run publish-mcp-registry.yml -f
+# version=0.1.4
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version already published to npm as @eilodon/calm-mcp (e.g. 0.1.4)'
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC auth to the registry
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set version in server.json
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          jq --arg v "$VERSION" \
+            '.version = $v | .packages[0].version = $v' \
+            server.json > server.tmp.json
+          mv server.tmp.json server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub OIDC — this repo's identity, no stored secret)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to the MCP Registry
+        run: ./mcp-publisher publish
+
+      - name: Verify
+        run: |
+          sleep 2
+          curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.eilodon/calm-mcp"

@@ -62,6 +62,33 @@ That SCIP-overlay number is worth pausing on, and it's no longer a Rust-only tri
 
 ## Quick start
 
+**Using CALM on your own project** — no clone, no Rust toolchain:
+
+```json
+{
+  "mcpServers": {
+    "calm": {
+      "command": "npx",
+      "args": ["-y", "@eilodon/calm-mcp", "serve"]
+    }
+  }
+}
+```
+
+Drop that into `.mcp.json` (Claude Code/Cursor) or `.vscode/mcp.json` (VS Code uses a top-level `"servers"` key instead of `"mcpServers"`, same shape otherwise) at your project root. Or from a shell:
+
+```bash
+claude mcp add --transport stdio calm -- npx -y @eilodon/calm-mcp serve
+```
+
+**[Add to Cursor →](cursor://anysphere.cursor-deeplink/mcp/install?name=calm&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBlaWxvZG9uL2NhbG0tbWNwIiwic2VydmUiXX0=)** · Claude Code plugin: `/plugin marketplace add Eilodon/CALM` then `/plugin install calm@CALM`.
+
+Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed.
+
+See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese) for Windsurf/JetBrains (global config, can't be checked into a repo) and every install option in detail.
+
+**Developing on CALM itself** (this repo):
+
 ```bash
 # 1. Build the binary
 cargo build --release -p calm-cli
@@ -76,9 +103,7 @@ calm index --project-root .
 calm serve --project-root .
 ```
 
-This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and VS Code (`.vscode/mcp.json`) — all three point at `scripts/mcp-launcher.sh`, a shared launcher that finds an already-built binary, downloads a checksum-verified prebuilt release if you're on a matching git tag, or builds from source if nothing is available yet. Clone the repo and it just works — no manual build step required first. See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese) for Windsurf/JetBrains (global config, can't be checked into a repo) and how the launcher decides what to do.
-
-Don't want to clone this repo? See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — install via `curl | sh` (`scripts/install.sh`) or `npx @eilodon/calm-mcp`, then run `calm setup` from inside your own project to write MCP config pointing at the binary you just installed.
+This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and VS Code (`.vscode/mcp.json`) — all three point at `scripts/mcp-launcher.sh`, a shared launcher that finds an already-built binary, downloads a checksum-verified prebuilt release if you're on a matching git tag, or builds from source if nothing is available yet. Clone the repo and it just works — no manual build step required first. See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese) for how the launcher decides what to do.
 
 > **Note:** `calm serve` automatically adds `.calm/` to `.gitignore` on startup so the index database never gets committed.
 

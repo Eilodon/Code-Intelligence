@@ -1,6 +1,7 @@
 {
   "name": "@eilodon/calm-mcp",
   "version": "0.1.3",
+  "mcpName": "io.github.eilodon/calm-mcp",
   "description": "CALM \u2014 Coding Agent Liveness Map MCP server (Rust binary, no toolchain required to run it)",
   "license": "MIT",
   "homepage": "https://github.com/Eilodon/CALM",

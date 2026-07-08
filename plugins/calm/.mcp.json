@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "calm": {
+      "command": "npx",
+      "args": ["-y", "@eilodon/calm-mcp", "serve", "--project-root", "${CLAUDE_PROJECT_DIR}"]
+    }
+  }
+}

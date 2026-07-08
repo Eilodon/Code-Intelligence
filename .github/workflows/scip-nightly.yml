@@ -34,11 +34,57 @@ jobs:
       - name: Install scip-go
         run: go install github.com/scip-code/scip-go/cmd/scip-go@latest
 
-      # Still missing: JDK + Gradle/Maven + scip-java (P2.2), .NET SDK +
-      # scip-dotnet (P2.3), scip-php (P2.5), compile_commands.json + clang +
-      # scip-clang (P3.1). Add each provider's own toolchain/binary install
-      # step here as it lands. `cargo test --workspace -- --ignored` below
-      # picks up their new `#[ignore]`d tests (pointed at
+      # JDK 21 + Maven + Gradle are all preinstalled on the `ubuntu-latest`
+      # runner image (github.com/actions/runner-images) — no `actions/setup-*`
+      # step needed. `scip-java` (P2.2) has no standalone-binary release the
+      # way `scip-go`/rust-analyzer do; its docs recommend `cs bootstrap`
+      # (coursier) or the `sourcegraph/scip-java` Docker image, neither of
+      # which is preinstalled here either. This step instead does what `cs
+      # bootstrap` does under the hood — resolve the `com.sourcegraph:
+      # scip-java_2.13` Maven Central artifact's full runtime classpath via
+      # Maven (already on `PATH`, needs no `coursier` install of its own) and
+      # wrap it in a launcher script — verified for real in the session that
+      # added this step (see the 8-language plan's P2.2). Bump SCIP_JAVA_VERSION
+      # when a newer release is verified the same way.
+      - name: Install scip-java
+        run: |
+          set -euo pipefail
+          SCIP_JAVA_VERSION=0.10.4
+          BOOTSTRAP_DIR="$RUNNER_TEMP/scip-java-bootstrap"
+          mkdir -p "$BOOTSTRAP_DIR"
+          curl -sSfL -o "$BOOTSTRAP_DIR/scip-java.jar" \
+            "https://repo1.maven.org/maven2/com/sourcegraph/scip-java_2.13/${SCIP_JAVA_VERSION}/scip-java_2.13-${SCIP_JAVA_VERSION}.jar"
+          cat > "$BOOTSTRAP_DIR/pom.xml" <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>local</groupId>
+            <artifactId>scip-java-bootstrap</artifactId>
+            <version>1.0</version>
+            <dependencies>
+              <dependency>
+                <groupId>com.sourcegraph</groupId>
+                <artifactId>scip-java_2.13</artifactId>
+                <version>${SCIP_JAVA_VERSION}</version>
+              </dependency>
+            </dependencies>
+          </project>
+          EOF
+          mvn -q -B -f "$BOOTSTRAP_DIR/pom.xml" dependency:build-classpath \
+            -Dmdep.outputFile="$BOOTSTRAP_DIR/cp.txt"
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/scip-java" <<EOF
+          #!/usr/bin/env bash
+          exec java -cp "$BOOTSTRAP_DIR/scip-java.jar:\$(cat "$BOOTSTRAP_DIR/cp.txt")" \
+            com.sourcegraph.scip_java.ScipJava "\$@"
+          EOF
+          chmod +x "$HOME/.local/bin/scip-java"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Still missing: .NET SDK + scip-dotnet (P2.3), scip-php (P2.5),
+      # compile_commands.json + clang + scip-clang (P3.1). Add each
+      # provider's own toolchain/binary install step here as it lands.
+      # `cargo test --workspace -- --ignored` below picks up their new
+      # `#[ignore]`d tests (pointed at
       # `crates/calm-core/tests/fixtures/multi_lang_workspace/`) the moment
       # they exist — no other change needed in this file.
       - name: Run real-indexer integration tests

@@ -22,6 +22,7 @@ pub struct Config {
     pub go: GoConfig,
     pub python: PythonConfig,
     pub js: JsConfig,
+    pub java: JavaConfig,
 }
 
 impl Default for Config {
@@ -60,6 +61,7 @@ impl Default for Config {
             go: GoConfig::default(),
             python: PythonConfig::default(),
             js: JsConfig::default(),
+            java: JavaConfig::default(),
         }
     }
 }
@@ -118,6 +120,35 @@ pub struct PythonConfig {
 #[serde(default)]
 pub struct JsConfig {
     pub scip: ScipConfig,
+}
+
+/// Java's overlay config (P2.2) — same `ScipConfig` shape and distinct-
+/// wrapper-struct reasoning as `GoConfig`/`PythonConfig`/`JsConfig`, but
+/// **not** `#[derive(Default)]` like the other three: `scip-java` drives a
+/// full Maven/Gradle build (see `runner::JAVA_SCIP_TIMEOUT`'s doc comment),
+/// exactly the "heavy future provider (Java/clang)" `ScipConfig::policy`'s
+/// own doc comment predicted would need something other than the `OnSave`
+/// every other provider defaults to. Default `MinInterval(900)` (15
+/// minutes) matches the plan doc's P2.2 row ("Policy: OnDemand/
+/// MinInterval(15m+)") — an automatic caller (watcher reindex, one-shot
+/// `calm index`) only re-runs the full build-tool invocation at most every
+/// 15 minutes; `calm scip run --lang java` / the `scip_refresh` MCP tool
+/// always bypass this (see `run_overlay_for`'s `force` parameter).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct JavaConfig {
+    pub scip: ScipConfig,
+}
+
+impl Default for JavaConfig {
+    fn default() -> Self {
+        Self {
+            scip: ScipConfig {
+                policy: RefreshPolicy::MinInterval(900),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

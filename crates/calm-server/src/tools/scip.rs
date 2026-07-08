@@ -5,7 +5,7 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "scip_refresh",
-        description = "Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript), bypassing the configured refresh policy — e.g. to force a run for an on_demand/min_interval provider without waiting. USE WHEN: you need formal-tier call edges immediately and know a source-of-truth indexer (rust-analyzer/scip-go/scip-python/scip-typescript) is available. Can block for a while (up to a few minutes for a large project) since it may invoke a real external indexer — not for routine use."
+        description = "Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java), bypassing the configured refresh policy — e.g. to force a run for an on_demand/min_interval provider without waiting. USE WHEN: you need formal-tier call edges immediately and know a source-of-truth indexer (rust-analyzer/scip-go/scip-python/scip-typescript/scip-java) is available. Can block for a while (up to a few minutes for a large project, longer for Java's full build-tool invocation) since it may invoke a real external indexer — not for routine use."
     )]
     pub(crate) fn scip_refresh(&self, #[tool(aggr)] p: ScipRefreshParams) -> String {
         self.timed_tool("scip_refresh", || {
@@ -66,8 +66,8 @@ impl CalmServer {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ScipRefreshParams {
-    /// Which provider to refresh: "rust", "go", "python", "javascript", or
-    /// "all" (default) for every provider in the table.
+    /// Which provider to refresh: "rust", "go", "python", "javascript",
+    /// "java", or "all" (default) for every provider in the table.
     #[serde(default)]
     pub(crate) lang: Option<String>,
 }

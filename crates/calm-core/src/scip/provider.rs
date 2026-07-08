@@ -215,3 +215,51 @@ fn js_lockfile_hash(root: &Path) -> String {
     }
     String::new()
 }
+
+/// The 5th entry in the table (Phase 2 / P2.2) — unlike Go/Python/TS,
+/// `scip-java` isn't a standalone binary a package manager installs; it's a
+/// Maven Central artifact (`com.sourcegraph:scip-java_2.13`) meant to be run
+/// via `cs bootstrap ... -o scip-java` (creating a launcher script on
+/// `PATH`) or the `sourcegraph/scip-java` Docker image — confirmed by
+/// actually running it that way (Maven-resolved classpath, no `coursier`
+/// binary needed: `mvn dependency:build-classpath` against a throwaway pom
+/// pulls the exact same jars `cs launch` would, since both just resolve
+/// Maven Central). `java_resolve_binary` therefore only ever looks for a
+/// `scip-java` launcher already on `PATH` — same shape as `GO`'s
+/// `go_resolve_binary`, deliberately simpler than Python/TS's `npx` fallback
+/// (there's no equivalently ubiquitous "run this artifact on demand" tool
+/// bundled with a JDK the way `npx` ships with `npm`).
+pub const JAVA: ScipProvider = ScipProvider {
+    lang: "java",
+    dirty_langs: &["java"],
+    resolve_binary: super::runner::java_resolve_binary,
+    build_command: super::runner::java_build_command,
+    timeout: super::runner::JAVA_SCIP_TIMEOUT,
+    cache_key: java_cache_key,
+    cache_file_name: "scip-java.cache",
+};
+
+fn java_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::binary_version(bin),
+        &super::runner::java_toolchain_fingerprint(root),
+        "", // no reliable Java lockfile equivalent (V1 simplification, see java_build_file_hash)
+        &java_build_file_hash(root),
+        dirty,
+    )
+}
+
+/// First build descriptor that actually exists wins — Maven (`pom.xml`) and
+/// Gradle (`build.gradle[.kts]`) are mutually exclusive build systems in
+/// practice, mirroring `js_lockfile_hash`'s same reasoning. V1
+/// simplification: a multi-module Maven/Gradle aggregator's child-module
+/// build files aren't hashed individually (matches Python's V1 cut of only
+/// hashing `requirements.txt`, not every possible dependency-pinning file).
+fn java_build_file_hash(root: &Path) -> String {
+    for name in ["pom.xml", "build.gradle.kts", "build.gradle"] {
+        if let Ok(s) = std::fs::read_to_string(root.join(name)) {
+            return crate::indexer::pipeline::hash_content(&s);
+        }
+    }
+    String::new()
+}

@@ -359,6 +359,68 @@ pub fn js_toolchain_fingerprint(root: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Total wall-clock budget for one `scip-java index` pass. `scip-java` drives
+/// a real Maven/Gradle build (compiling the whole project through a
+/// semanticdb compiler plugin) rather than an incremental analysis the way
+/// rust-analyzer/scip-go/scip-typescript do, so this gets by far the largest
+/// budget of any provider — matches the plan doc's own risk note that a
+/// full-build indexer like this must never run on the hot edit-save path
+/// (see `JavaConfig`'s default `MinInterval` policy, not `OnSave`).
+pub const JAVA_SCIP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Resolve a usable `scip-java` launcher: an explicit override, then `PATH`.
+/// `scip-java` has no standalone-binary release the way `scip-go`/rust-
+/// analyzer do — real installs are `cs bootstrap com.sourcegraph:scip-java_2.13:<version>
+/// -o scip-java` (coursier) or the `sourcegraph/scip-java` Docker image
+/// wrapped in a shim script, both of which land a `scip-java` launcher on
+/// `PATH` either way, so a single `PATH` probe covers both documented
+/// install paths without this needing to know which one produced it.
+pub fn java_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-java")); // PATH lookup via which-style probe
+    candidates.into_iter().find(|c| binary_runs(c))
+}
+
+/// `scip-java index --output <out>`, run with `root` as the working
+/// directory — confirmed via the real tool that `index` has no `--cwd`/
+/// `--module-root` flag at all (unlike `scip-go`/`scip-typescript`); it
+/// always indexes "the current working directory" (its own `--help` text),
+/// so `current_dir(root)` is the only way to scope it, mirroring
+/// `go_build_command`'s same use of `current_dir` as a belt-and-braces
+/// measure alongside its own `--module-root` flag.
+pub fn java_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("index")
+        .arg("--output")
+        .arg(out)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// `java -version`'s output, trimmed, or `""` if it can't be run. Part of the
+/// Java overlay cache key alongside `binary_version` (the scip-java launcher
+/// itself) — a different active JDK can change semanticdb compiler-plugin
+/// output even with the same scip-java version. Unlike `go version`/`node
+/// --version`, `java -version` writes to **stderr**, not stdout — confirmed
+/// empirically (`java -version > out 2> err` puts the version text in
+/// `err`); every other `*_toolchain_fingerprint` in this file reads stdout,
+/// so this one deliberately doesn't share their pattern.
+pub fn java_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("java")
+        .arg("-version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn binary_runs(path: &Path) -> bool {
     Command::new(path)
         .arg("--version")
@@ -498,6 +560,16 @@ mod tests {
     fn js_binary_runs_rejects_a_nonexistent_path() {
         assert!(!binary_runs(Path::new(
             "definitely-not-a-real-scip-typescript-binary-xyz"
+        )));
+    }
+
+    /// Same invariant as `go_binary_runs_rejects_a_nonexistent_path`/
+    /// `js_binary_runs_rejects_a_nonexistent_path`, pinned at the underlying
+    /// probe for the same reason.
+    #[test]
+    fn java_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!binary_runs(Path::new(
+            "definitely-not-a-real-scip-java-binary-xyz"
         )));
     }
 }

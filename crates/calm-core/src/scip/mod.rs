@@ -347,6 +347,22 @@ pub fn run_js_overlay_and_log(
     run_and_refresh(&provider::TYPESCRIPT, conn, root, &cfg.scip, false)
 }
 
+/// Run the Java overlay (`provider::JAVA`) — same shape as
+/// `run_go_overlay_and_log`/`run_python_overlay_and_log`/
+/// `run_js_overlay_and_log`. Java, like Python/TypeScript, already has a
+/// pre-existing stack-graphs formal tier (`resolver::formal::load_java`,
+/// wired into both `run_indexing_pipeline` and `reindex_changed`) — the two
+/// coexist via the same `formal_source` provenance P0.3 already built
+/// (`ingest_occurrences` may override a `'stack_graphs'` row but never its
+/// own prior `'scip'` verdict), no special handling needed here for that.
+pub fn run_java_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::JavaConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    run_and_refresh(&provider::JAVA, conn, root, &cfg.scip, false)
+}
+
 /// Manually refresh one or every SCIP provider right now, bypassing
 /// `cfg.policy`'s automatic-run gate (`force: true` — see
 /// `run_overlay_for`) — the shared entry point behind `calm scip run` and
@@ -364,7 +380,7 @@ pub fn refresh_language(
     config: &crate::config::Config,
     lang: Option<&str>,
 ) -> anyhow::Result<Vec<(String, ingest::IngestStats)>> {
-    let all = ["rust", "go", "python", "javascript"];
+    let all = ["rust", "go", "python", "javascript", "java"];
     let want: &[&str] = match lang {
         None | Some("all") => &all,
         Some(l) if all.contains(&l) => std::slice::from_ref(
@@ -373,7 +389,7 @@ pub fn refresh_language(
                 .expect("just checked contains"),
         ),
         Some(other) => anyhow::bail!(
-            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, all"
+            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, all"
         ),
     };
     let mut out = Vec::with_capacity(want.len());
@@ -385,6 +401,7 @@ pub fn refresh_language(
             "javascript" => {
                 run_and_refresh(&provider::TYPESCRIPT, conn, root, &config.js.scip, true)?
             }
+            "java" => run_and_refresh(&provider::JAVA, conn, root, &config.java.scip, true)?,
             _ => unreachable!("want is filtered to `all` above"),
         };
         out.push((lang.to_string(), stats));
@@ -580,6 +597,29 @@ mod tests {
         );
     }
 
+    /// Same guarantee as the Go/Python/JS equivalents, for the Java provider
+    /// added in P2.2 — `run_java_overlay_and_log` must short-circuit on
+    /// `enabled: Some(false)` before ever probing for `scip-java`
+    /// (deterministic regardless of whether this sandbox has one bootstrapped
+    /// on `PATH`).
+    #[test]
+    fn java_explicit_off_is_a_noop_even_when_scip_java_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let java = crate::config::JavaConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        assert_eq!(
+            run_java_overlay_and_log(&conn, Path::new("."), &java).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
     /// A project with zero indexed files of a provider's language(s) must
     /// short-circuit to a no-op *before* ever probing for a binary — even
     /// with `enabled: Some(true)`, which would otherwise log a "not found"
@@ -624,7 +664,7 @@ mod tests {
     }
 
     /// `None`/`Some("all")` runs every provider in the table, in the same
-    /// fixed order, one result per provider — all 4 configs are disabled so
+    /// fixed order, one result per provider — all 5 configs are disabled so
     /// this is deterministic regardless of what's installed on this machine.
     #[test]
     fn refresh_language_all_covers_every_provider_in_order() {
@@ -640,11 +680,12 @@ mod tests {
         config.rust.scip = off.clone();
         config.go.scip = off.clone();
         config.python.scip = off.clone();
-        config.js.scip = off;
+        config.js.scip = off.clone();
+        config.java.scip = off;
 
         let results = refresh_language(&conn, Path::new("."), &config, None).unwrap();
         let langs: Vec<&str> = results.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(langs, vec!["rust", "go", "python", "javascript"]);
+        assert_eq!(langs, vec!["rust", "go", "python", "javascript", "java"]);
         assert!(
             results
                 .iter()
@@ -653,7 +694,7 @@ mod tests {
 
         let results_explicit_all =
             refresh_language(&conn, Path::new("."), &config, Some("all")).unwrap();
-        assert_eq!(results_explicit_all.len(), 4);
+        assert_eq!(results_explicit_all.len(), 5);
     }
 
     /// A specific `lang` runs only that one provider.
@@ -890,6 +931,51 @@ mod tests {
                 "SELECT edge_confidence FROM call_edges \
                  WHERE from_symbol = 'main.js::run' \
                    AND to_symbol = 'helper.js::greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-java` against `multi_lang_workspace/java`
+    /// (P2.2). Ignored by default — requires a `scip-java` launcher on
+    /// `PATH` (e.g. `cs bootstrap com.sourcegraph:scip-java_2.13:<version>
+    /// -o scip-java`, or an equivalent wrapper resolving the same Maven
+    /// Central artifact — see the 8-language plan's P2.2 for how this was
+    /// verified without `coursier`/Docker in the session that wrote this
+    /// test) plus a JDK and Maven/Gradle reachable on `PATH` — `scip-java`
+    /// drives a real build.
+    #[test]
+    #[ignore]
+    fn java_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/java");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let java = crate::config::JavaConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        let stats = run_java_overlay_and_log(&conn, &fixture, &java).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'src/main/java/com/example/Main.java::Main::main' \
+                   AND to_symbol = 'src/main/java/com/example/Helper.java::Helper::greet'",
                 [],
                 |r| r.get(0),
             )

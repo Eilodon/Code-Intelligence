@@ -20,6 +20,7 @@ pub struct Config {
     pub cochange: CoChangeConfig,
     pub rust: RustConfig,
     pub go: GoConfig,
+    pub python: PythonConfig,
 }
 
 impl Default for Config {
@@ -56,6 +57,7 @@ impl Default for Config {
             cochange: CoChangeConfig::default(),
             rust: RustConfig::default(),
             go: GoConfig::default(),
+            python: PythonConfig::default(),
         }
     }
 }
@@ -94,6 +96,14 @@ pub struct RustConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GoConfig {
+    pub scip: ScipConfig,
+}
+
+/// Python's overlay config (P2.4) — same `ScipConfig` shape and same
+/// distinct-wrapper-struct reasoning as `GoConfig`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PythonConfig {
     pub scip: ScipConfig,
 }
 

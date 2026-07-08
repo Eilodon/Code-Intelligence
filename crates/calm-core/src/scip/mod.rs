@@ -199,6 +199,31 @@ pub fn run_go_overlay_and_log(
     Ok(stats)
 }
 
+/// Run the Python overlay (`provider::PYTHON`) — the Python-specific
+/// counterpart to `run_go_overlay_and_log`, same shape. Coexists with
+/// Python's existing stack-graphs formal tier (`resolver::formal`) via the
+/// `formal_source` provenance P0.3 already built — no special handling
+/// needed here for that.
+pub fn run_python_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::PythonConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    let dirty = source_dirty_keys(conn, &["python"]);
+    let stats = run_overlay_for(
+        &provider::PYTHON,
+        conn,
+        root,
+        Path::new(""),
+        &cfg.scip,
+        &dirty,
+    )?;
+    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
+        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+    Ok(stats)
+}
+
 /// Cheap, non-invoking snapshot of the overlay's readiness — never spawns an
 /// external indexer, just checks binary presence and compares the cache key
 /// that `run_overlay_for` would compute against what's already on disk.
@@ -329,6 +354,27 @@ mod tests {
         };
         assert_eq!(
             run_go_overlay_and_log(&conn, Path::new("."), &go).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
+    /// Same guarantee as the Go/Rust equivalents, for the Python provider
+    /// added in P2.4 — `run_python_overlay_and_log` must short-circuit on
+    /// `enabled: Some(false)` before ever probing for `scip-python`
+    /// (deterministic regardless of whether this sandbox can reach npm).
+    #[test]
+    fn python_explicit_off_is_a_noop_even_when_scip_python_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let python = crate::config::PythonConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        assert_eq!(
+            run_python_overlay_and_log(&conn, Path::new("."), &python).unwrap(),
             ingest::IngestStats::default()
         );
     }

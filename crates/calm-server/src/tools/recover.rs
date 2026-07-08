@@ -96,7 +96,7 @@ impl CalmServer {
 
     /// One `OverlayStatus` per SCIP provider (P2.6) — `scip_overlay` above
     /// stays Rust-only for backward compat with existing callers; this is
-    /// the superset covering Go/Python/JS-TS too. Skips a provider entirely
+    /// the superset covering Go/Python/JS-TS/Java/C#/PHP/C-C++ too. Skips a provider entirely
     /// when `cfg.enabled == Some(false)` (same semantics as
     /// `overlay_status_for` returning `None`) rather than reporting a
     /// misleading `available: false`.
@@ -138,6 +138,38 @@ impl CalmServer {
             &config.js.scip,
         ) {
             out.push(PerLanguageOverlayStatus::new("javascript", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::JAVA,
+            conn,
+            &self.project_root,
+            &config.java.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("java", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::CSHARP,
+            conn,
+            &self.project_root,
+            &config.csharp.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("csharp", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::PHP,
+            conn,
+            &self.project_root,
+            &config.php.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("php", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::CLANG,
+            conn,
+            &self.project_root,
+            &config.clang.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("c", s));
         }
         out
     }
@@ -388,7 +420,7 @@ pub(crate) struct IndexingStatusOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scip_overlay: Option<ScipOverlayStatusOutput>,
     /// Superset of `scip_overlay` covering every SCIP provider (P2.6) —
-    /// `rust`/`go`/`python`/`javascript` — instead of Rust alone. Empty when
+    /// `rust`/`go`/`python`/`javascript`/`java`/`csharp`/`php`/`c` — instead of Rust alone. Empty when
     /// this build lacks the `scip-overlay` feature. A language is omitted
     /// (not present with `available: false`) when its `enabled` config is
     /// explicitly `false` — nothing to report, same as `scip_overlay` being

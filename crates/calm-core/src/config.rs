@@ -22,6 +22,10 @@ pub struct Config {
     pub go: GoConfig,
     pub python: PythonConfig,
     pub js: JsConfig,
+    pub java: JavaConfig,
+    pub csharp: CSharpConfig,
+    pub php: PhpConfig,
+    pub clang: ClangConfig,
 }
 
 impl Default for Config {
@@ -60,6 +64,10 @@ impl Default for Config {
             go: GoConfig::default(),
             python: PythonConfig::default(),
             js: JsConfig::default(),
+            java: JavaConfig::default(),
+            csharp: CSharpConfig::default(),
+            php: PhpConfig::default(),
+            clang: ClangConfig::default(),
         }
     }
 }
@@ -118,6 +126,87 @@ pub struct PythonConfig {
 #[serde(default)]
 pub struct JsConfig {
     pub scip: ScipConfig,
+}
+
+/// Java's overlay config (P2.2) — same `ScipConfig` shape and distinct-
+/// wrapper-struct reasoning as `GoConfig`/`PythonConfig`/`JsConfig`, but
+/// **not** `#[derive(Default)]` like the other three: `scip-java` drives a
+/// full Maven/Gradle build (see `runner::JAVA_SCIP_TIMEOUT`'s doc comment),
+/// exactly the "heavy future provider (Java/clang)" `ScipConfig::policy`'s
+/// own doc comment predicted would need something other than the `OnSave`
+/// every other provider defaults to. Default `MinInterval(900)` (15
+/// minutes) matches the plan doc's P2.2 row ("Policy: OnDemand/
+/// MinInterval(15m+)") — an automatic caller (watcher reindex, one-shot
+/// `calm index`) only re-runs the full build-tool invocation at most every
+/// 15 minutes; `calm scip run --lang java` / the `scip_refresh` MCP tool
+/// always bypass this (see `run_overlay_for`'s `force` parameter).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct JavaConfig {
+    pub scip: ScipConfig,
+}
+
+impl Default for JavaConfig {
+    fn default() -> Self {
+        Self {
+            scip: ScipConfig {
+                policy: RefreshPolicy::MinInterval(900),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// C#'s overlay config (P2.3) — same `ScipConfig` shape and distinct-
+/// wrapper-struct reasoning as `GoConfig`/`PythonConfig`/`JsConfig`.
+/// `#[derive(Default)]` (plain `OnSave`, unlike `JavaConfig`): `scip-dotnet`
+/// runs `dotnet restore` + a Roslyn compile, comparable in cost to
+/// `scip-go`/`scip-typescript` rather than a from-scratch Maven/Gradle
+/// build, so the default on-save cadence used by every provider except
+/// Java is the right fit here too.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CSharpConfig {
+    pub scip: ScipConfig,
+}
+
+/// PHP's overlay config (P2.5) — same `ScipConfig` shape and distinct-
+/// wrapper-struct reasoning as the others. `#[derive(Default)]` (plain
+/// `OnSave`): `scip-php` is a pure static AST walk (no build-tool
+/// invocation, no compilation), the lightest of every provider added so
+/// far — no reason to default it any more conservative than Rust's own
+/// baseline.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PhpConfig {
+    pub scip: ScipConfig,
+}
+
+/// C/C++'s overlay config (P3.1) — same `ScipConfig` shape and distinct-
+/// wrapper-struct reasoning as the others, but **not** `#[derive(Default)]`
+/// like Go/Python/JS/C#/PHP: `scip-clang` compiles real translation units
+/// (see `runner::CLANG_SCIP_TIMEOUT`'s doc comment), the same "heavy future
+/// provider (Java/clang)" case `JavaConfig` already exists for. Default
+/// `MinInterval(900)` matches `JavaConfig`'s own default and the plan's
+/// explicit risk note ("tuyệt đối không nối scip-java/scip-clang vào
+/// on-save"). Deliberately does **not** carry the plan's originally
+/// sketched `compile_commands: Option<String>` override field — see
+/// `provider::CLANG`'s doc comment for why.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClangConfig {
+    pub scip: ScipConfig,
+}
+
+impl Default for ClangConfig {
+    fn default() -> Self {
+        Self {
+            scip: ScipConfig {
+                policy: RefreshPolicy::MinInterval(900),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -215,3 +215,222 @@ fn js_lockfile_hash(root: &Path) -> String {
     }
     String::new()
 }
+
+/// The 5th entry in the table (Phase 2 / P2.2) — unlike Go/Python/TS,
+/// `scip-java` isn't a standalone binary a package manager installs; it's a
+/// Maven Central artifact (`com.sourcegraph:scip-java_2.13`) meant to be run
+/// via `cs bootstrap ... -o scip-java` (creating a launcher script on
+/// `PATH`) or the `sourcegraph/scip-java` Docker image — confirmed by
+/// actually running it that way (Maven-resolved classpath, no `coursier`
+/// binary needed: `mvn dependency:build-classpath` against a throwaway pom
+/// pulls the exact same jars `cs launch` would, since both just resolve
+/// Maven Central). `java_resolve_binary` therefore only ever looks for a
+/// `scip-java` launcher already on `PATH` — same shape as `GO`'s
+/// `go_resolve_binary`, deliberately simpler than Python/TS's `npx` fallback
+/// (there's no equivalently ubiquitous "run this artifact on demand" tool
+/// bundled with a JDK the way `npx` ships with `npm`).
+pub const JAVA: ScipProvider = ScipProvider {
+    lang: "java",
+    dirty_langs: &["java"],
+    resolve_binary: super::runner::java_resolve_binary,
+    build_command: super::runner::java_build_command,
+    timeout: super::runner::JAVA_SCIP_TIMEOUT,
+    cache_key: java_cache_key,
+    cache_file_name: "scip-java.cache",
+};
+
+fn java_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::binary_version(bin),
+        &super::runner::java_toolchain_fingerprint(root),
+        "", // no reliable Java lockfile equivalent (V1 simplification, see java_build_file_hash)
+        &java_build_file_hash(root),
+        dirty,
+    )
+}
+
+/// First build descriptor that actually exists wins — Maven (`pom.xml`) and
+/// Gradle (`build.gradle[.kts]`) are mutually exclusive build systems in
+/// practice, mirroring `js_lockfile_hash`'s same reasoning. V1
+/// simplification: a multi-module Maven/Gradle aggregator's child-module
+/// build files aren't hashed individually (matches Python's V1 cut of only
+/// hashing `requirements.txt`, not every possible dependency-pinning file).
+fn java_build_file_hash(root: &Path) -> String {
+    for name in ["pom.xml", "build.gradle.kts", "build.gradle"] {
+        if let Ok(s) = std::fs::read_to_string(root.join(name)) {
+            return crate::indexer::pipeline::hash_content(&s);
+        }
+    }
+    String::new()
+}
+
+/// The 6th entry in the table (Phase 2 / P2.3) — `scip-dotnet` is a real
+/// `dotnet tool` published on NuGet (`dotnet tool install --global
+/// scip-dotnet`), so unlike `scip-java` it needs no bespoke bootstrap:
+/// NuGet is reachable the same way Maven Central is, and `dotnet tool
+/// install` is the officially documented install path (no `coursier`/Docker
+/// workaround needed here). `csharp_resolve_binary` only ever looks for a
+/// `scip-dotnet` launcher already on `PATH` — same shape as `GO`'s
+/// `go_resolve_binary`.
+pub const CSHARP: ScipProvider = ScipProvider {
+    lang: "csharp",
+    dirty_langs: &["csharp"],
+    resolve_binary: super::runner::csharp_resolve_binary,
+    build_command: super::runner::csharp_build_command,
+    timeout: super::runner::CSHARP_SCIP_TIMEOUT,
+    cache_key: csharp_cache_key,
+    cache_file_name: "scip-dotnet.cache",
+};
+
+fn csharp_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::binary_version(bin),
+        &super::runner::csharp_toolchain_fingerprint(root),
+        "", // no reliable lockfile analog (packages.lock.json is opt-in, not universal — V1 cut)
+        &csharp_project_file_hash(root),
+        dirty,
+    )
+}
+
+/// Hashes whichever project/solution file `csharp_build_command` will
+/// actually index (see `runner::find_csharp_project`) — a `.sln`/`.csproj`
+/// change (new project reference, target framework bump) can change
+/// `scip-dotnet`'s output even with nothing else different, so this has to
+/// be part of the cache key, not just a manifest presence check.
+fn csharp_project_file_hash(root: &Path) -> String {
+    super::runner::find_csharp_project(root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// The 7th entry in the table (Phase 2 / P2.5) — `scip-php` is a Composer
+/// package (`davidrjenni/scip-php`), confirmed by actually installing it
+/// via `composer install` in the session that added this entry — an
+/// earlier session's `go install` attempts were chasing the wrong
+/// ecosystem entirely (the module only exists on Go's proxy because that
+/// proxy mirrors any git tag on request; there's no real Go package
+/// underneath). `php_resolve_binary` prefers `vendor/bin/scip-php` (the
+/// project-local Composer bin, matching the "Prereq" column's own stated
+/// preference for a per-project pinned version) before falling back to a
+/// global `PATH` lookup.
+///
+/// Neither this table's shared `binary_runs`/`binary_version` (both drive
+/// `<bin> --version`) is used for PHP — confirmed via the real CLI that
+/// `scip-php`'s `getopt('h', ['help', 'memory-limit:'])` silently ignores
+/// an unrecognized `--version` flag instead of erroring, so that probe
+/// falls through and actually **runs the full indexer** against whatever
+/// the current directory happens to be (reproduced: `scip-php --version`
+/// in `/tmp` crashed trying to read `/tmp/composer.json`, proving it had
+/// already started indexing, not printing a version). `php_resolve_binary`/
+/// `php_binary_version` use `--help` instead, which the CLI does handle
+/// safely.
+pub const PHP: ScipProvider = ScipProvider {
+    lang: "php",
+    dirty_langs: &["php"],
+    resolve_binary: super::runner::php_resolve_binary,
+    build_command: super::runner::php_build_command,
+    timeout: super::runner::PHP_SCIP_TIMEOUT,
+    cache_key: php_cache_key,
+    cache_file_name: "scip-php.cache",
+};
+
+fn php_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::php_binary_version(bin),
+        &super::runner::php_toolchain_fingerprint(root),
+        &php_composer_lock_hash(root),
+        &php_composer_json_hash(root),
+        dirty,
+    )
+}
+
+fn php_composer_lock_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("composer.lock"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+fn php_composer_json_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("composer.json"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// The 8th entry in the table (Phase 3 / P3.1) — **scaffolding only, no
+/// live verification**, unlike every other provider in this table. Two
+/// independent blockers made `scip-clang` unobtainable in this sandbox:
+/// prebuilt binaries are published as GitHub Release assets, and this
+/// environment's egress policy returns a hard 403 for both
+/// `api.github.com` and `github.com/*/releases/*` (confirmed via the
+/// proxy's own status endpoint — a real policy denial, not a transient
+/// network failure); building from source requires Bazel, and only
+/// `bazel-bootstrap` is apt-installable here, which itself requires
+/// building Bazel from source first. Neither path is realistic inside one
+/// session, so this entry follows the plan's own P3.1 spec exactly
+/// (`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §P3.1)
+/// but has unit tests only — no `#[ignore]`d live-binary integration test
+/// exists for this provider the way `csharp_overlay_upgrades_a_real_edge_*`/
+/// `php_overlay_upgrades_a_real_edge_*` do for C#/PHP.
+///
+/// Deliberate cut from the plan's literal `ClangConfig { scip: ScipConfig,
+/// compile_commands: Option<String> }` shape: `ClangConfig` below carries
+/// only `scip`, not a second `compile_commands` override field. Every
+/// `ScipProvider::build_command`/`resolve_binary` function signature is
+/// generic across all 8 providers and carries no per-provider config
+/// payload beyond `cfg.binary` — wiring a `ClangConfig`-specific override
+/// through that shared, fixed-signature plumbing would mean changing the
+/// `ScipProvider` struct's fn-pointer types (and, with them, all 7 other
+/// providers' functions) for a provider that cannot be exercised end to
+/// end here regardless. `clang_resolve_binary`/`find_compile_commands`
+/// (`runner.rs`) instead auto-detect `compile_commands.json` at `root` or
+/// `root/build/` only, exactly satisfying the plan's own DoD wording
+/// ("auto-detect ... ở root/`build/`; absent → silent no-op") without a
+/// half-wired config field pointing nowhere. A future session adding real
+/// coverage (once a `scip-clang` binary is actually obtainable) is the
+/// right time to decide whether an override is worth the shared-signature
+/// change.
+///
+/// `dirty_langs`/`lang` follow `TYPESCRIPT`'s established precedent for a
+/// provider spanning more than one `file_index.language` value: one
+/// `scip-clang` run covers both `.c` and `.cpp` sources via the same
+/// `compile_commands.json`, so `dirty_langs` lists both and `lang` takes
+/// the first (`"c"`) as the single display/cache-filename string.
+///
+/// Policy default (see `ClangConfig` below): `MinInterval(900)`, same as
+/// `JAVA` — `scip-clang` compiles real translation units, exactly the
+/// "heavy future provider (Java/clang)" case `ScipConfig::policy`'s own
+/// doc comment named up front, and the plan's own risk note is explicit:
+/// "tuyệt đối không nối scip-java/scip-clang vào on-save".
+pub const CLANG: ScipProvider = ScipProvider {
+    lang: "c",
+    dirty_langs: &["c", "cpp"],
+    resolve_binary: super::runner::clang_resolve_binary,
+    build_command: super::runner::clang_build_command,
+    timeout: super::runner::CLANG_SCIP_TIMEOUT,
+    cache_key: clang_cache_key,
+    cache_file_name: "scip-clang.cache",
+};
+
+fn clang_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::binary_version(bin),
+        &super::runner::clang_toolchain_fingerprint(root),
+        "", // no lockfile analog — compile_commands.json below is the real dependency-shape input
+        &clang_compile_commands_hash(root),
+        dirty,
+    )
+}
+
+/// Hashes whichever `compile_commands.json` `clang_build_command` will
+/// actually pass to `--compdb-path` (see `runner::find_compile_commands`)
+/// — a regenerated compilation database (new source file, changed compiler
+/// flags, new include path) can change `scip-clang`'s output even with the
+/// toolchain and `dirty` files otherwise unchanged, so it has to be part
+/// of the cache key, not just a presence check.
+fn clang_compile_commands_hash(root: &Path) -> String {
+    super::runner::find_compile_commands(root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}

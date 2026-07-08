@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-08 (cập nhật lần 2) · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. **`benchmarks/resolution/` (§7) ĐÃ XONG** — baseline thật 8/8 ngôn ngữ đo xong, kèm 1 bug crash thật tìm+sửa (C, xem §7). **Phase 2: P2.1 (Go) ĐÃ XONG** — commit `6603e49`, verify thật với scip-go thật (xem §5's bảng, dòng P2.1). **Phase 3: P3.3 (SQL) ĐÃ XONG** — commit `22965d2`, verify thật bằng CLI thật (xem §6's mục P3.3). Còn lại P2.2-P2.6, P3.1, P3.2 CHƯA thực thi. Xem §3/§4/§5/§6/§7 để biết chi tiết những gì đã làm; đừng làm lại.
+> **Ngày:** 2026-07-08 (cập nhật lần 3) · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. **`benchmarks/resolution/` (§7) ĐÃ XONG** — baseline thật 8/8 ngôn ngữ đo xong, kèm 1 bug crash thật tìm+sửa (C, xem §7). **Phase 2: P2.1 (Go) VÀ P2.4 (Python) ĐÃ XONG** — commit `6603e49`/`9abb9f4`, cả 2 verify thật với binary/npx thật (xem §5's bảng). **Phase 3: P3.3 (SQL) ĐÃ XONG** — commit `22965d2`, verify thật bằng CLI thật (xem §6's mục P3.3). Còn lại P2.2/P2.3/P2.5/P2.6, P3.1, P3.2 CHƯA thực thi. Xem §3/§4/§5/§6/§7 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -176,7 +176,7 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 | P2.1 | go | ✅ **XONG (V1 single-module)** — commit `6603e49`. `provider::GO` (`crates/calm-core/src/scip/provider.rs`) + `go_resolve_binary`/`go_build_command`/`go_toolchain_fingerprint` (`runner.rs`) + `GoConfig` (`config.rs`) + `run_go_overlay_and_log` (`mod.rs`), wired vào đúng 3 call site production (lib.rs/watcher.rs/main.rs) cạnh Rust. **Verify thật bằng scip-go thật** (`go install github.com/scip-code/scip-go/cmd/scip-go@latest` — LƯU Ý module path đã đổi từ `sourcegraph/scip-go`, xem §2) trên fixture 2-package cross-call: `calm index` → 2 edge upgrade `formal`/`formal_source=scip`, match_rate=0.67; lần chạy 2 cache-skip đúng, không re-invoke. **Chưa làm (V2, hoãn có chủ đích):** multi-module `go.work` enumerate (P0.4's `ScipProvider` vẫn chưa có field marker/multi-root — Go V1 chỉ single go.mod ở root, đúng như phần lớn checkout thật). Toàn bộ workspace 658 test xanh (527+2 mới), clippy `-D warnings` sạch, fmt sạch. Đừng làm lại V1. | ~~`scip-go --output {out}` tại module dir~~ → thật: `scip-go index --module-root {root} --output {out} --quiet` | hash(go.mod+go.sum) + `go version` + dirty .go trong module | Go toolchain; policy OnSave/MinInterval ok (nhẹ) | Multi-module (`go.work`) CHƯA xử lý — V2 |
 | P2.2 | java | `pom.xml`/`build.gradle(.kts)`/`settings.gradle` | `scip-java index --output {out}` | build files + lockfiles + JDK version | JDK + build resolve (mạng lần đầu). **Policy: OnDemand/MinInterval(15m+)** — full build, KHÔNG on-save. Docs: khuyến nghị Docker `sourcegraph/scip-java` cho CI | Giữ stack-graphs Java làm fallback. **Bonus: Kotlin/Scala free** — thêm ext mapping khi bật |
 | P2.3 | csharp | `*.sln`/`*.csproj` | `scip-dotnet index` | csproj/sln + packages.lock.json + `dotnet --version` | .NET 8 SDK; policy MinInterval | |
-| P2.4 | python | `pyproject.toml`/`setup.py`/`requirements.txt` | `scip-python index . --output {out}` | lockfile + `python --version` | npm package (cần node) — probe cả binary lẫn `npx` | Nâng Python lên formal THẬT (hiện chỉ stack-graphs archived) |
+| P2.4 | python | ✅ **XONG** — commit `9abb9f4`. `provider::PYTHON` + `python_resolve_binary`/`python_build_command`/`python_binary_version`/`python_toolchain_fingerprint` (`runner.rs`) + `PythonConfig` (`config.rs`) + `run_python_overlay_and_log` (`mod.rs`), wired vào đúng 3 call site production. `resolve_binary` probe CẢ binary lẫn `npx` đúng như cột "Prereq" gốc yêu cầu — `npx --yes @sourcegraph/scip-python` khi không có binary global. **Bug thật phát hiện qua thực nghiệm:** scip-python crash toàn bộ (`TypeError` trong `normalizeNameOrVersion`) nếu thiếu CẢ `--project-name` LẪN `--project-version` và thư mục không phải git repo — `python_build_command` luôn truyền cả 2 (placeholder cố định cho version, giá trị không quan trọng, chỉ cần tồn tại). **Verify thật bằng scip-python thật qua npx** trên fixture cross-module (`main.py` gọi `pkg.helper.helper()`) → 1 edge upgrade `formal`/`formal_source=scip`, match_rate=0.50; lần chạy 2 cache-skip đúng. Cùng tồn tại với stack-graphs formal tier có sẵn của Python qua cơ chế provenance P0.3 (scip override stack_graphs, không cần code mới). Toàn bộ workspace xanh, clippy sạch, fmt sạch. Đừng làm lại. | ~~`scip-python index . --output {out}`~~ → thật: `scip-python index --cwd {root} --project-name {name} --project-version 0.0.0 --output {out} --quiet` | hash(requirements.txt) + hash(pyproject.toml) + `python3 --version` + dirty .py | npm package (cần node) — ✅ probe cả binary lẫn `npx` | Nâng Python lên formal THẬT (hiện chỉ stack-graphs archived) — ĐÃ XONG |
 | P2.5 | php | `composer.json` **và** `vendor/autoload.php` tồn tại | `vendor/bin/scip-php` (ưu tiên) hoặc global | composer.lock + `php -v` | Không autoload → silent skip. Community tool → docs ghi rõ | Nâng ceiling PHP lên Formal (kế hoạch gốc sai ở điểm này) |
 
 **P2.6 — Ops surface (bắt buộc kèm Phase 2):**
@@ -262,7 +262,7 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 ```
 P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ✅ → P0.5 ✅   (P0 XONG TOÀN BỘ)
 P1.1 ✅ ∥ P1.2 ✅ ∥ P1.3 ✅ ∥ P1.4 ✅ ∥ P1.5 ✅ (partial, xem ghi chú)   (PHASE 1 XONG TOÀN BỘ)
-P2.1 ✅ (Go, V1 single-module, commit `6603e49`) ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (P2.2-P2.6 mở)
+P2.1 ✅ (Go, V1 single-module, commit `6603e49`) ∥ P2.2 ∥ P2.3 ∥ P2.4 ✅ (Python, commit `9abb9f4`) ∥ P2.5 → P2.6   (P2.2/P2.3/P2.5/P2.6 mở)
 sau P2: P3.1 ∥ P3.2   (P3.1/P3.2 vẫn mở)
 P3.3 (SQL) ✅ XONG (commit `22965d2`) — độc lập, không chặn P3.1/P3.2
 Benchmark harness: ✅ XONG (2026-07-07) — xem §7, kết quả baseline đầu tiên đã đo thật, 8/8 ngôn ngữ
@@ -271,7 +271,24 @@ P1.5's "using→namespace" nửa còn lại: mở, cần 1 pre-pass kiến trúc
 
 Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người (P0.1-P0.3 đã xong trong 1 phiên); P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
 
-## 10-2. Điểm dừng phiên 2026-07-08 — sau khi P3.3 (SQL) xong (MỚI NHẤT — đọc mục này trước §10)
+## 10-3. Điểm dừng phiên 2026-07-08 — sau khi P2.4 (Python) xong (MỚI NHẤT — đọc mục này trước §10-2)
+
+**Đã làm (P2.4 — Python, toàn bộ):** xem §5's bảng, dòng P2.4 (đã cập nhật ✅ đầy đủ ở đó — không lặp lại ở đây). Commit `9abb9f4`.
+
+**Phát hiện quan trọng nhất (bug thật, không phải suy đoán):** `scip-python` (thử qua `npx @sourcegraph/scip-python@0.6.6`) **crash toàn bộ** với `TypeError: Cannot read properties of undefined (reading 'indexOf')` trong `normalizeNameOrVersion` nếu CẢ `--project-name` LẪN `--project-version` đều thiếu và thư mục target không phải git repo (không có gì để tự suy ra version). Thử riêng từng cờ: chỉ `--project-name` KHÔNG đủ, vẫn crash — phải có CẢ HAI. `python_build_command` luôn truyền cả 2 tường minh (name = basename thư mục root, version = placeholder cố định `"0.0.0"`) để né hoàn toàn lỗi này, bất kể target có phải git repo hay không.
+
+**Kiến trúc đáng chú ý (khác Go):** `resolve_binary` phải hỗ trợ CẢ standalone binary lẫn `npx` proxy (đúng yêu cầu cột "Prereq" gốc) — vì hàm `fn` pointer trong `ScipProvider` không capture closure được, `python_build_command`/`python_binary_version` phải tự kiểm tra `bin.file_name() == "npx"` lúc runtime để quyết định có chèn tên package `@sourcegraph/scip-python` vào args hay không. Xem `runner.rs::is_npx`.
+
+**Verify thật bằng scip-python thật (qua npx, không phải fixture giả):** fixture Python cross-module (`main.py` import+gọi `pkg.helper.helper()`) → `calm index` → 1 edge upgrade `formal`/`formal_source='scip'`, match_rate=0.50; chạy lại → cache-skip đúng, không re-invoke npx (tránh phí thời gian download/check lại mỗi lần).
+
+**Tiếp theo (không đổi so với §10-2, chỉ bỏ P2.4 khỏi danh sách vì đã xong):**
+1. P3.2 (JS/TS, scip-typescript) — Node/npm đã có, `@sourcegraph/scip-typescript@0.4.0` resolve được trên registry nhưng CHƯA thử cài/chạy thật — nên thử trước khi code, như đã làm với Go/Python.
+2. P2.2 (Java) — toolchain có nhưng tải release scip-java bị chặn trong sandbox này; cần tìm đường khác (coursier, Docker image `sourcegraph/scip-java`) trước khi bắt đầu code.
+3. P2.3 (C#) — bỏ qua trong sandbox này (không có .NET SDK); không chặn các nhánh khác.
+4. P2.6 (ops surface) — làm sau khi có ≥2 provider Phase 2 thật (đã có Go+Python) — có thể bắt đầu bất kỳ lúc nào từ đây, không còn lý do hoãn "tránh đoán trước shape" nữa vì đã có 2 case thật để tham chiếu.
+5. P3.1 (scip-clang) — chưa thử; platform gate Linux x86_64 thoả trong sandbox này, chưa thử toolchain (`compile_commands.json`).
+
+## 10-2. Điểm dừng phiên 2026-07-08 — sau khi P3.3 (SQL) xong
 
 **Đã làm (P3.3 — SQL, toàn bộ, không có phần "V1 partial"):**
 - `crates/calm-core/src/indexer/sql.rs` — module mới hoàn chỉnh, xem chi tiết đầy đủ ở §6/P3.3 (đã cập nhật ✅ trong mục đó — đọc ở đó, không lặp lại ở đây).

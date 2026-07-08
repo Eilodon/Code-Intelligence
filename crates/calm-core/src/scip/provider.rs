@@ -15,13 +15,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// One row of the (currently one-row) provider table.
+/// One row of the provider table.
 pub struct ScipProvider {
-    /// `file_index.language` value this provider's edges are attributed to,
-    /// e.g. `"rust"`. Also used to scope `source_dirty_keys` and to label
-    /// log lines so a future second provider's output isn't ambiguous with
-    /// this one's.
+    /// `file_index.language` value this provider's edges are primarily
+    /// attributed to, e.g. `"rust"`. Used to label log lines and to name the
+    /// cache file so a second provider's output isn't ambiguous with this
+    /// one's. NOT used to scope `source_dirty_keys` — see `dirty_langs`,
+    /// which exists precisely because `lang` alone can't represent a
+    /// provider covering more than one `file_index.language` value.
     pub lang: &'static str,
+    /// `file_index.language` values whose dirty (changed-since-last-run)
+    /// files should invalidate this provider's cache key. A single-language
+    /// provider (Rust/Go/Python) sets this to `&[lang]`; `TYPESCRIPT` needs
+    /// both `"javascript"` and `"typescript"` because one `scip-typescript
+    /// index` run covers both extensions in the same project — added
+    /// alongside that provider rather than guessed up front, per P0.4's own
+    /// "widen when a real 2nd case proves the shape" rule.
+    pub dirty_langs: &'static [&'static str],
     /// Locate a usable indexer binary: explicit override first, then this
     /// language's own probe (Rust's is rustup/VS Code aware; a future
     /// simpler provider might just be a `PATH` lookup).
@@ -50,6 +60,7 @@ pub struct ScipProvider {
 /// call sites, zero behavior change per P0.4's own DoD).
 pub const RUST: ScipProvider = ScipProvider {
     lang: "rust",
+    dirty_langs: &["rust"],
     resolve_binary: super::runner::resolve_binary,
     build_command: super::runner::rust_build_command,
     timeout: super::runner::SCIP_TIMEOUT,
@@ -85,6 +96,7 @@ fn cargo_toml_hash(root: &Path) -> String {
 /// instead of being guessed up front.
 pub const GO: ScipProvider = ScipProvider {
     lang: "go",
+    dirty_langs: &["go"],
     resolve_binary: super::runner::go_resolve_binary,
     build_command: super::runner::go_build_command,
     timeout: super::runner::GO_SCIP_TIMEOUT,
@@ -122,6 +134,7 @@ fn go_sum_hash(root: &Path) -> String {
 /// own prior `'scip'` verdict — no new code needed here for that part.
 pub const PYTHON: ScipProvider = ScipProvider {
     lang: "python",
+    dirty_langs: &["python"],
     resolve_binary: super::runner::python_resolve_binary,
     build_command: super::runner::python_build_command,
     timeout: super::runner::PYTHON_SCIP_TIMEOUT,
@@ -153,4 +166,52 @@ fn python_pyproject_hash(root: &Path) -> String {
     std::fs::read_to_string(root.join("pyproject.toml"))
         .map(|s| crate::indexer::pipeline::hash_content(&s))
         .unwrap_or_default()
+}
+
+/// The 4th entry in the table (Phase 3 / P3.2) — one `scip-typescript index`
+/// pass covers both `.js`/`.jsx` and `.ts`/`.tsx` (it infers a `tsconfig.json`
+/// for plain-JS projects via `--infer-tsconfig` when none exists), hence
+/// `dirty_langs` carrying both `file_index.language` values while `lang`
+/// stays a single display string for logs/cache-file naming. Also the exit
+/// ramp from the archived `stack-graphs` JS/TS formal tier (P1.1/pre-existing
+/// TS support): this provider runs after the base pipeline, and `scip`
+/// provenance is allowed to override a prior `stack_graphs` verdict via the
+/// same P0.3 mechanism Python's provider already relies on — no new code
+/// needed here for that part either.
+pub const TYPESCRIPT: ScipProvider = ScipProvider {
+    lang: "javascript",
+    dirty_langs: &["javascript", "typescript"],
+    resolve_binary: super::runner::js_resolve_binary,
+    build_command: super::runner::js_build_command,
+    timeout: super::runner::JS_SCIP_TIMEOUT,
+    cache_key: js_cache_key,
+    cache_file_name: "scip-ts.cache",
+};
+
+fn js_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::js_binary_version(bin),
+        &super::runner::js_toolchain_fingerprint(root),
+        &js_lockfile_hash(root),
+        &js_manifest_hash(root),
+        dirty,
+    )
+}
+
+fn js_manifest_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("package.json"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// First lockfile that actually exists wins (a checkout has at most one) —
+/// npm/yarn/pnpm are mutually exclusive in practice, so there's no need to
+/// hash all three and no ambiguity from checking in this fixed order.
+fn js_lockfile_hash(root: &Path) -> String {
+    for name in ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"] {
+        if let Ok(s) = std::fs::read_to_string(root.join(name)) {
+            return crate::indexer::pipeline::hash_content(&s);
+        }
+    }
+    String::new()
 }

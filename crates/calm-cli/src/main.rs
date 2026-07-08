@@ -233,6 +233,24 @@ async fn main() -> Result<()> {
                         tracing::warn!("SCIP overlay (python) error (base graph intact): {e}")
                     }
                 }
+
+                let js_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.js)
+                    .unwrap_or_default();
+                match calm_core::scip::run_js_overlay_and_log(&conn, &root, &js_cfg) {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
+                        println!(
+                            "SCIP overlay (js): {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("SCIP overlay (js) error (base graph intact): {e}")
+                    }
+                }
             }
         }
         Commands::Doctor { project_root } => {

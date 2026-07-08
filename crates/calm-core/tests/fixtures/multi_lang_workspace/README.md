@@ -19,15 +19,32 @@ language notes:
   `helper.c`, with a minimal `compile_commands.json` (P1.4; P3.1 scip-clang).
 - `cpp/` — `main.cpp` calls `Circle::area()` through a `Shape&` reference —
   a virtual dispatch call site (P1.4; P3.1 scip-clang).
-- `js/` — `main.js` requires `helper.js` and calls `greet` (CommonJS; P1.1
-  stack-graphs JS; P3.2 scip-typescript).
+- `js/` — `main.js` requires `helper.js` and calls `greet` from a wrapping
+  `run()` function (CommonJS; P1.1 stack-graphs JS; P3.2 scip-typescript).
+  `run()` is required, not incidental: a bare top-level `greet("world")`
+  call produces no `symbols`/`call_edges` row at all (top-level statements
+  aren't attributed to an enclosing function) — confirmed empirically by
+  running `calm index` against the original bare-call version before this
+  wrapper was added, which yielded 1 symbol and 0 call edges.
+- `python/` — `main.py` does `from pkg.helper import helper` and calls it
+  from a wrapping `run()` function, mirroring `go/`'s and `js/`'s
+  cross-file-call shape (P2.4 scip-python). Added alongside P3.2 to close a
+  gap: P2.4 shipped without any fixture committed here, only an ad-hoc
+  uncommitted one used for its manual verification.
 - `php/` — `index.php` does `require_once` then `$helper->greet(...)` on a
   PSR-4-autoloadable class (P1.2 PHP heuristics; P2.5 scip-php).
 - `sql/` — `schema.sql`: `CREATE TABLE users`, a `CREATE VIEW` referencing
   it, and one stored procedure `CALL`-ing another (P3.3 SQL module).
 
-None of these are wired into any test yet — Phase 1/2/3 work should add its
-own `#[ignore]`d integration test(s) pointing at the relevant subdirectory
-here as it lands, so the nightly CI job (`.github/workflows/scip-nightly.yml`)
-picks them up automatically via `cargo test --workspace -- --ignored`
-without any workflow-file change.
+`go/`, `python/`, and `js/` are wired into `#[ignore]`d integration tests in
+`crates/calm-core/src/scip/mod.rs` (`go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`,
+`python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`,
+`js_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`) — each asserts
+the real external indexer (`scip-go`/`scip-python`/`scip-typescript`)
+upgrades the fixture's one cross-file call edge to `formal`. The remaining
+subdirectories (`java/`, `csharp/`, `c/`, `cpp/`, `php/`, `sql/`) are still
+unwired — Phase 2/3 work for those languages should add its own `#[ignore]`d
+integration test(s) pointing at the relevant subdirectory here as it lands,
+so the nightly CI job (`.github/workflows/scip-nightly.yml`) picks them up
+automatically via `cargo test --workspace -- --ignored` without any
+workflow-file change.

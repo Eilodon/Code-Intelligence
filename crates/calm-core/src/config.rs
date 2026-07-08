@@ -21,6 +21,7 @@ pub struct Config {
     pub rust: RustConfig,
     pub go: GoConfig,
     pub python: PythonConfig,
+    pub js: JsConfig,
 }
 
 impl Default for Config {
@@ -58,6 +59,7 @@ impl Default for Config {
             rust: RustConfig::default(),
             go: GoConfig::default(),
             python: PythonConfig::default(),
+            js: JsConfig::default(),
         }
     }
 }
@@ -104,6 +106,17 @@ pub struct GoConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PythonConfig {
+    pub scip: ScipConfig,
+}
+
+/// JS/TS's overlay config (P3.2) — same `ScipConfig` shape and same
+/// distinct-wrapper-struct reasoning as `GoConfig`/`PythonConfig`. Covers
+/// both `file_index.language` values (`"javascript"`/`"typescript"`) under
+/// one block since `scip-typescript` indexes both in a single pass — see
+/// `provider::TYPESCRIPT`'s `dirty_langs`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct JsConfig {
     pub scip: ScipConfig,
 }
 

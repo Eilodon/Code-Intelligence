@@ -191,7 +191,7 @@ pub fn run_go_overlay_and_log(
     root: &Path,
     cfg: &crate::config::GoConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
-    let dirty = source_dirty_keys(conn, &["go"]);
+    let dirty = source_dirty_keys(conn, provider::GO.dirty_langs);
     let stats = run_overlay_for(&provider::GO, conn, root, Path::new(""), &cfg.scip, &dirty)?;
     if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
         crate::indexer::pipeline::refresh_caller_counts(conn)?;
@@ -209,9 +209,34 @@ pub fn run_python_overlay_and_log(
     root: &Path,
     cfg: &crate::config::PythonConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
-    let dirty = source_dirty_keys(conn, &["python"]);
+    let dirty = source_dirty_keys(conn, provider::PYTHON.dirty_langs);
     let stats = run_overlay_for(
         &provider::PYTHON,
+        conn,
+        root,
+        Path::new(""),
+        &cfg.scip,
+        &dirty,
+    )?;
+    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
+        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+    Ok(stats)
+}
+
+/// Run the JS/TS overlay (`provider::TYPESCRIPT`) — same shape as
+/// `run_go_overlay_and_log`/`run_python_overlay_and_log`. Coexists with the
+/// pre-existing stack-graphs formal tier for TypeScript (and the P1.1
+/// stopgap for JavaScript) via the same `formal_source` provenance
+/// mechanism Python's provider already relies on.
+pub fn run_js_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::JsConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    let dirty = source_dirty_keys(conn, provider::TYPESCRIPT.dirty_langs);
+    let stats = run_overlay_for(
+        &provider::TYPESCRIPT,
         conn,
         root,
         Path::new(""),
@@ -244,7 +269,7 @@ pub fn overlay_status_for(
     let available = bin.is_some();
     let up_to_date = match &bin {
         Some(bin) => {
-            let dirty = source_dirty_keys(conn, &[provider.lang]);
+            let dirty = source_dirty_keys(conn, provider.dirty_langs);
             let key = (provider.cache_key)(bin, root, &dirty);
             let cache_path = root.join(".calm").join(provider.cache_file_name);
             std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key)
@@ -379,6 +404,27 @@ mod tests {
         );
     }
 
+    /// Same guarantee as the Go/Python equivalents, for the JS/TS provider
+    /// added in P3.2 — `run_js_overlay_and_log` must short-circuit on
+    /// `enabled: Some(false)` before ever probing for `scip-typescript`
+    /// (deterministic regardless of whether this sandbox can reach npm).
+    #[test]
+    fn js_explicit_off_is_a_noop_even_when_scip_typescript_is_reachable() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let js = crate::config::JsConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        assert_eq!(
+            run_js_overlay_and_log(&conn, Path::new("."), &js).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
     #[test]
     fn rust_source_dirty_keys_reflects_path_and_hash_rust_only() {
         let conn = Connection::open_in_memory().unwrap();
@@ -474,6 +520,127 @@ mod tests {
                 "SELECT edge_confidence FROM call_edges \
                  WHERE from_symbol = 'app/src/main.rs::main' \
                    AND to_symbol = 'core/src/engine.rs::Engine::start'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-go` against `multi_lang_workspace/go`
+    /// (P2.1 shipped without this — gap closed alongside P3.2). Ignored by
+    /// default — requires `scip-go` on `PATH`/`$GOBIN`/`$HOME/go/bin` (`go
+    /// install github.com/scip-code/scip-go/cmd/scip-go@latest`), which CI
+    /// only installs on the nightly `scip-nightly.yml` job.
+    #[test]
+    #[ignore]
+    fn go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/go");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let go = crate::config::GoConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        let stats = run_go_overlay_and_log(&conn, &fixture, &go).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.go::main' \
+                   AND to_symbol = 'helper.go::Greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-python` (via `npx`) against
+    /// `multi_lang_workspace/python` (P2.4 shipped without this — gap closed
+    /// alongside P3.2). Ignored by default — requires Node/npm reachable on
+    /// `PATH` and network access to the npm registry on first run.
+    #[test]
+    #[ignore]
+    fn python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/python");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let python = crate::config::PythonConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        let stats = run_python_overlay_and_log(&conn, &fixture, &python).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.py::run' \
+                   AND to_symbol = 'pkg/helper.py::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
+
+    /// Live integration: real `scip-typescript` (via `npx`) against
+    /// `multi_lang_workspace/js` (P3.2). Ignored by default — requires
+    /// Node/npm reachable on `PATH` and network access to the npm registry
+    /// on first run.
+    #[test]
+    #[ignore]
+    fn js_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/js");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let js = crate::config::JsConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        let stats = run_js_overlay_and_log(&conn, &fixture, &js).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.js::run' \
+                   AND to_symbol = 'helper.js::greet'",
                 [],
                 |r| r.get(0),
             )

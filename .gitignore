@@ -8,6 +8,10 @@ crates/calm-core/tests/fixtures/rust_workspace/target/
 *.db-wal
 *.db-shm
 
+# scip-typescript's --infer-tsconfig side effect when the P3.2 ignored test
+# runs against the (deliberately tsconfig-less) js/ fixture directly.
+crates/calm-core/tests/fixtures/multi_lang_workspace/js/tsconfig.json
+
 # Coverage output — but keep the committed parity-test fixture
 .coverage
 coverage.out

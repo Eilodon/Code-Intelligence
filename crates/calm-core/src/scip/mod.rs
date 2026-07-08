@@ -179,6 +179,26 @@ pub fn rust_source_dirty_keys(conn: &Connection) -> Vec<String> {
     source_dirty_keys(conn, &["rust"])
 }
 
+/// Run the Go overlay (`provider::GO`), refresh `caller_count` if it changed
+/// anything, and log the outcome — the Go-specific counterpart to the
+/// Rust-only block each of the 3 production call sites (`lib.rs`,
+/// `watcher.rs`, `main.rs`) already had before this existed. Bundled into one
+/// function (rather than inlining ~15 lines a 3rd time at each call site) so
+/// a future 3rd provider's callers only need one new line here, not a new
+/// copy of the refresh/log dance at every call site.
+pub fn run_go_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::GoConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    let dirty = source_dirty_keys(conn, &["go"]);
+    let stats = run_overlay_for(&provider::GO, conn, root, Path::new(""), &cfg.scip, &dirty)?;
+    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
+        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+    Ok(stats)
+}
+
 /// Cheap, non-invoking snapshot of the overlay's readiness — never spawns an
 /// external indexer, just checks binary presence and compares the cache key
 /// that `run_overlay_for` would compute against what's already on disk.
@@ -287,6 +307,28 @@ mod tests {
         };
         assert_eq!(
             run_overlay(&conn, Path::new("."), &rust, &[]).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
+    /// Same guarantee as `explicit_off_is_a_noop_even_when_rust_analyzer_is_on_path`,
+    /// for the Go provider added in P2.1 — `run_go_overlay_and_log` must
+    /// short-circuit on `enabled: Some(false)` before ever probing `PATH` for
+    /// `scip-go`, deterministically regardless of whether this machine
+    /// happens to have it installed (this sandbox does).
+    #[test]
+    fn go_explicit_off_is_a_noop_even_when_scip_go_is_on_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let go = crate::config::GoConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(false),
+                binary: None,
+                insert_missing: None,
+            },
+        };
+        assert_eq!(
+            run_go_overlay_and_log(&conn, Path::new("."), &go).unwrap(),
             ingest::IngestStats::default()
         );
     }

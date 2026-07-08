@@ -84,6 +84,64 @@ pub fn run_indexer(
     }
 }
 
+/// Total wall-clock budget for one `scip-go index` pass. Go's compiler-driven
+/// analysis (`go/packages` loading + typechecking) is typically slower per
+/// LOC than rust-analyzer's incremental LSP pass, so this gets a larger
+/// budget than `SCIP_TIMEOUT`; still bounded so a pathological module graph
+/// can't hang the watcher/CLI indefinitely.
+pub const GO_SCIP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Resolve a usable `scip-go` binary: an explicit override, then `PATH`, then
+/// `$HOME/go/bin` and `$GOBIN` (where `go install .../scip-go@latest` lands
+/// when neither is already on `PATH` — the common case for a freshly
+/// installed toolchain).
+pub fn go_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-go")); // PATH lookup via which-style probe
+    if let Some(gobin) = std::env::var_os("GOBIN") {
+        candidates.push(PathBuf::from(gobin).join("scip-go"));
+    }
+    if let Some(home) = dirs_home() {
+        candidates.push(home.join("go").join("bin").join("scip-go"));
+    }
+    candidates.into_iter().find(|c| binary_runs(c))
+}
+
+/// `scip-go index --module-root <root> --output <out> --quiet`. `module-root`
+/// (rather than relying on cwd) is what lets `run_indexer`'s spawn work
+/// regardless of the calling process's own working directory.
+pub fn go_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("index")
+        .arg("--module-root")
+        .arg(root)
+        .arg("--output")
+        .arg(out)
+        .arg("--quiet")
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// `go version`, trimmed, or `""` if it can't be run. Part of the Go overlay
+/// cache key alongside `binary_version` (the scip-go binary itself) — a
+/// different active Go toolchain can change typechecking results even with
+/// the same scip-go version.
+pub fn go_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("go")
+        .arg("version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn binary_runs(path: &Path) -> bool {
     Command::new(path)
         .arg("--version")
@@ -187,6 +245,19 @@ mod tests {
         // negative, non-panicking result — at the underlying probe instead.
         assert!(!binary_runs(Path::new(
             "definitely-not-a-real-ra-binary-xyz"
+        )));
+    }
+
+    /// Same invariant as `detect_returns_none_when_binary_absent`, pinned at
+    /// the underlying probe for the same reason: this sandbox has a real
+    /// `scip-go` on `PATH` (P2.1 was verified against it), so asserting
+    /// `go_resolve_binary(...).is_none()` end-to-end would be flaky based on
+    /// what's installed rather than testing the actual invariant — an
+    /// absent/non-executable path is rejected.
+    #[test]
+    fn go_binary_runs_rejects_a_nonexistent_path() {
+        assert!(!binary_runs(Path::new(
+            "definitely-not-a-real-scip-go-binary-xyz"
         )));
     }
 }

@@ -19,6 +19,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub cochange: CoChangeConfig,
     pub rust: RustConfig,
+    pub go: GoConfig,
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             session: SessionConfig::default(),
             cochange: CoChangeConfig::default(),
             rust: RustConfig::default(),
+            go: GoConfig::default(),
         }
     }
 }
@@ -81,6 +83,17 @@ impl Default for HubThresholdConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RustConfig {
+    pub scip: ScipConfig,
+}
+
+/// Go's overlay config (P2.1) — same `ScipConfig` shape as Rust's (three-state
+/// `enabled`/`insert_missing`, optional binary override); a distinct wrapper
+/// struct only so `config.json`'s `"go":{"scip":{...}}` doesn't collide with
+/// `"rust":{"scip":{...}}` and so each language's block can grow independent
+/// fields later without disturbing the other.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GoConfig {
     pub scip: ScipConfig,
 }
 

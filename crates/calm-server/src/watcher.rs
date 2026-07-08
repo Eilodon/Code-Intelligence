@@ -221,6 +221,58 @@ pub fn run_watch_loop(
                                     "Incremental SCIP overlay error (base graph intact): {e}"
                                 ),
                             }
+
+                            let go_cfg = calm_core::config::load_config(&project_root)
+                                .map(|c| c.go)
+                                .unwrap_or_default();
+                            match calm_core::scip::run_go_overlay_and_log(
+                                &conn,
+                                &project_root,
+                                &go_cfg,
+                            ) {
+                                Ok(stats)
+                                    if stats.upgraded > 0
+                                        || stats.ruled_out > 0
+                                        || stats.inserted > 0 =>
+                                {
+                                    tracing::info!(
+                                        "Incremental SCIP overlay (go): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
+                                        stats.upgraded,
+                                        stats.ruled_out,
+                                        stats.inserted
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    "Incremental SCIP overlay (go) error (base graph intact): {e}"
+                                ),
+                            }
+
+                            let python_cfg = calm_core::config::load_config(&project_root)
+                                .map(|c| c.python)
+                                .unwrap_or_default();
+                            match calm_core::scip::run_python_overlay_and_log(
+                                &conn,
+                                &project_root,
+                                &python_cfg,
+                            ) {
+                                Ok(stats)
+                                    if stats.upgraded > 0
+                                        || stats.ruled_out > 0
+                                        || stats.inserted > 0 =>
+                                {
+                                    tracing::info!(
+                                        "Incremental SCIP overlay (python): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
+                                        stats.upgraded,
+                                        stats.ruled_out,
+                                        stats.inserted
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    "Incremental SCIP overlay (python) error (base graph intact): {e}"
+                                ),
+                            }
                         }
                     }
                     Ok(_) => {}

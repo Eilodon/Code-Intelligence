@@ -3,11 +3,13 @@
 //! copying this whole `scip/` module — see the plan doc
 //! `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §3 (P0.4).
 //!
-//! Only `RUST` exists today. Fields sketched in the plan's P0.4 design for
-//! multi-root marker-file discovery, prereq gating, and refresh policy are
-//! deliberately NOT here yet — they'd be dead weight with no second concrete
-//! provider to validate their shape against. Add them (and widen this
-//! struct) when a Phase 2 provider actually needs them.
+//! `RUST`, `GO` (P2.1), and `PYTHON` (P2.4) exist today. Fields sketched in
+//! the plan's P0.4 design for multi-root marker-file discovery, prereq
+//! gating, and refresh policy are still deliberately NOT here — neither Go's
+//! nor Python's single-project case needed them (Go's `go.work`
+//! multi-module handling is a documented upstream `scip-go` limitation, not
+//! something this table papers over yet; scip-python indexes one `--cwd`
+//! tree per invocation). Add them when a provider actually needs them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,6 +75,82 @@ fn lockfile_hash(root: &Path) -> String {
 
 fn cargo_toml_hash(root: &Path) -> String {
     std::fs::read_to_string(root.join("Cargo.toml"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// The 2nd entry in the table (Phase 2 / P2.1) — validates that P0.4's
+/// `ScipProvider` shape actually generalizes past Rust, per the plan doc's
+/// own note that widening the struct should wait for a real 2nd provider
+/// instead of being guessed up front.
+pub const GO: ScipProvider = ScipProvider {
+    lang: "go",
+    resolve_binary: super::runner::go_resolve_binary,
+    build_command: super::runner::go_build_command,
+    timeout: super::runner::GO_SCIP_TIMEOUT,
+    cache_key: go_cache_key,
+    cache_file_name: "scip-go.cache",
+};
+
+fn go_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::binary_version(bin),
+        &super::runner::go_toolchain_fingerprint(root),
+        &go_sum_hash(root),
+        &go_mod_hash(root),
+        dirty,
+    )
+}
+
+fn go_mod_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("go.mod"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+fn go_sum_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("go.sum"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+/// The 3rd entry in the table (Phase 2 / P2.4) — upgrades Python from
+/// stack-graphs (archived upstream, per-file name-set matching only) to real
+/// exact-(file,line) SCIP resolution. The two coexist via the provenance
+/// mechanism P0.3 already built for exactly this: `ingest_occurrences` is
+/// allowed to override a `formal_source = 'stack_graphs'` edge but never its
+/// own prior `'scip'` verdict — no new code needed here for that part.
+pub const PYTHON: ScipProvider = ScipProvider {
+    lang: "python",
+    resolve_binary: super::runner::python_resolve_binary,
+    build_command: super::runner::python_build_command,
+    timeout: super::runner::PYTHON_SCIP_TIMEOUT,
+    cache_key: python_cache_key,
+    cache_file_name: "scip-python.cache",
+};
+
+fn python_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::python_binary_version(bin),
+        &super::runner::python_toolchain_fingerprint(root),
+        &python_requirements_hash(root),
+        &python_pyproject_hash(root),
+        dirty,
+    )
+}
+
+/// V1 simplification (noted in the plan): only `requirements.txt` is hashed
+/// as "the lockfile" — `poetry.lock`/`Pipfile.lock` aren't consulted yet.
+/// Missing entirely is not an error (plenty of real Python projects have
+/// neither) — an absent file just contributes an empty, stable hash input.
+fn python_requirements_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("requirements.txt"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
+fn python_pyproject_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("pyproject.toml"))
         .map(|s| crate::indexer::pipeline::hash_content(&s))
         .unwrap_or_default()
 }

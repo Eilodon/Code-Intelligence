@@ -218,6 +218,50 @@ pub async fn serve_stdio_with_preset(
                         Ok(_) => {}
                         Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                     }
+
+                    let go_cfg = calm_core::config::load_config(&indexer_root)
+                        .map(|c| c.go)
+                        .unwrap_or_default();
+                    match calm_core::scip::run_go_overlay_and_log(&conn, &indexer_root, &go_cfg) {
+                        Ok(stats)
+                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                        {
+                            tracing::info!(
+                                "SCIP overlay (go): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
+                                stats.upgraded,
+                                stats.ruled_out,
+                                stats.inserted
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("SCIP overlay (go) error (base graph intact): {e}")
+                        }
+                    }
+
+                    let python_cfg = calm_core::config::load_config(&indexer_root)
+                        .map(|c| c.python)
+                        .unwrap_or_default();
+                    match calm_core::scip::run_python_overlay_and_log(
+                        &conn,
+                        &indexer_root,
+                        &python_cfg,
+                    ) {
+                        Ok(stats)
+                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                        {
+                            tracing::info!(
+                                "SCIP overlay (python): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
+                                stats.upgraded,
+                                stats.ruled_out,
+                                stats.inserted
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("SCIP overlay (python) error (base graph intact): {e}")
+                        }
+                    }
                 }
                 #[cfg(not(feature = "scip-overlay"))]
                 let _ = index_ok;

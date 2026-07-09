@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -143,8 +143,12 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     let fts_query = escape_fts5_query(query);
     let fetch_limit = (limit * 2) as i64;
 
-    let mut scores: HashMap<String, f64> = HashMap::new();
-    let mut data: HashMap<String, SearchResult> = HashMap::new();
+    // BTreeMap, not HashMap: same determinism reasoning as `rrf_merge_n` —
+    // ties in score must break the same way (alphabetically by
+    // qualified_name) on every run, not depend on HashMap's
+    // per-process-random iteration order.
+    let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+    let mut data: BTreeMap<String, SearchResult> = BTreeMap::new();
 
     let mut stmt_exact = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
@@ -1112,6 +1116,47 @@ mod tests {
         .unwrap();
         assert!(output.results.is_empty());
         assert!(!output.truncated);
+    }
+
+    #[test]
+    fn test_search_symbol_ties_break_deterministically_by_qualified_name() {
+        // Same reasoning as rrf_merge_n's determinism test: two symbols with
+        // identical name/docstring/tokens genuinely tie on combined BM25
+        // score. Before switching search_symbol's internal maps from
+        // HashMap to BTreeMap, the tie's winner depended on HashMap's
+        // per-process-random iteration order.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for qn in ["src/b.py::widget", "src/a.py::widget"] {
+            let path = qn.split("::").next().unwrap();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "widget", qn, "function",
+                    path, "python", 1, 5, "", "widget"
+                ],
+            )
+            .unwrap();
+        }
+
+        let output = search(&conn, "widget", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0].score, output.results[1].score,
+            "must be a genuine tie"
+        );
+        assert_eq!(
+            output.results[0].qualified_name,
+            "src/a.py::widget",
+            "tied results must order deterministically (alphabetically), got: {:?}",
+            output
+                .results
+                .iter()
+                .map(|r| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

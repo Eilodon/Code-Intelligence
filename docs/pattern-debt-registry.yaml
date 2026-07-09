@@ -3,17 +3,27 @@ generated: "2026-06-29"
 
 items:
   DEBT-001-parity-harness:
-    status: open
-    urgency: high
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-10"
     description: >
-      Parity test harness Python↔Rust chưa tồn tại.
-      Kế hoạch v1 coi đây là safety net chính của migration,
-      nhưng chưa có fixture, oracle, hay diff runner nào.
-    current_control: "Unit tests riêng lẻ cho từng module Rust"
-    remaining:
-      - "Synthetic fixture (~50 files, ~200 symbols, mixed languages)"
-      - "Python oracle đã fix C-1/C-2"
-      - "Diff runner so sánh JSON output"
+      Parity test harness Python↔Rust chưa tồn tại (trạng thái tại thời điểm
+      viết registry 2026-06-29). Kế hoạch v1 coi đây là safety net chính của
+      migration, nhưng lúc đó chưa có fixture, oracle, hay diff runner nào.
+    current_control: >
+      Audit 2026-07-10 phát hiện registry đã stale: `crates/calm-core/tests/
+      parity_test.rs` (264 dòng) tồn tại và chạy thật — 6 test pass
+      (test_codeowners_parity, test_coverage_parity, test_coreness_parity,
+      test_path_parity, test_hotspot_parity, test_formal_edges_integration),
+      so khớp với golden fixture JSON trong tests/fixtures/synthetic_project/
+      (expected_codeowners.json, expected_coverage.json, expected_coreness.json,
+      expected_path.json, expected_hotspot.json). Không phải diff-runner so
+      Python↔Rust trực tiếp nữa — Python side đã bị retired hoàn toàn (xem
+      doc-comment build_synthetic_db(): "Ported from the retired Python
+      build_synthetic_db.py oracle") — nên harness giờ so Rust output với
+      golden fixture đã chốt, tương đương về mặt safety-net nhưng không cần
+      Python interpreter khi checkout sạch.
+    remaining: []
     owner_hint: testing
 
   DEBT-002-analysis-modules:
@@ -29,16 +39,25 @@ items:
     owner_hint: calm-core
 
   DEBT-003-bug-fixes:
-    status: partial
-    urgency: medium
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-10"
     description: >
       Bug fixes từ audit:
       H-1 (last_changed) đã fix trong hotspot.rs (Option<String>).
-      H-3 và H-4 chờ MCP tool layer (Phase 3+).
-    current_control: "H-1 fixed; H-3, H-4 documented"
-    remaining:
-      - "H-3: understand response thêm edges_ready: bool"
-      - "H-4: AmbiguousResult.signature → Option<String>"
+      H-3 và H-4 chờ MCP tool layer (Phase 3+, chưa có lúc viết registry
+      2026-06-29).
+    current_control: >
+      Audit 2026-07-10: Phase 3+ đã xong từ lâu (bao gồm commit gần nhất
+      b1216d1 "Unify all 22 MCP tools on Json<ToolOutcome>/ResolvedOutcome
+      envelopes"). H-3 xác nhận: `edges_ready: bool` có mặt xuyên suốt
+      callers/callees/symbol_info/session_context/edit_context/repo_overview
+      (crates/calm-server/src/tools.rs, trace.rs), có regression test riêng
+      (vd. edges_ready_follows_indexing_phase, callers_includes_call_site_
+      line_preview_and_edges_ready). H-4 xác nhận: `AmbiguousCandidate.
+      signature` đã là `Option<String>` (crates/calm-server/src/tools/
+      common.rs:618). H-1 vẫn giữ nguyên đã fix.
+    remaining: []
     owner_hint: calm-core
 
   DEBT-004-c1-regression:

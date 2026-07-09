@@ -47,10 +47,10 @@ pub fn run_all(root: &Path, db_path: &Path) {
                 // helpers already do this internally (via `run_and_refresh`);
                 // `run_overlay` is the one raw entry point that doesn't, so it's
                 // done here instead.
-                if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
-                    if let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(conn) {
-                        tracing::warn!("caller_count refresh after SCIP overlay (rust) failed: {e}");
-                    }
+                if (stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0)
+                    && let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(conn)
+                {
+                    tracing::warn!("caller_count refresh after SCIP overlay (rust) failed: {e}");
                 }
                 Ok(stats)
             });

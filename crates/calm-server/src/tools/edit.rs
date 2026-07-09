@@ -65,13 +65,45 @@ impl CalmServer {
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
     ) -> ToolOutcome<EditLinesOutput> {
-        // Serialize the whole read -> hash-check -> write -> reindex sequence:
-        // rmcp dispatches tool calls concurrently, and locking only the write
-        // phase left the read+hash-check racy (TOCTOU) -- two concurrent calls
-        // could both read the pre-edit snapshot, both pass hash validation,
-        // and the second writer's full-file replace would silently discard
-        // the first writer's change even on disjoint line ranges.
+        // In-process guard: serializes the whole read -> hash-check -> write
+        // -> reindex sequence within this one `calm serve` process. rmcp
+        // dispatches tool calls concurrently, and locking only the write
+        // phase left the read+hash-check racy (TOCTOU) -- two concurrent
+        // calls could both read the pre-edit snapshot, both pass hash
+        // validation, and the second writer's full-file replace would
+        // silently discard the first writer's change even on disjoint line
+        // ranges.
         let _guard = self.edit_lock.lock().unwrap();
+
+        // Cross-process guard: a *different* `calm serve` process (another
+        // IDE session on the same project) has its own independent
+        // `edit_lock` Mutex above, so it isn't covered by it -- see
+        // `calm_core::db::edit_lock`'s doc comment for the exact same TOCTOU,
+        // still open across processes, this closes. Acquired after the cheap
+        // in-process Mutex (so at most one thread per process ever contends
+        // for it), with the same scope (held through the end of this
+        // function) so the two guards never disagree about what's protected.
+        // A failure here is treated as a hard error rather than silently
+        // proceeding in-process-only: proceeding would just reintroduce the
+        // cross-process race this guard exists to close.
+        let calm_dir = self
+            .db_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.project_root.clone());
+        let _cross_guard = match calm_core::db::edit_lock::acquire(&calm_dir) {
+            Ok(g) => g,
+            Err(e) => {
+                return ToolOutcome::error(error_detail(
+                    "EDIT_LOCK_FAILED",
+                    &format!(
+                        "could not acquire cross-process edit lock in {}: {e}",
+                        calm_dir.display()
+                    ),
+                    true,
+                ));
+            }
+        };
 
         let full_path = self.project_root.join(path);
         let original = match std::fs::read_to_string(&full_path) {
@@ -163,6 +195,7 @@ impl CalmServer {
         }
 
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
+            drop(_cross_guard);
             drop(_guard);
             return ToolOutcome::error(error_detail(
                 "WRITE_FAILED",
@@ -174,6 +207,7 @@ impl CalmServer {
         let mut write_conn = match calm_core::db::conn::open_writer(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
+                drop(_cross_guard);
                 drop(_guard);
                 return ToolOutcome::error(error_detail(
                     "DB_ERROR",
@@ -201,6 +235,7 @@ impl CalmServer {
             Ok(_) => {}
             Err(e) => {
                 drop(write_conn);
+                drop(_cross_guard);
                 drop(_guard);
                 return ToolOutcome::error(error_detail(
                     "REINDEX_FAILED",
@@ -212,6 +247,7 @@ impl CalmServer {
             }
         }
         drop(write_conn);
+        drop(_cross_guard);
         drop(_guard);
 
         self.track_file(path);

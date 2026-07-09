@@ -14,7 +14,21 @@ impl CalmServer {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = rusqlite::Connection::open(&db_path)?;
+        // `open_writer` (not a bare `Connection::open`) so this sets
+        // `busy_timeout` before running schema DDL: every *other* writer site
+        // in this codebase goes through `open_writer` for exactly this
+        // reason (see its doc comment), but this one-time schema-init
+        // connection didn't, and it's reachable from every `calm serve`
+        // process's own startup, not just the indexer-lock owner's. Without
+        // `busy_timeout`, two processes launched at the same moment against
+        // a brand-new project (no schema yet — the widest DDL burst, and the
+        // likeliest moment for two sessions to start together) can race:
+        // SQLite's default no-retry `SQLITE_BUSY` on the loser propagates
+        // straight through this `?`, failing `new_with_preset` entirely —
+        // that `calm serve` process never starts, surfacing to the user as
+        // "MCP server failed to connect" instead of the brief, silent wait
+        // `busy_timeout` gives every other writer.
+        let conn = calm_core::db::conn::open_writer(&db_path)?;
         calm_core::db::schema::init_db(&conn)?;
         drop(conn);
         let coverage = calm_core::analysis::coverage::load_coverage(&project_root);

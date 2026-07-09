@@ -102,44 +102,75 @@ pub async fn serve_stdio_with_preset(
             // `busy_timeout`, never prevented. Only the process that wins
             // this advisory lock runs the indexer+watcher below; a loser
             // still serves tool calls read-only against the DB the winner
-            // keeps fresh.
+            // keeps fresh — and now waits in the background to *become* the
+            // owner if that winner ever exits mid-session (see
+            // `acquire_blocking`'s doc comment): without that, a loser that
+            // started before the owner died would stay read-only for its
+            // entire remaining lifetime, since nothing else here ever
+            // retried the initial `try_acquire`.
             let lock_dir = indexer_db_path
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| indexer_root.clone());
-            let Some(_indexer_lock) = calm_core::db::instance_lock::try_acquire(&lock_dir) else {
-                tracing::info!(
-                    "Another calm serve process already owns indexing for this project — skipping redundant indexer/watcher"
-                );
-                // Best-effort: if a prior process already indexed this
-                // project, there's real data to serve immediately — don't
-                // leave `phase` stuck at its initial pre-Ready value this
-                // process will now never itself advance. If the DB is
-                // genuinely empty (everyone racing to index a brand new
-                // project simultaneously), leave `phase` as-is; it stays
-                // honestly non-Ready here, but reads still start reflecting
-                // real data as soon as the owning process writes it.
-                if let Ok(conn) = calm_core::db::conn::open_writer(&indexer_db_path) {
-                    let existing_files: i64 = conn
-                        .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
-                        .unwrap_or(0);
-                    if existing_files > 0 {
-                        *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
+            let _indexer_lock = match calm_core::db::instance_lock::try_acquire(&lock_dir) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!(
+                        "Another calm serve process already owns indexing for this project — \
+                         serving read-only for now; will take over automatically if that \
+                         process exits"
+                    );
+                    // Best-effort: if a prior process already indexed this
+                    // project, there's real data to serve immediately — don't
+                    // leave `phase` stuck at its initial pre-Ready value this
+                    // process will now never itself advance. If the DB is
+                    // genuinely empty (everyone racing to index a brand new
+                    // project simultaneously), leave `phase` as-is; it stays
+                    // honestly non-Ready here, but reads still start reflecting
+                    // real data as soon as the owning process writes it.
+                    if let Ok(conn) = calm_core::db::conn::open_writer(&indexer_db_path) {
+                        let existing_files: i64 = conn
+                            .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
+                            .unwrap_or(0);
+                        if existing_files > 0 {
+                            *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
+                        }
+                    }
+                    // The lock only gates *writes* (new index rows, new embedding
+                    // rows) — every process still needs its own live `Embedder`
+                    // to embed *queries* at search time, and loading it is a
+                    // pure, local, side-effect-free operation (vendored weights,
+                    // zero network by default). Without this, every `calm serve`
+                    // process that loses the race — i.e. every session opened
+                    // against this project after the first one — would report
+                    // `embeddings_status: "disabled"` forever, even though the DB
+                    // the winner maintains already has real embeddings in it.
+                    if semantic.enabled {
+                        load_embedder_readonly(&semantic, &embedder, &embed_status, &last_embed_error);
+                    }
+                    // Block (not poll) until the current owner exits and this
+                    // process can take over — see `acquire_blocking`'s doc
+                    // comment for why blocking is correct here: the OS wakes
+                    // this thread the instant the lock is released, whether
+                    // via a graceful shutdown or the kernel's own `flock`
+                    // release on an ungraceful death, with no interval to
+                    // tune and no missed-promotion window.
+                    match calm_core::db::instance_lock::acquire_blocking(&lock_dir) {
+                        Ok(lock) => {
+                            tracing::info!(
+                                "Promoted to indexer/watcher owner — previous owner exited"
+                            );
+                            lock
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Could not wait to become indexer/watcher owner ({e}) — this \
+                                 process will stay read-only for its whole lifetime"
+                            );
+                            return;
+                        }
                     }
                 }
-                // The lock only gates *writes* (new index rows, new embedding
-                // rows) — every process still needs its own live `Embedder`
-                // to embed *queries* at search time, and loading it is a
-                // pure, local, side-effect-free operation (vendored weights,
-                // zero network by default). Without this, every `calm serve`
-                // process that loses the race — i.e. every session opened
-                // against this project after the first one — would report
-                // `embeddings_status: "disabled"` forever, even though the DB
-                // the winner maintains already has real embeddings in it.
-                if semantic.enabled {
-                    load_embedder_readonly(&semantic, &embedder, &embed_status, &last_embed_error);
-                }
-                return;
             };
             *owns_indexer_lock.write().unwrap() = true;
 

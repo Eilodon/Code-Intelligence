@@ -36,11 +36,13 @@ impl CalmServer {
                 &conn,
                 &p.query,
                 kind,
-                p.limit,
+                search_fetch_limit(&p),
                 self.embedder().as_deref(),
                 rrf_k,
             ) {
                 Ok(mut output) => {
+                    let filter_truncated =
+                        apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
                     let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                     let results: Vec<SearchResultItem> = output
                         .results
@@ -88,7 +90,7 @@ impl CalmServer {
                     };
                     serde_json::to_string_pretty(&SearchOutput {
                         results,
-                        truncated: output.truncated,
+                        truncated: output.truncated || filter_truncated,
                         degraded: output.degraded,
                         note: output.note,
                         personalized,
@@ -129,9 +131,11 @@ impl CalmServer {
             p.case_insensitive,
             p.context,
             &ignore_patterns,
-            p.limit,
+            search_fetch_limit(p),
         ) {
             Ok(mut output) => {
+                let filter_truncated =
+                    apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
                 let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                 let results: Vec<SearchResultItem> = output
                     .results
@@ -161,7 +165,7 @@ impl CalmServer {
                 });
                 serde_json::to_string_pretty(&SearchOutput {
                     results,
-                    truncated: output.truncated,
+                    truncated: output.truncated || filter_truncated,
                     degraded: output.degraded,
                     note,
                     personalized,
@@ -199,8 +203,10 @@ impl CalmServer {
             Ok(c) => c,
             Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
         };
-        match calm_core::search::search_similar(&conn, path, line, p.limit) {
+        match calm_core::search::search_similar(&conn, path, line, search_fetch_limit(p)) {
             Ok(mut output) => {
+                let filter_truncated =
+                    apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
                 let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                 let results: Vec<SearchResultItem> = output
                     .results
@@ -223,7 +229,7 @@ impl CalmServer {
                 });
                 serde_json::to_string_pretty(&SearchOutput {
                     results,
-                    truncated: output.truncated,
+                    truncated: output.truncated || filter_truncated,
                     degraded: output.degraded,
                     note,
                     personalized,
@@ -507,6 +513,16 @@ pub(crate) struct SearchParams {
     /// selects the anchor chunk (the smallest indexed chunk spanning this
     /// line).
     pub(crate) line: Option<i64>,
+    /// `false` to hard-exclude test code (`is_test`) from results. Default
+    /// `true` (current behavior, unchanged): tests are only soft-penalized
+    /// via `NOISE_PENALTY`, which a descriptively-named test that closely
+    /// paraphrases the query can still outrank the real implementation
+    /// against — pass `false` when the query has nothing to do with tests
+    /// to exclude them outright instead of just down-ranking them. May
+    /// return fewer than `limit` results if enough hits were tests (a
+    /// modest overfetch covers most cases but isn't retried further).
+    #[serde(default = "default_include_tests")]
+    pub(crate) include_tests: bool,
 }
 
 pub(crate) fn default_symbol() -> String {
@@ -515,6 +531,43 @@ pub(crate) fn default_symbol() -> String {
 
 pub(crate) fn default_limit() -> usize {
     10
+}
+
+pub(crate) fn default_include_tests() -> bool {
+    true
+}
+
+/// Internal fetch size passed to the underlying `calm_core` search —
+/// deliberately larger than `p.limit` when `include_tests` is `false`, so
+/// `apply_include_tests_filter` below has enough of a pool to drop test
+/// hits from without immediately starving the response. Not a guarantee:
+/// a file with unusually many tests can still under-fill `limit`.
+pub(crate) fn search_fetch_limit(p: &SearchParams) -> usize {
+    if p.include_tests {
+        p.limit
+    } else {
+        p.limit.saturating_mul(2).max(p.limit + 5)
+    }
+}
+
+/// Hard-excludes `is_test` rows when `include_tests` is `false` (vs
+/// `NOISE_PENALTY`'s soft score demotion inside `rrf_merge_n`, which a
+/// descriptively-named test that closely paraphrases the query can still
+/// outrank the real implementation against), then truncates back down to
+/// `limit`. Returns `true` if the filter itself dropped enough rows that
+/// truncation now reflects the filter rather than (or in addition to) the
+/// underlying search's own limit.
+pub(crate) fn apply_include_tests_filter(
+    results: &mut Vec<calm_core::search::SearchResult>,
+    limit: usize,
+    include_tests: bool,
+) -> bool {
+    if !include_tests {
+        results.retain(|r| !r.is_test);
+    }
+    let filter_truncated = results.len() > limit;
+    results.truncate(limit);
+    filter_truncated
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -750,5 +803,56 @@ mod tests {
         assert_eq!(full.symbol_count, 45);
         assert_eq!(full.symbols.len(), 45, "no cap returns the full list");
         assert!(!full.symbols_truncated);
+    }
+
+    fn stub_search_result(qn: &str, is_test: bool) -> calm_core::search::SearchResult {
+        calm_core::search::SearchResult {
+            name: qn.into(),
+            qualified_name: qn.into(),
+            path: "x.rs".into(),
+            kind: None,
+            line_start: None,
+            line_end: None,
+            score: 0.0,
+            match_type: "symbol".into(),
+            snippet: None,
+            is_test,
+        }
+    }
+
+    #[test]
+    fn apply_include_tests_filter_keeps_all_when_include_tests_true() {
+        let mut results = vec![stub_search_result("a", false), stub_search_result("b", true)];
+        let truncated = apply_include_tests_filter(&mut results, 10, true);
+        assert_eq!(results.len(), 2, "include_tests=true is the current, unchanged behavior");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn apply_include_tests_filter_excludes_tests_when_false() {
+        let mut results = vec![
+            stub_search_result("a", false),
+            stub_search_result("b", true),
+            stub_search_result("c", false),
+        ];
+        let truncated = apply_include_tests_filter(&mut results, 10, false);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.qualified_name != "b"),
+            "is_test result must be hard-excluded, not just score-penalized"
+        );
+        assert!(!truncated, "under the limit even after filtering, not truncated");
+    }
+
+    #[test]
+    fn apply_include_tests_filter_reports_truncated_when_still_over_limit() {
+        let mut results = vec![
+            stub_search_result("a", false),
+            stub_search_result("b", false),
+            stub_search_result("c", false),
+        ];
+        let truncated = apply_include_tests_filter(&mut results, 2, true);
+        assert_eq!(results.len(), 2);
+        assert!(truncated);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -920,8 +920,15 @@ fn rrf_merge_n(
     rrf_k: f64,
     match_type: &str,
 ) -> Vec<SearchResult> {
-    let mut scores: HashMap<String, f64> = HashMap::new();
-    let mut data: HashMap<String, SearchResult> = HashMap::new();
+    // BTreeMap, not HashMap: ties in RRF score must break the same way on
+    // every run. HashMap's per-process-random iteration order fed
+    // `data.into_iter().collect()` below a different starting order each
+    // run, and `sort_by`'s stable sort preserves whatever order it's given
+    // — so two results tied on score could swap rank from one process
+    // launch to the next. BTreeMap iterates in `qualified_name` order
+    // instead, so ties now break alphabetically, deterministically.
+    let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+    let mut data: BTreeMap<String, SearchResult> = BTreeMap::new();
 
     for (results, weight) in sources {
         for (rank, r) in results.iter().enumerate() {
@@ -1805,6 +1812,27 @@ mod tests {
         assert_eq!(
             merged[0].qualified_name, "real_impl",
             "non-test path must outrank an equally-ranked test path, got: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_rrf_merge_n_ties_break_deterministically_by_qualified_name() {
+        // Neither noise-penalized nor path-noisy, so these two genuinely
+        // tie on RRF score (each is the sole rank-0 entry of its own source
+        // list, both weight 1.0). Before switching rrf_merge_n's internal
+        // maps from HashMap to BTreeMap, this tie's winner depended on
+        // HashMap's per-process-random iteration order — i.e. it could flip
+        // between separate `calm serve` launches with byte-identical input.
+        // BTreeMap iterates by key, so the tie must now always resolve the
+        // same way: alphabetically by qualified_name.
+        let a = stub_result("aaa_symbol", "semantic");
+        let z = stub_result("zzz_symbol", "semantic");
+        let merged = rrf_merge_n(&[(&[a][..], 1.0), (&[z][..], 1.0)], 10, DEFAULT_RRF_K, "semantic");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].score, merged[1].score, "must be a genuine tie");
+        assert_eq!(
+            merged[0].qualified_name, "aaa_symbol",
+            "tied results must order deterministically (alphabetically), got: {merged:?}"
         );
     }
 

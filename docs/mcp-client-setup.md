@@ -2,8 +2,9 @@
 
 `calm` không phải MCP server chỉ dành riêng cho Claude Code — `scripts/mcp-launcher.sh`
 là entrypoint dùng chung cho **mọi** client MCP nói stdio (Claude Code, Cursor,
-VS Code, Windsurf, JetBrains, hoặc bất kỳ tool nào có thể spawn một command).
-File này giải thích launcher hoạt động ra sao và cách trỏ từng client vào nó.
+VS Code, Windsurf, JetBrains, Codex CLI, Antigravity, hoặc bất kỳ tool nào có
+thể spawn một command). File này giải thích launcher hoạt động ra sao và cách
+trỏ từng client vào nó.
 
 ## Không muốn clone cả repo? — cài thẳng binary `calm`
 
@@ -128,6 +129,43 @@ cục):
 Cấu hình qua UI settings riêng của JetBrains (không phải file check-in vào
 repo) — trỏ command/args giống hệt snippet Windsurf ở trên (path tuyệt đối
 tới `scripts/mcp-launcher.sh`).
+
+## Codex CLI (OpenAI)
+
+Giống Windsurf/JetBrains — config toàn cục theo user (`~/.codex/config.toml`),
+không có project-level, dùng cú pháp TOML thay vì JSON. Mỗi server là một
+bảng `[mcp_servers.<tên>]`:
+
+```toml
+[mcp_servers.calm]
+command = "bash"
+args = ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
+```
+
+Path tới `mcp-launcher.sh` **phải tuyệt đối**, cùng lý do như Windsurf. Xem
+lại bằng `codex mcp list` hoặc `/mcp` trong Codex TUI. Xem chi tiết:
+[developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
+
+## Antigravity (Google)
+
+Cũng config toàn cục, dùng chung giữa Antigravity IDE và Antigravity CLI, tại
+`~/.gemini/config/mcp_config.json` — cùng shape JSON `mcpServers` như Claude
+Code/Cursor, chỉ khác chỗ đặt file (global, không phải project-level):
+
+```json
+{
+  "mcpServers": {
+    "calm": {
+      "command": "bash",
+      "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
+    }
+  }
+}
+```
+
+Sửa xong lưu file, Antigravity tự reload — không cần restart. Trong IDE cũng
+sửa được qua "..." ở agent panel → "Manage MCP Servers" → "View raw config".
+Path tới `mcp-launcher.sh` vẫn phải tuyệt đối, cùng lý do như Windsurf.
 
 ## Liên quan: race điều kiện lúc cold-start trên Claude Code on the web
 

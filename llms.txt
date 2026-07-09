@@ -23,8 +23,8 @@
 - [README](https://github.com/Eilodon/CALM/blob/main/README.md): quick
   start, the 22 MCP tools, architecture, benchmarks.
 - [docs/mcp-client-setup.md](https://github.com/Eilodon/CALM/blob/main/docs/mcp-client-setup.md):
-  wiring CALM into Claude Code, Cursor, VS Code, Windsurf, JetBrains
-  (Vietnamese).
+  wiring CALM into Claude Code, Cursor, VS Code, Windsurf, JetBrains, Codex
+  CLI, Antigravity (Vietnamese).
 - [docs/comparison.md](https://github.com/Eilodon/CALM/blob/main/docs/comparison.md):
   positioning against other code-graph MCP servers.
 - [npm/README.md](https://github.com/Eilodon/CALM/blob/main/npm/README.md):

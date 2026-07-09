@@ -50,8 +50,9 @@ ai có memory" không còn đúng sau khi test thật ít nhất 1 tool trong nh
   `calm` có call-graph đầy đủ, không phải symbol nông.
 - Bạn muốn agent **tự nhớ** quyết định kiến trúc/gotcha qua nhiều session, không phải giải thích lại
   từ đầu mỗi lần.
-- Bạn dùng nhiều MCP client khác nhau (Claude Code, Cursor, VS Code, Windsurf, JetBrains) và muốn
-  cùng một lớp an toàn/điều hướng hoạt động giống nhau ở mọi nơi, không khoá vào 1 host.
+- Bạn dùng nhiều MCP client khác nhau (Claude Code, Cursor, VS Code, Windsurf, JetBrains, Codex CLI,
+  Antigravity) và muốn cùng một lớp an toàn/điều hướng hoạt động giống nhau ở mọi nơi, không khoá
+  vào 1 host.
 - Bạn coi trọng chạy local, không gọi ra ngoài, không phụ thuộc embedding API trả phí.
 
 ## Khi nào không nên chọn `calm` (hoặc nên cân nhắc thêm)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Universal MCP stdio launcher for the "calm" server — works from any MCP
-# client's config (Claude Code, Cursor, VS Code, Windsurf, JetBrains, or
-# anything else that spawns a command over stdio). See
+# client's config (Claude Code, Cursor, VS Code, Windsurf, JetBrains, Codex
+# CLI, Antigravity, or anything else that spawns a command over stdio). See
 # docs/mcp-client-setup.md for the full rationale and per-client wiring.
 #
 # Resolution order (first usable binary wins, no exceptions):

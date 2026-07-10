@@ -2355,6 +2355,7 @@ mod tests {
             path: None,
             line: None,
             include_metadata: false,
+            if_none_match: None,
         })));
 
         assert_eq!(v["data_source"], "disk");
@@ -2366,6 +2367,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn source_if_none_match_returns_not_modified() {
+        let dir = std::env::temp_dir().join(format!("ci_source_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            symbol: "foo".into(),
+            path: None,
+            line: None,
+            include_metadata: false,
+            if_none_match: None,
+        })));
+        let etag = first["etag"]
+            .as_str()
+            .expect("first call must report an etag")
+            .to_string();
+        assert!(
+            first.get("not_modified").is_none(),
+            "first call has nothing to compare against, must not be not_modified: {first}"
+        );
+        assert!(
+            !first["source"].as_str().unwrap().is_empty(),
+            "first call must include the full source body"
+        );
+
+        let second = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            symbol: "foo".into(),
+            path: None,
+            line: None,
+            include_metadata: false,
+            if_none_match: Some(etag.clone()),
+        })));
+        assert_eq!(second["not_modified"], true, "matching if_none_match must report not_modified: {second}");
+        assert_eq!(second["etag"], etag, "etag must stay stable across calls when content is unchanged");
+        assert_eq!(
+            second["source"], "",
+            "not_modified response must omit the source body: {second}"
+        );
+
+        let stale = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            symbol: "foo".into(),
+            path: None,
+            line: None,
+            include_metadata: false,
+            if_none_match: Some("deadbeefdeadbeef".into()),
+        })));
+        assert!(
+            stale.get("not_modified").is_none(),
+            "a stale/wrong if_none_match must fall through to a full response: {stale}"
+        );
+        assert!(
+            !stale["source"].as_str().unwrap().is_empty(),
+            "a stale if_none_match must still return the full source body"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn source_omits_content_warning_for_clean_code() {
         let dir = std::env::temp_dir().join(format!("ci_source_clean_{}", std::process::id()));
@@ -2389,6 +2460,7 @@ mod tests {
             path: None,
             line: None,
             include_metadata: false,
+            if_none_match: None,
         })));
         assert!(
             v.get("content_warning").is_none(),
@@ -2426,6 +2498,7 @@ mod tests {
             path: None,
             line: None,
             include_metadata: false,
+            if_none_match: None,
         })));
 
         let warning = v["content_warning"]

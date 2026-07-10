@@ -17,7 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 
+use crate::tools::CalmServer;
 use crate::{bootstrap, shutdown_and_checkpoint, Bootstrapped};
 
 /// Runs CALM as a daemon listening on `socket_path`. Returns once shut down
@@ -25,6 +27,13 @@ use crate::{bootstrap, shutdown_and_checkpoint, Bootstrapped};
 /// already wires up); propagates an error if this process couldn't become
 /// the daemon (e.g. bind failed for a reason other than another daemon
 /// already owning the socket).
+/// Check every 60s; after 30 consecutive idle checks (~30 minutes) with no
+/// active connections and a stable (not actively indexing/embedding)
+/// server, shut the daemon down. Hardcoded for v1 — revisit if dogfooding
+/// (M6) shows this is wrong in either direction.
+const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const IDLE_CHECKS_BEFORE_SHUTDOWN: u32 = 30;
+
 pub async fn serve_unix_daemon(
     project_root: PathBuf,
     db_path: PathBuf,
@@ -69,6 +78,44 @@ pub async fn serve_unix_daemon(
 
     let Bootstrapped { server, ct } = bootstrap(project_root, db_path.clone(), preset).await?;
 
+    run_accept_loop(
+        listener,
+        server,
+        ct,
+        IDLE_CHECK_INTERVAL,
+        IDLE_CHECKS_BEFORE_SHUTDOWN,
+    )
+    .await;
+
+    std::fs::remove_file(&socket_path).ok();
+    remove_daemon_meta(&calm_dir);
+    shutdown_and_checkpoint(&db_path);
+    tracing::info!("Daemon shut down cleanly");
+    Ok(())
+}
+
+/// The daemon's whole service lifetime: accept connections, spawn one
+/// `serve_server_with_ct` task per connection, and watch for either
+/// SIGTERM/SIGINT (`ct` cancelled — reuses `bootstrap`'s existing handlers)
+/// or sustained idleness. Extracted from `serve_unix_daemon` (rather than
+/// left inline) so `idle_check_interval`/`idle_checks_before_shutdown` can
+/// be tiny in a test instead of the real 30-minute production values —
+/// counting discrete idle *checks* rather than tracking elapsed wall-clock
+/// time via `Instant` is what makes that swap trivial, no fake-time needed.
+async fn run_accept_loop(
+    listener: tokio::net::UnixListener,
+    server: CalmServer,
+    ct: CancellationToken,
+    idle_check_interval: std::time::Duration,
+    idle_checks_before_shutdown: u32,
+) {
+    let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let phase = server.phase_handle();
+    let embed_status = server.embed_status_handle();
+    let mut idle_ticks: u32 = 0;
+    let mut ticker = tokio::time::interval(idle_check_interval);
+    ticker.tick().await; // first tick fires immediately — discard it so the next one is a full interval away
+
     loop {
         tokio::select! {
             _ = ct.cancelled() => {
@@ -90,6 +137,8 @@ pub async fn serve_unix_daemon(
                 // every connection) is correct.
                 let conn_ct = ct.child_token();
                 let conn_server = server.for_connection();
+                let active = active_connections.clone();
+                active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(async move {
                     match rmcp::service::serve_server_with_ct(conn_server, stream, conn_ct).await {
                         Ok(service) => {
@@ -99,17 +148,53 @@ pub async fn serve_unix_daemon(
                         }
                         Err(e) => tracing::warn!("daemon connection init failed: {e}"),
                     }
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 });
+            }
+            _ = ticker.tick() => {
+                if is_idle(&active_connections, &phase, &embed_status) {
+                    idle_ticks += 1;
+                    if idle_ticks >= idle_checks_before_shutdown {
+                        tracing::info!(
+                            "Daemon idle for {idle_ticks} consecutive checks (~{:?}) — shutting down",
+                            idle_check_interval * idle_ticks
+                        );
+                        break;
+                    }
+                } else {
+                    idle_ticks = 0;
+                }
             }
         }
     }
+}
 
-    drop(listener);
-    std::fs::remove_file(&socket_path).ok();
-    remove_daemon_meta(&calm_dir);
-    shutdown_and_checkpoint(&db_path);
-    tracing::info!("Daemon shut down cleanly");
-    Ok(())
+/// Idle means: zero active connections, AND the background indexer isn't
+/// actively parsing/building edges, AND embeddings aren't actively
+/// downloading/computing. Gating on `phase` alone (an earlier draft's
+/// mistake, caught before writing this) would let the idle-timeout evict a
+/// daemon mid-embed — `phase` can already read `Ready` while
+/// `bootstrap_embeddings` is still running on a separate track, since
+/// embeddings start only *after* the graph is built.
+fn is_idle(
+    active_connections: &std::sync::atomic::AtomicUsize,
+    phase: &std::sync::Arc<std::sync::RwLock<calm_core::types::IndexingPhase>>,
+    embed_status: &std::sync::Arc<std::sync::RwLock<calm_core::types::EmbedStatus>>,
+) -> bool {
+    use calm_core::types::{EmbedStatus, IndexingPhase};
+
+    if active_connections.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return false;
+    }
+    let phase_stable = matches!(
+        *phase.read().unwrap(),
+        IndexingPhase::Ready | IndexingPhase::Failed
+    );
+    let embed_stable = !matches!(
+        *embed_status.read().unwrap(),
+        EmbedStatus::Downloading | EmbedStatus::Embedding
+    );
+    phase_stable && embed_stable
 }
 
 #[cfg(unix)]
@@ -609,6 +694,108 @@ mod tests {
         );
 
         accept_task.abort();
+        let _ = std::fs::remove_dir_all(&calm_dir);
+    }
+
+    fn idle_test_server(calm_dir: &std::path::Path) -> CalmServer {
+        CalmServer::new(calm_dir.to_path_buf(), calm_dir.join("index.db")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_accept_loop_shuts_down_after_sustained_idle() {
+        let (calm_dir, socket_path) = test_dirs("idle_shutdown");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = idle_test_server(&calm_dir);
+        // `CalmServer::new` starts life in `IndexingPhase::Scanning` (matches
+        // real startup, before any indexing has run) — explicitly advance to
+        // `Ready` so this test exercises the "genuinely idle" case, not the
+        // "never got a chance to be idle" case `embed_status` defaults
+        // (`Disabled`) already cover correctly on their own.
+        *server.phase_handle().write().unwrap() = calm_core::types::IndexingPhase::Ready;
+        let ct = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_accept_loop(
+                listener,
+                server,
+                ct,
+                std::time::Duration::from_millis(20),
+                2,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_accept_loop must exit on its own once idle for \
+             idle_checks_before_shutdown consecutive checks"
+        );
+
+        let _ = std::fs::remove_dir_all(&calm_dir);
+    }
+
+    #[tokio::test]
+    async fn run_accept_loop_does_not_shut_down_while_indexing_is_active() {
+        let (calm_dir, socket_path) = test_dirs("idle_indexing_guard");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = idle_test_server(&calm_dir);
+        *server.phase_handle().write().unwrap() = calm_core::types::IndexingPhase::Scanning;
+        let ct = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_accept_loop(
+                listener,
+                server,
+                ct,
+                std::time::Duration::from_millis(20),
+                2,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an actively-Scanning phase must never be treated as idle, no \
+             matter how many idle checks pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&calm_dir);
+    }
+
+    #[tokio::test]
+    async fn run_accept_loop_does_not_shut_down_with_an_active_connection() {
+        let (calm_dir, socket_path) = test_dirs("idle_connection_guard");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = idle_test_server(&calm_dir);
+        let ct = CancellationToken::new();
+
+        // Held open for the whole test, never speaks MCP — the accept
+        // itself must still count as "active" and block the idle-timeout,
+        // since the resulting `serve_server_with_ct` task just sits waiting
+        // to read a message that never comes, exactly like a real client
+        // that connected but hasn't sent its next request yet.
+        let _held = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_accept_loop(
+                listener,
+                server,
+                ct,
+                std::time::Duration::from_millis(20),
+                2,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a live (even MCP-silent) connection must block the idle-timeout \
+             from ever firing"
+        );
+
         let _ = std::fs::remove_dir_all(&calm_dir);
     }
 }

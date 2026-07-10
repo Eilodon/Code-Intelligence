@@ -63,6 +63,17 @@ tree-sitter-kotlin-ng = "=1.1.0"
 # AST-dump test. 0.7.0 is the newest version still on ABI 14; same Rust API
 # shape (`LANGUAGE` const) as 0.7.3, confirmed by diffing bindings/rust/lib.rs.
 tree-sitter-swift = "=0.7.0"
+# Phase C (2026-07-11, docs/superskills/plans/2026-07-10-25-language-expansion.md):
+# same ABI-cliff pattern as swift/csharp above, verified the same way (grep
+# generated src/parser.c's LANGUAGE_VERSION at each GitHub release tag, not
+# trusted from the version number alone). tree-sitter-scala 0.24.1 is ABI 14
+# (compatible); 0.25.0 (2026-xx) regenerated with a newer tree-sitter-cli and
+# jumped straight to ABI 15 (incompatible with this workspace's 0.24.7
+# runtime). 0.24.1, not 0.24.0, is the newest ABI-14 release. Real dependency
+# (crates.io dependency API, not assumed) is `tree-sitter-language ^0.1`
+# (normal) — `tree-sitter` itself is only a dev-dependency there, so it
+# doesn't propagate to us.
+tree-sitter-scala = "=0.24.1"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"

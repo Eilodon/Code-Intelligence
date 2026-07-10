@@ -204,6 +204,15 @@ fn ts_lang_r() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-scala")]
+fn ts_lang_scala() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_scala::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-scala"))]
+fn ts_lang_scala() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -850,6 +859,72 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
         modifier_keywords: &[],
         shallow_detect: Some(crate::indexer::parser::detect_r),
+    },
+    // Scala (Phase C, 2026-07-11): verified against the real grammar
+    // (tree-sitter-scala 0.24.1, pinned below its published latest 0.26.0
+    // for an ABI-14-vs-15 reason — see the workspace root Cargo.toml
+    // comment) via a throwaway AST-dump test on a fixture covering a class
+    // with a constructor param, a bare call, a receiver call (`this.foo()`),
+    // an `object` singleton, a `trait`, and a `case class`. Unlike
+    // Kotlin/Swift, `call_expression` DOES carry a real "function" field
+    // (confirmed via node-types.json) for both bare and receiver calls —
+    // no `"$first_child"` sentinel needed here.
+    LanguageSpec {
+        name: "scala",
+        aliases: &[],
+        extensions: &["scala", "sc"],
+        constants: LangConstants {
+            function_node_types: &[
+                "function_definition",
+                // Abstract trait member (`def name: String` with no body) —
+                // a distinct node kind from `function_definition`, confirmed
+                // via node-types.json.
+                "function_declaration",
+                "class_definition",
+                "object_definition",
+                "trait_definition",
+            ],
+            name_field: "name",
+            // ScalaDoc (`/** ... */`) — node-types.json confirms two comment
+            // kinds exist, "comment" (line, `//`) and "block_comment" (`/*
+            // ... */`), same split as Kotlin.
+            docstring_type: Some("block_comment"),
+            call_node_types: &["call_expression"],
+            call_function_field: "function",
+            call_function_field_by_kind: &[],
+            class_node_types: &["class_definition", "object_definition", "trait_definition"],
+            class_name_field: "name",
+        },
+        ts_language: ts_lang_scala,
+        branch_node_kinds: &[
+            "if_expression",
+            "while_expression",
+            "do_while_expression",
+            "for_expression",
+            "case_clause",
+            "catch_clause",
+        ],
+        decorator_node_kinds: &["annotation"],
+        // No binding_kinds entry (scope cut, same as kotlin/swift/ruby/shell/r
+        // above) — Scala's `val x: Foo = ...` type inference would need its
+        // own binding_names_and_type arm, not just a binding_kinds list entry.
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        // "case " so `case class`/`case object` reduce to the plain
+        // `class `/`object ` prefix `detect_scala`'s class_kws loop matches;
+        // "sealed " so `sealed trait`/`sealed class` do too.
+        modifier_keywords: &[
+            "private ",
+            "protected ",
+            "override ",
+            "final ",
+            "sealed ",
+            "abstract ",
+            "implicit ",
+            "lazy ",
+            "case ",
+        ],
+        shallow_detect: Some(crate::indexer::parser::detect_scala),
     },
 ];
 

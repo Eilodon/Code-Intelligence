@@ -51,6 +51,11 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         "struct_declaration" => SymbolKind::Struct, // C#
         "trait_item" => SymbolKind::Trait,
         "trait_declaration" => SymbolKind::Trait, // PHP
+        // Scala: `trait Named { ... }` — confirmed via real grammar
+        // (tree-sitter-scala 0.24.1) node-types.json, distinct node kind
+        // from `class_definition`/`object_definition`. Same category as
+        // PHP's trait_declaration above.
+        "trait_definition" => SymbolKind::Trait,
         // Reachable only if `resolve_name_node` ever grows an `impl_item` case (it
         // currently doesn't: `impl_item` has no `name` field, only `type`/`trait`).
         // `impl_item` stays in Rust's `function_node_types` purely so its children
@@ -69,6 +74,11 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // unit tests (which never call this function on kotlin/swift input)
         // can't catch.
         "object_declaration" => SymbolKind::Class,
+        // Scala's `object Main { ... }` — same singleton concept as
+        // Kotlin's `object_declaration` above, same treatment. Verified via
+        // real grammar AST dump, not guessed — see this bug class's history
+        // right above.
+        "object_definition" => SymbolKind::Class,
         // Swift's `protocol` is exactly Swift's version of an interface —
         // same category of gap as `object_declaration` above, found the
         // same way (`Named` reported as `SymbolKind::Function` on a real
@@ -104,7 +114,10 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // Plain function nodes: Method when inside a class/impl, Function otherwise.
         // Also covers TS/JS `generator_function_declaration` (see
         // lang_constants.rs) — a generator is still a plain function/method
-        // for this index's purposes, no dedicated kind needed.
+        // for this index's purposes, no dedicated kind needed. Also covers
+        // Scala's `function_definition`/`function_declaration` (abstract
+        // trait member) — no dedicated kind needed there either, same
+        // reasoning.
         _ => {
             if in_class {
                 SymbolKind::Method
@@ -114,7 +127,6 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         }
     }
 }
-
 /// Parse `source` for a tier-0 `language` into a tree-sitter tree, or `None` if
 /// the language is unsupported or parsing fails. Single source of the per-language
 /// grammar mapping.
@@ -1949,6 +1961,32 @@ fn r_ident_at_start(s: &str) -> Option<String> {
     }
     Some(name.to_string())
 }
+
+// Scala: modifiers ("private "/"sealed "/"case "/etc.) are stripped by
+// `strip_modifiers` (via LanguageSpec::modifier_keywords) before this runs,
+// so "sealed trait X"/"case class Y" both reduce to a plain "trait X"/
+// "class Y" the class_kws loop below can match directly — verified against
+// the real grammar (tree-sitter-scala 0.24.1) node-types.json, same as the
+// tree-sitter path's LangConstants entry in lang_constants.rs.
+pub(crate) fn detect_scala(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("def ") {
+        let name = ident_at_start(rest.trim_start())?;
+        return Some((name, SymbolKind::Function));
+    }
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("object ", SymbolKind::Class),
+        ("trait ", SymbolKind::Trait),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3315,6 +3353,70 @@ public class FooTest {
         );
     }
 
+    #[test]
+    #[cfg(feature = "lang-scala")]
+    fn test_tier0_5_grammar_loads_scala() {
+        assert!(
+            parse_tree("def main(): Unit = {}", "scala").is_some(),
+            "tree-sitter-scala grammar should load and parse — locks the pinned ABI (=0.24.1, ABI 14); \
+             a caret-range bump to 0.25.0+ (ABI 15) would silently regress this to shallow line-scan"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-scala")]
+    fn test_scala_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "class Greeter {\n  def hello(): Unit = {\n    println(\"hi\")\n    this.logIt()\n  }\n  def logIt(): Unit = {}\n}\nobject Singleton {\n  def instance(): Unit = {}\n}\ntrait Named {\n  def name: String\n}\n";
+        let symbols = extract_symbols(code, "scala", "a.scala").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"hello"), "should detect method");
+        // Same bug class as Kotlin's object_declaration / Swift's
+        // protocol_declaration above (see those tests' comments) — asserting
+        // `kind`, not just presence-by-name, is what would have caught it.
+        let singleton = symbols
+            .iter()
+            .find(|s| s.name == "Singleton")
+            .expect("should detect object definition");
+        assert_eq!(
+            singleton.kind,
+            SymbolKind::Class,
+            "Scala `object` should map to SymbolKind::Class, not the generic Function/Method fallback"
+        );
+        let named = symbols
+            .iter()
+            .find(|s| s.name == "Named")
+            .expect("should detect trait definition");
+        assert_eq!(
+            named.kind,
+            SymbolKind::Trait,
+            "Scala `trait` should map to SymbolKind::Trait, not the generic Function/Method fallback"
+        );
+        let calls = extract_calls(code, "scala", "a.scala").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "hello" && c.callee == "println"),
+            "bare call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "hello"
+                && c.callee == "logIt"
+                && c.receiver.as_deref() == Some("this")),
+            "receiver-qualified call should produce a call edge with receiver: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_shallow_scala() {
+        let code = "case class User(name: String)\ndef greet(user: User): Unit = {}\nsealed trait Repository\nobject Singleton\n";
+        let syms = extract_symbols_shallow(code, "scala", "a.scala");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"User"), "should detect case class");
+        assert!(names.contains(&"greet"), "should detect def");
+        assert!(names.contains(&"Repository"), "should detect sealed trait");
+        assert!(names.contains(&"Singleton"), "should detect object");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";

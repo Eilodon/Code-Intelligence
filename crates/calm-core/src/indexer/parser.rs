@@ -119,42 +119,11 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
 /// the language is unsupported or parsing fails. Single source of the per-language
 /// grammar mapping.
 pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
-    let lang: tree_sitter::Language = match language {
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        // Tier-0.5: optional grammar crates, each gated by a Cargo feature.
-        #[cfg(feature = "lang-ruby")]
-        "ruby" => tree_sitter_ruby::LANGUAGE.into(),
-        #[cfg(feature = "lang-php")]
-        "php" => tree_sitter_php::LANGUAGE_PHP.into(),
-        // kotlin/swift (2026-07-10): real grammars, not the old no-op stubs —
-        // see lang_constants.rs's "kotlin"/"swift" arms for the AST-dump
-        // verification that corrected several never-tested field guesses.
-        #[cfg(feature = "lang-kotlin")]
-        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
-        #[cfg(feature = "lang-swift")]
-        "swift" => tree_sitter_swift::LANGUAGE.into(),
-        #[cfg(feature = "lang-csharp")]
-        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
-        #[cfg(feature = "lang-shell")]
-        "shell" | "bash" => tree_sitter_bash::LANGUAGE.into(),
-        #[cfg(feature = "lang-c")]
-        "c" => tree_sitter_c::LANGUAGE.into(),
-        #[cfg(feature = "lang-cpp")]
-        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
-        #[cfg(feature = "lang-r")]
-        "r" => tree_sitter_r::LANGUAGE.into(),
-        _ => return None,
-    };
+    let lang = (crate::indexer::lang_constants::find_spec(language)?.ts_language)()?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang).ok()?;
     parser.parse(source, None)
 }
-
 pub fn extract_symbols(
     source: &str,
     language: &str,
@@ -509,13 +478,9 @@ fn go_receiver_type(node: tree_sitter::Node, source: &str) -> Option<String> {
 /// as `annotation`. TS/JS decorators (`@Controller()`, `@Injectable()`, ...)
 /// parse as a single `decorator` node, same shape as Python's.
 fn decorator_node_kinds(language: &str) -> &'static [&'static str] {
-    match language {
-        "python" => &["decorator"],
-        "rust" => &["attribute_item"],
-        "java" => &["marker_annotation", "annotation"],
-        "javascript" | "typescript" => &["decorator"],
-        _ => &[],
-    }
+    crate::indexer::lang_constants::find_spec(language)
+        .map(|spec| spec.decorator_node_kinds)
+        .unwrap_or(&[])
 }
 
 /// Source text of every decorator/attribute immediately preceding `node`
@@ -1314,40 +1279,14 @@ pub fn extract_type_map_from_tree(
     // different modules sharing both a field name and a method name could
     // only be told apart by same-file/same-language heuristics, not by the
     // field's actual declared type.
-    let binding_kinds: &[&str] = match language {
-        "python" => &["typed_parameter"],
-        "typescript" => &[
-            "required_parameter",
-            "optional_parameter",
-            "public_field_definition",
-            "property_signature",
-        ],
-        "rust" => &["parameter", "let_declaration", "field_declaration"],
-        "go" => &["parameter_declaration", "var_spec", "field_declaration"],
-        "java" => &["formal_parameter", "field_declaration"],
-        // C/C++: local variable declarations (`Circle *c;`) and struct/class
-        // field declarations (`Circle *c;` inside a `class`/`struct` body)
-        // share the same `type`+`declarator` shape — see
-        // `binding_names_and_type`'s "c" | "cpp" arm for how the name is
-        // pulled out of the (possibly pointer-wrapped) declarator.
-        "c" | "cpp" => &["declaration", "field_declaration"],
-        // C#: confirmed via the real grammar that `field_declaration` and
-        // `local_declaration_statement` both just wrap one
-        // `variable_declaration` node (which itself carries the `type`
-        // field directly) — matching that one inner node kind covers both
-        // fields and locals, no separate `field_declaration`/
-        // `local_declaration_statement` arm needed. `parameter` names/types
-        // itself directly and falls through to the generic arm below.
-        "csharp" => &["parameter", "variable_declaration"],
-        // PHP: typed property declarations (`private Foo $helper;`) and
-        // simple typed parameters (`function m(Foo $x)`) — confirmed via
-        // the real grammar that both have their type directly on a "type"
-        // field (a `named_type` node whose own text is just the bare class
-        // name, e.g. "Foo" — no unwrapping needed unlike C's struct_specifier).
-        // Untyped `$x = new Foo();` locals are handled separately below
-        // (constructor inference), not through this generic path.
-        "php" => &["simple_parameter", "property_declaration"],
-        _ => return map, // javascript: no static annotations
+    // Per-language binding node kinds now live in `LanguageSpec::binding_kinds`
+    // (crates/calm-core/src/indexer/lang_constants.rs) — see each entry's own
+    // doc comment there for why a given node kind was chosen per language.
+    let Some(binding_kinds) = crate::indexer::lang_constants::find_spec(language)
+        .map(|spec| spec.binding_kinds)
+        .filter(|kinds| !kinds.is_empty())
+    else {
+        return map; // no static-annotation binding kinds for this language (e.g. javascript), or unrecognized
     };
 
     let mut stack = vec![tree.root_node()];
@@ -1729,85 +1668,7 @@ fn ident_before_paren(s: &str) -> Option<String> {
 
 /// Strip common visibility / storage modifier prefixes so the structural
 /// keyword (`class`, `func`, `def`, …) appears at position 0.
-fn strip_modifiers<'a>(s: &'a str, language: &str) -> &'a str {
-    let modifiers: &[&str] = match language {
-        "csharp" => &[
-            "public ",
-            "private ",
-            "protected ",
-            "internal ",
-            "static ",
-            "abstract ",
-            "virtual ",
-            "override ",
-            "sealed ",
-            "async ",
-            "partial ",
-            "readonly ",
-            "new ",
-            "extern ",
-            "unsafe ",
-            "volatile ",
-        ],
-        "kotlin" => &[
-            "public ",
-            "private ",
-            "protected ",
-            "internal ",
-            "open ",
-            "abstract ",
-            "final ",
-            "override ",
-            "data ",
-            "inline ",
-            "suspend ",
-            "companion ",
-            "tailrec ",
-            "operator ",
-            "infix ",
-            "external ",
-        ],
-        "swift" => &[
-            "public ",
-            "private ",
-            "internal ",
-            "fileprivate ",
-            "open ",
-            "static ",
-            "override ",
-            "mutating ",
-            "nonmutating ",
-            "lazy ",
-            "final ",
-            "required ",
-            "convenience ",
-            "dynamic ",
-            "optional ",
-        ],
-        "php" => &[
-            "public ",
-            "private ",
-            "protected ",
-            "static ",
-            "abstract ",
-            "final ",
-        ],
-        "cpp" | "c" => &[
-            "static ",
-            "inline ",
-            "virtual ",
-            "explicit ",
-            "constexpr ",
-            "const ",
-            "extern ",
-            "volatile ",
-            "friend ",
-            "override ",
-            "final ",
-            "noexcept ",
-        ],
-        _ => &[],
-    };
+fn strip_modifiers<'a>(s: &'a str, modifiers: &[&str]) -> &'a str {
     let mut s = s;
     loop {
         let prev = s;
@@ -1845,7 +1706,7 @@ const C_SKIP: &[&str] = &[
     "default",
 ];
 
-fn detect_c_cpp(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_c_cpp(s: &str) -> Option<(String, SymbolKind)> {
     // Struct/class/namespace/union/enum
     let class_kws: &[(&str, SymbolKind)] = &[
         ("class ", SymbolKind::Class),
@@ -1885,7 +1746,7 @@ fn detect_c_cpp(s: &str) -> Option<(String, SymbolKind)> {
     Some((name, SymbolKind::Function))
 }
 
-fn detect_csharp(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_csharp(s: &str) -> Option<(String, SymbolKind)> {
     let class_kws: &[(&str, SymbolKind)] = &[
         ("class ", SymbolKind::Class),
         ("interface ", SymbolKind::Interface),
@@ -1930,7 +1791,7 @@ fn detect_csharp(s: &str) -> Option<(String, SymbolKind)> {
     None
 }
 
-fn detect_ruby(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_ruby(s: &str) -> Option<(String, SymbolKind)> {
     if let Some(rest) = s.strip_prefix("def ") {
         // `def name` or `def self.name` or `def ClassName.name`
         let name_part = rest.trim_start();
@@ -1951,7 +1812,7 @@ fn detect_ruby(s: &str) -> Option<(String, SymbolKind)> {
     None
 }
 
-fn detect_shell(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_shell(s: &str) -> Option<(String, SymbolKind)> {
     // `function name` or `function name()` or `name()` at line start
     if let Some(rest) = s.strip_prefix("function ") {
         let name = ident_at_start(rest.trim_start())?;
@@ -1970,7 +1831,7 @@ fn detect_shell(s: &str) -> Option<(String, SymbolKind)> {
     None
 }
 
-fn detect_kotlin(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_kotlin(s: &str) -> Option<(String, SymbolKind)> {
     if let Some(rest) = s.strip_prefix("fun ") {
         let name = ident_at_start(rest.trim_start())?;
         return Some((name, SymbolKind::Function));
@@ -1994,7 +1855,7 @@ fn detect_kotlin(s: &str) -> Option<(String, SymbolKind)> {
     None
 }
 
-fn detect_swift(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_swift(s: &str) -> Option<(String, SymbolKind)> {
     if let Some(rest) = s.strip_prefix("func ") {
         let name = ident_at_start(rest.trim_start())?;
         return Some((name, SymbolKind::Function));
@@ -2017,7 +1878,7 @@ fn detect_swift(s: &str) -> Option<(String, SymbolKind)> {
     None
 }
 
-fn detect_php(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_php(s: &str) -> Option<(String, SymbolKind)> {
     if let Some(rest) = s.strip_prefix("function ") {
         // `function &name(` — strip leading `&`
         let rest = rest.trim_start().trim_start_matches('&');
@@ -2043,17 +1904,11 @@ fn detect_php(s: &str) -> Option<(String, SymbolKind)> {
 }
 
 fn is_comment_line(trimmed: &str, language: &str) -> bool {
-    match language {
-        "ruby" | "shell" | "bash" | "php" => {
-            trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with('*')
-        }
-        _ => {
-            trimmed.starts_with("//")
-                || trimmed.starts_with('*')
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with('#')
-        }
-    }
+    const DEFAULT_PREFIXES: &[&str] = &["//", "*", "/*", "#"];
+    let prefixes = crate::indexer::lang_constants::find_spec(language)
+        .map(|spec| spec.line_comment_prefixes)
+        .unwrap_or(DEFAULT_PREFIXES);
+    prefixes.iter().any(|p| trimmed.starts_with(p))
 }
 
 // R has no dedicated function-declaration keyword: `name <- function(...)`
@@ -2061,7 +1916,7 @@ fn is_comment_line(trimmed: &str, language: &str) -> bool {
 // resolves this precisely via `resolve_name_node`'s "binary_operator" arm;
 // this line-scan fallback only approximates the common left-assign forms
 // (no `->` right-assign support — rare enough in practice to skip here).
-fn detect_r(s: &str) -> Option<(String, SymbolKind)> {
+pub(crate) fn detect_r(s: &str) -> Option<(String, SymbolKind)> {
     for sep in ["<<-", "<-", "="] {
         let Some(idx) = s.find(sep) else { continue };
         let lhs = s[..idx].trim();
@@ -2095,18 +1950,9 @@ fn r_ident_at_start(s: &str) -> Option<String> {
     Some(name.to_string())
 }
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
-    let s = strip_modifiers(trimmed, language);
-    match language {
-        "c" | "cpp" => detect_c_cpp(s),
-        "csharp" => detect_csharp(s),
-        "ruby" => detect_ruby(s),
-        "shell" | "bash" => detect_shell(s),
-        "kotlin" => detect_kotlin(s),
-        "swift" => detect_swift(s),
-        "php" => detect_php(s),
-        "r" => detect_r(s),
-        _ => None,
-    }
+    let spec = crate::indexer::lang_constants::find_spec(language)?;
+    let s = strip_modifiers(trimmed, spec.modifier_keywords);
+    spec.shallow_detect.and_then(|f| f(s))
 }
 
 /// Lightweight line-scan symbol extraction for Tier-0.5 languages (those

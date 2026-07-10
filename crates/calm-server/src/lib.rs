@@ -68,11 +68,32 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
     serve_stdio_with_preset(project_root, db_path, "full".into()).await
 }
 
-pub async fn serve_stdio_with_preset(
+/// Bundle returned by `bootstrap`: a fully-constructed `CalmServer` (index/
+/// watcher/embeddings already started in the background) plus the master
+/// `CancellationToken` that drives graceful shutdown. Callers choose what to
+/// do with `ct`: `serve_stdio_with_preset` moves it directly into
+/// `serve_server_with_ct` (today's 1-client-per-process shape, where the
+/// service's own lifetime IS the shutdown token's lifetime); a daemon-style
+/// caller instead keeps `ct` as its own accept-loop-lifetime token and hands
+/// out `ct.child_token()` per connection, so one connection closing can't
+/// cancel every other session sharing the daemon.
+pub struct Bootstrapped {
+    pub server: CalmServer,
+    pub ct: CancellationToken,
+}
+
+/// Everything `serve_stdio_with_preset` used to do before touching a
+/// transport: construct `CalmServer`, install SIGINT/SIGTERM handlers on a
+/// fresh `CancellationToken`, and kick off the background indexer/embedder/
+/// watcher. Extracted so a non-stdio transport (a daemon accept loop) can
+/// reuse this exact bootstrap sequence instead of duplicating it — see
+/// `Bootstrapped`'s doc comment for how the two tails differ in what they do
+/// with the returned `ct`.
+pub async fn bootstrap(
     project_root: PathBuf,
     db_path: PathBuf,
     preset: String,
-) -> Result<()> {
+) -> Result<Bootstrapped> {
     calm_core::gitignore::ensure_gitignore(&project_root)?;
 
     let server = CalmServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
@@ -384,30 +405,28 @@ pub async fn serve_stdio_with_preset(
         }
     });
 
-    let transport = stdio();
-    let service: rmcp::service::RunningService<rmcp::RoleServer, _> =
-        rmcp::service::serve_server_with_ct(server, transport, ct)
-            .await
-            .map_err(|e| anyhow::anyhow!("Server init error: {e}"))?;
+    Ok(Bootstrapped { server, ct })
+}
 
-    service
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Best-effort: reclaim WAL space on a clean shutdown rather than leaving
-    // it to sit around until SQLite's own passive auto-checkpoint happens to
-    // fire — which never runs at all while any connection (including a
-    // lock-loser process that never got a shutdown signal — see the SIGTERM
-    // handler above) still holds an old read snapshot open. Any process may
-    // request a checkpoint regardless of indexer-lock ownership; it's a
-    // WAL-level operation, harmless and idempotent when there's nothing to
-    // reclaim. TRUNCATE can only partially complete ("busy") if another
-    // connection is concurrently active, which is not an error — a missed or
-    // partial checkpoint here just means the next one (from this process or
-    // another) reclaims the rest. This cannot help against SIGKILL, which no
-    // userspace code can intercept on any OS; that gap is inherent, not a bug.
-    if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+/// Best-effort: reclaim WAL space on a clean shutdown rather than leaving
+/// it to sit around until SQLite's own passive auto-checkpoint happens to
+/// fire — which never runs at all while any connection (including a
+/// lock-loser process that never got a shutdown signal — see the SIGTERM
+/// handler above) still holds an old read snapshot open. Any process may
+/// request a checkpoint regardless of indexer-lock ownership; it's a
+/// WAL-level operation, harmless and idempotent when there's nothing to
+/// reclaim. TRUNCATE can only partially complete ("busy") if another
+/// connection is concurrently active, which is not an error — a missed or
+/// partial checkpoint here just means the next one (from this process or
+/// another) reclaims the rest. This cannot help against SIGKILL, which no
+/// userspace code can intercept on any OS; that gap is inherent, not a bug.
+///
+/// Called exactly once per server lifetime: at the end of the single stdio
+/// session for `serve_stdio_with_preset`, or once at daemon accept-loop exit
+/// for a daemon — never per-connection, since the checkpoint belongs to the
+/// shared DB writer's lifetime, not any individual session's.
+fn shutdown_and_checkpoint(db_path: &std::path::Path) {
+    if let Ok(conn) = calm_core::db::conn::open_writer(db_path) {
         match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -421,11 +440,31 @@ pub async fn serve_stdio_with_preset(
             Err(e) => tracing::warn!("WAL checkpoint on shutdown failed (non-fatal): {e}"),
         }
     }
+}
+
+pub async fn serve_stdio_with_preset(
+    project_root: PathBuf,
+    db_path: PathBuf,
+    preset: String,
+) -> Result<()> {
+    let Bootstrapped { server, ct } = bootstrap(project_root, db_path.clone(), preset).await?;
+
+    let transport = stdio();
+    let service: rmcp::service::RunningService<rmcp::RoleServer, _> =
+        rmcp::service::serve_server_with_ct(server, transport, ct)
+            .await
+            .map_err(|e| anyhow::anyhow!("Server init error: {e}"))?;
+
+    service
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    shutdown_and_checkpoint(&db_path);
 
     tracing::info!("Server shut down cleanly");
     Ok(())
-}/// True when semantic search should stop before ever attempting a network
-/// call: the configured model is the vendored default, that vendored asset
+}/// call: the configured model is the vendored default, that vendored asset
 /// is unusable (see `calm_core::embedding::default_vendored_asset_unusable`),
 /// and the config has not opted into a network fallback. Pulled out as a
 /// pure function (taking the three already-evaluated booleans, not

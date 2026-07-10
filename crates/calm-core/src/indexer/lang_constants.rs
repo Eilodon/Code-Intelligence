@@ -123,11 +123,21 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
         }),
         // Tier-0.5 — full tree-sitter parsing when the optional grammar feature is enabled.
         // LangConstants are always present; parse_tree gates the actual grammar behind the flag.
+        // Ruby: call-graph extraction was silently 100% broken until
+        // 2026-07-10 — this arm declared `call_node_types: &["method_call"]`,
+        // but the vendored grammar (`tree-sitter-ruby`) has no node kind
+        // named "method_call" at all; confirmed by reading its own
+        // `node-types.json` directly. The real call node is named `"call"`
+        // (it does carry a `"method"` field, so `call_function_field` below
+        // was already correct — only the node-kind string was wrong).
+        // Verified via empirical re-index of a real fixture before/after:
+        // `call_edges`/`call_sites` were 0 rows for every Ruby call, with or
+        // without parens/an explicit receiver, before this fix.
         "ruby" => Some(LangConstants {
             function_node_types: &["method", "singleton_method", "class", "module"],
             name_field: "name",
             docstring_type: Some("comment"),
-            call_node_types: &["method_call"],
+            call_node_types: &["call"],
             call_function_field: "method",
             call_function_field_by_kind: &[],
             class_node_types: &["class", "module"],

@@ -36,6 +36,18 @@ enum Commands {
         #[arg(long)]
         listen: Option<String>,
     },
+    /// Thin forwarder: connect to (or spawn, if none is live or the live
+    /// one is a stale build) the shared daemon for `project_root`, then
+    /// relay stdin<->socket verbatim — no MCP/JSON-RPC parsing here at all.
+    /// This is what a launcher script points an MCP client's stdio at
+    /// instead of `calm serve` to get the daemon's N-processes-collapse-to-
+    /// one behavior (ADR-0005). Unix-only.
+    #[cfg(unix)]
+    Connect {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+    },
     /// One-shot index of the project
     Index {
         /// Project root directory
@@ -204,6 +216,10 @@ async fn main() -> Result<()> {
                 effective_preset
             );
             calm_server::serve_stdio_with_preset(root, db, effective_preset).await?;
+        }
+        #[cfg(unix)]
+        Commands::Connect { project_root } => {
+            calm_server::daemon::connect_or_spawn(project_root).await?;
         }
         Commands::Index {
             project_root,

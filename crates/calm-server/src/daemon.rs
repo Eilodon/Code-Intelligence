@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::{bootstrap, current_git_head_short, shutdown_and_checkpoint, Bootstrapped};
+use crate::{bootstrap, shutdown_and_checkpoint, Bootstrapped};
 
 /// Runs CALM as a daemon listening on `socket_path`. Returns once shut down
 /// cleanly (SIGINT/SIGTERM via the same `CancellationToken` `bootstrap`
@@ -31,10 +31,25 @@ pub async fn serve_unix_daemon(
     preset: String,
     socket_path: PathBuf,
 ) -> Result<()> {
-    let calm_dir = socket_path
-        .parent()
-        .map(Path::to_path_buf)
-        .context("--listen socket path has no parent directory")?;
+    // Deliberately `project_root.join(".calm")`, NOT `socket_path.parent()`:
+    // `connect_or_spawn`'s `resolve_socket_path` can fall back to a short
+    // path outside the project (e.g. `/tmp/calm-<hash>.sock`) when the
+    // natural `.calm/daemon.sock` would exceed a unix socket's path-length
+    // limit. Deriving `calm_dir` from the socket's parent in that case would
+    // (a) write `daemon.meta`/`daemon-spawn.lock` into a directory shared by
+    // every project using the fallback instead of this project's own
+    // `.calm/`, breaking the version handshake (`calm connect` looks for
+    // `daemon.meta` under the *project's* `.calm/`, per `connect_or_spawn`)
+    // and conflating spawn-arbitration across unrelated projects, and (b)
+    // for a bare `/tmp` fallback specifically, hand `create_calm_dir` a
+    // `mode(0o700)` `create()` call against `/tmp` itself — harmless only
+    // because `/tmp` already exists so the `AlreadyExists` branch short-
+    // circuits before any chmod, but one directory-layout accident away from
+    // trying to lock down a directory every other process on the system
+    // depends on being world-writable. Caught via manual smoke-testing this
+    // exact fallback path, not by inspection — both classes of bug only
+    // showed up once the socket path actually diverged from `.calm/`.
+    let calm_dir = project_root.join(".calm");
     create_calm_dir(&calm_dir)?;
 
     let listener = match bind_or_yield(&calm_dir, &socket_path).await? {
@@ -48,7 +63,7 @@ pub async fn serve_unix_daemon(
     };
     set_socket_perms(&socket_path)?;
 
-    write_daemon_meta(&calm_dir, &project_root)?;
+    write_daemon_meta(&calm_dir)?;
 
     tracing::info!("Daemon listening on {}", socket_path.display());
 
@@ -196,17 +211,257 @@ fn set_socket_perms(socket_path: &Path) -> Result<()> {
 /// silently running old code for a whole session — ADR-0005 §9's
 /// version-skew risk. Written eagerly here (before the read side exists)
 /// so that milestone needs no daemon-side change.
-fn write_daemon_meta(calm_dir: &Path, project_root: &Path) -> Result<()> {
-    let meta = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "git_sha": current_git_head_short(project_root),
-    });
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DaemonMeta {
+    /// `CARGO_PKG_VERSION` — a cheap first-pass signal, but not sufficient
+    /// alone: this string doesn't change between commits that don't bump
+    /// it, which is most of them.
+    version: String,
+    /// `calm_core::BUILD_INFO` — the CALM *source repo's* git SHA (+
+    /// `-dirty` if built with uncommitted changes) baked in at compile time
+    /// by `calm-core/build.rs`. Deliberately NOT `current_git_head_short`
+    /// of the *target* `project_root` being served — that reflects the
+    /// project being indexed, not which `calm` build produced this daemon,
+    /// and would be nonsensical to compare against a forwarder's own build
+    /// identity (an early version of this function made exactly that
+    /// mistake). This is the same mechanism `ci doctor`/`--version` already
+    /// use to answer "what commit is this binary actually running".
+    build_info: String,
+    /// This daemon process's own PID, so a forwarder that detects a stale
+    /// build can ask it to shut down (best-effort SIGTERM) before spawning
+    /// a replacement — see `connect_or_spawn`'s version-handshake logic.
+    pid: u32,
+}
+
+impl DaemonMeta {
+    fn is_current(&self) -> bool {
+        self.version == env!("CARGO_PKG_VERSION") && self.build_info == calm_core::BUILD_INFO
+    }
+}
+
+/// Sidecar written next to the socket: this daemon's build identity, so a
+/// future `calm connect` can detect it's talking to a stale daemon (a
+/// binary rebuilt after the daemon was spawned) and respawn instead of
+/// silently running old code for a whole session — ADR-0005 §9's
+/// version-skew risk.
+fn write_daemon_meta(calm_dir: &Path) -> Result<()> {
+    let meta = DaemonMeta {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_info: calm_core::BUILD_INFO.to_string(),
+        pid: std::process::id(),
+    };
     std::fs::write(calm_dir.join("daemon.meta"), serde_json::to_string(&meta)?)
         .context("writing daemon.meta")
 }
 
+/// `None` covers every case a caller should treat as "can't verify this
+/// daemon, respawn": file missing, unreadable, or malformed — deliberately
+/// not distinguished further, since a forwarder's response is identical
+/// either way (fall through to spawning a fresh daemon).
+fn read_daemon_meta(calm_dir: &Path) -> Option<DaemonMeta> {
+    let text = std::fs::read_to_string(calm_dir.join("daemon.meta")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn remove_daemon_meta(calm_dir: &Path) {
     std::fs::remove_file(calm_dir.join("daemon.meta")).ok();
+}
+
+/// `calm connect`'s entire job: connect to (or spawn, if none is live or
+/// the live one is a stale build) the daemon for `project_root`, then relay
+/// stdin<->socket verbatim — no JSON-RPC/MCP parsing here at all (ADR-0005
+/// §2: keep the forwarder protocol-version-agnostic, so it never needs to
+/// track the MCP protocol's own version).
+pub async fn connect_or_spawn(project_root: PathBuf) -> Result<()> {
+    let root = std::fs::canonicalize(&project_root).context("resolving --project-root")?;
+    let calm_dir = root.join(".calm");
+    std::fs::create_dir_all(&calm_dir)?;
+    let socket_path = resolve_socket_path(&calm_dir);
+
+    let stream = connect_live_and_current(&root, &calm_dir, &socket_path).await?;
+    relay(stream).await
+}
+
+/// `<calm_dir>/daemon.sock` when it fits, else a short deterministic
+/// fallback under the OS temp dir. Unix domain socket paths are capped at
+/// `sizeof(sockaddr_un.sun_path)` — 108 bytes on Linux, 104 on macOS/BSD,
+/// both including the null terminator — a limit `.calm/daemon.sock` can
+/// blow past for a deeply nested project root (hit directly during manual
+/// smoke-testing this feature, not a hypothetical: `bind()` fails with
+/// "path must be shorter than SUN_LEN", and since the spawned daemon's
+/// stderr is `Stdio::null()`'d, that error was otherwise silently swallowed
+/// — the forwarder just polls for 5s and reports a generic timeout).
+///
+/// The fallback path is a hash of the *canonical* `calm_dir`, not the
+/// natural path itself — deterministic (`DefaultHasher::new()` uses a fixed
+/// seed, unlike `HashMap`'s randomized `RandomState`) so every `calm
+/// connect` invocation for the same project recomputes the same fallback
+/// path without needing to read or write any extra shared state to agree
+/// on it. Only `calm connect` needs this: the daemon it spawns is always
+/// told the exact resolved path via an explicit `--listen unix:<path>`
+/// argument, so `serve_unix_daemon` itself never has to re-derive it.
+fn resolve_socket_path(calm_dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    let natural = calm_dir.join("daemon.sock");
+    const SUN_PATH_SAFE_LIMIT: usize = 100; // conservative margin under the 104-108 byte ceiling
+    if natural.as_os_str().len() <= SUN_PATH_SAFE_LIMIT {
+        return natural;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    calm_dir.hash(&mut hasher);
+    let short = std::env::temp_dir().join(format!("calm-{:016x}.sock", hasher.finish()));
+    tracing::warn!(
+        "{} is too long for a unix socket path — using {} instead",
+        natural.display(),
+        short.display()
+    );
+    short
+}
+
+/// Returns a connection to a live, version-matched daemon — spawning one
+/// (detached) if none exists, or asking a stale one to shut down and
+/// respawning if it's serving an old build. Bounded-poll retry, same
+/// ~150ms-interval pattern `instance_lock` already uses for "no wakeup to
+/// wait on, so poll" waits.
+async fn connect_live_and_current(
+    project_root: &Path,
+    calm_dir: &Path,
+    socket_path: &Path,
+) -> Result<tokio::net::UnixStream> {
+    if let Some(stream) = try_connect_current(calm_dir, socket_path).await {
+        return Ok(stream);
+    }
+
+    spawn_detached_daemon(project_root, socket_path)?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if let Some(stream) = try_connect_current(calm_dir, socket_path).await {
+            return Ok(stream);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "daemon at {} did not become reachable within 5s of spawning it",
+                socket_path.display()
+            );
+        }
+    }
+}
+
+/// `Some(stream)` only if connect succeeds *and* `daemon.meta` reports the
+/// same build as this binary. `None` covers everything that should trigger
+/// a (re)spawn: no socket, a dead/stale socket, or a live daemon on a
+/// different build — deliberately not distinguished further to the caller,
+/// since the response (spawn/respawn and retry) is identical either way. A
+/// version mismatch additionally best-effort-signals the stale daemon to
+/// shut down (see `signal_shutdown`) — without this, `bind_or_yield`'s own
+/// split-brain protection would correctly refuse to let a fresh daemon
+/// candidate replace a *live* one, and this loop would spin forever finding
+/// the same stale daemon on every retry.
+async fn try_connect_current(
+    calm_dir: &Path,
+    socket_path: &Path,
+) -> Option<tokio::net::UnixStream> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await.ok()?;
+
+    match read_daemon_meta(calm_dir) {
+        Some(meta) if meta.is_current() => Some(stream),
+        Some(meta) => {
+            tracing::info!(
+                "daemon at {} (pid {}) is a stale build — signaling it to shut down and respawning",
+                socket_path.display(),
+                meta.pid
+            );
+            signal_shutdown(meta.pid);
+            drop(stream);
+            None
+        }
+        None => {
+            tracing::warn!(
+                "connected to {} but its daemon.meta is missing/unreadable — treating as stale",
+                socket_path.display()
+            );
+            drop(stream);
+            None
+        }
+    }
+}
+
+/// Best-effort: the daemon might already be gone, or (very unlikely, given
+/// the short window) `pid` reused by an unrelated process. Either way
+/// there's nothing actionable to do with a failed signal here — the
+/// retry loop in `connect_live_and_current` is what actually verifies the
+/// outcome (does a fresh connect eventually succeed against a *current*
+/// build), not this call's return value.
+fn signal_shutdown(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+/// Spawns `calm serve --listen unix:<socket_path>` fully detached from this
+/// forwarder process.
+fn spawn_detached_daemon(project_root: &Path, socket_path: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("resolving current calm binary path")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("serve")
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--listen")
+        .arg(format!("unix:{}", socket_path.display()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // New process group: the daemon must survive *this* forwarder's own
+        // process group being SIGTERM'd (e.g. an MCP client tearing down
+        // just this one session) — ADR-0005's own self-flagged Risk #1, the
+        // single highest-severity risk in the whole design. Get this wrong
+        // and a client closing session A kills the daemon and silently
+        // takes every other session sharing it down too — reproducing the
+        // exact bug this whole feature exists to fix, under a new name.
+        .process_group(0);
+    cmd.spawn().context("spawning detached daemon")?;
+    Ok(())
+}
+
+/// Pure byte relay between this process's stdio and the daemon socket — no
+/// MCP/JSON-RPC awareness. Distinguishes *which side* closed first so the
+/// exit code means something: the client (our stdin) closing is a normal
+/// end of session; the daemon closing on us while the client was still
+/// talking is an unexpected mid-session failure (crash, or an idle-timeout
+/// evicting a session that was still in use) and must surface as an error
+/// rather than silently exiting 0 — consistent with this codebase's
+/// existing "never fake ready" honesty (`embed_status`/`indexing_phase`
+/// never pretend a failure didn't happen).
+async fn relay(stream: tokio::net::UnixStream) -> Result<()> {
+    let (mut sock_read, mut sock_write) = tokio::io::split(stream);
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let client_to_daemon = tokio::io::copy(&mut stdin, &mut sock_write);
+    let daemon_to_client = tokio::io::copy(&mut sock_read, &mut stdout);
+    tokio::pin!(client_to_daemon);
+    tokio::pin!(daemon_to_client);
+
+    tokio::select! {
+        result = &mut client_to_daemon => {
+            if let Err(e) = result {
+                tracing::warn!("client->daemon relay ended with an error: {e}");
+            }
+            Ok(())
+        }
+        result = &mut daemon_to_client => {
+            match result {
+                Ok(_) => anyhow::bail!("daemon closed the connection unexpectedly"),
+                Err(e) => Err(anyhow::anyhow!("daemon connection error: {e}")),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +539,76 @@ mod tests {
             .expect("a caller against a stale (dead) socket must detect and recover it");
         drop(second);
 
+        let _ = std::fs::remove_dir_all(&calm_dir);
+    }
+
+    #[tokio::test]
+    async fn try_connect_current_accepts_current_build_rejects_mismatch_and_signals_it() {
+        let (calm_dir, socket_path) = test_dirs("version_handshake");
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let accept_task = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // No daemon.meta yet: connect succeeds, but a missing/unreadable
+        // meta must be treated as stale, not silently trusted.
+        assert!(
+            try_connect_current(&calm_dir, &socket_path).await.is_none(),
+            "a connect with no daemon.meta at all must be treated as stale"
+        );
+
+        // Current-build meta: connect must be accepted.
+        write_daemon_meta(&calm_dir).unwrap();
+        assert!(
+            try_connect_current(&calm_dir, &socket_path).await.is_some(),
+            "a daemon.meta matching this binary's own build must be accepted"
+        );
+
+        // A disposable child process stands in for "the stale daemon's real
+        // pid" — real enough to prove `signal_shutdown` actually delivers
+        // SIGTERM (not just \"doesn't panic\"), safe to signal since it's
+        // ours and does nothing but sleep.
+        let mut stale_daemon = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a disposable sleep process for this test");
+        let stale_pid = stale_daemon.id();
+
+        std::fs::write(
+            calm_dir.join("daemon.meta"),
+            serde_json::to_string(&DaemonMeta {
+                version: "0.0.0-not-real".to_string(),
+                build_info: "not-a-real-build".to_string(),
+                pid: stale_pid,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            try_connect_current(&calm_dir, &socket_path).await.is_none(),
+            "a version/build mismatch must be rejected"
+        );
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || stale_daemon.wait()),
+        )
+        .await
+        .expect("stale-pid process must exit promptly once SIGTERM'd")
+        .unwrap()
+        .unwrap();
+        assert!(
+            !status.success(),
+            "the disposable process must have been terminated by SIGTERM, not exited on its own"
+        );
+
+        accept_task.abort();
         let _ = std::fs::remove_dir_all(&calm_dir);
     }
 }

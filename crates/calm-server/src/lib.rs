@@ -1,4 +1,5 @@
 mod scip_overlay;
+#[cfg(unix)]
 pub mod daemon;
 pub mod telemetry;
 pub mod tools;

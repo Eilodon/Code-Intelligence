@@ -44,6 +44,13 @@ impl CalmServer {
             owns_indexer_lock: Arc::new(RwLock::new(false)),
             coverage: Arc::new(RwLock::new(coverage)),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
+            // `0` is never a real `for_connection`-allocated id (that
+            // counter starts at 1 — see `next_session_id` below), so this
+            // instance's own entry never collides with, and is never
+            // confused for, a connection's.
+            session_id: 0,
+            next_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             edit_lock: Arc::new(Mutex::new(())),
             preset,
             tool_router,
@@ -52,24 +59,61 @@ impl CalmServer {
 
     /// Builds a fresh per-connection `CalmServer` from a daemon-shared
     /// instance — every field is cloned (cheap: everything but
-    /// `session_log`/`preset`/`project_root`/`db_path`/`tool_router` is
-    /// already `Arc<RwLock/Mutex<_>>`) except `session_log`, which gets a
+    /// `session_log`/`session_id`/`preset`/`project_root`/`db_path`/
+    /// `tool_router` is already `Arc<RwLock/Mutex<_>>`) except two
+    /// deliberately-private ones this call resets: `session_log` gets a
     /// brand-new `SessionLog` so one connection's explored-files/explored-
     /// symbols history can never leak into another session sharing the same
-    /// daemon. `edit_lock` is deliberately NOT reset here — it must stay the
-    /// one lock shared by every connection to keep serializing
-    /// `edit_lines`/`edit_symbol` writes against the one shared DB writer
-    /// (today, each `calm serve` process has its own `edit_lock`, only
-    /// soft-serialized across processes via SQLite's `busy_timeout` — a
-    /// daemon sharing one real `edit_lock` is a strict improvement, real
-    /// mutual exclusion instead of best-effort). `preset`/`project_root`/
-    /// `db_path`/`tool_router` also stay shared/frozen at whatever the
-    /// daemon was spawned with — first-writer-wins, per ADR-0005.
+    /// daemon, and `session_id` gets a fresh id (allocated here, from the
+    /// still-shared `next_session_id` counter) with a matching entry
+    /// inserted into the still-shared `active_sessions` map — the mirror
+    /// image: `session_log` stays private per connection, `active_sessions`
+    /// stays visible across all of them, on purpose, so `session_context`
+    /// can answer "who else is here" without leaking any one session's full
+    /// exploration history to the others. `edit_lock` is deliberately NOT
+    /// reset here — it must stay the one lock shared by every connection to
+    /// keep serializing `edit_lines`/`edit_symbol` writes against the one
+    /// shared DB writer (today, each `calm serve` process has its own
+    /// `edit_lock`, only soft-serialized across processes via SQLite's
+    /// `busy_timeout` — a daemon sharing one real `edit_lock` is a strict
+    /// improvement, real mutual exclusion instead of best-effort).
+    /// `preset`/`project_root`/`db_path`/`tool_router` also stay
+    /// shared/frozen at whatever the daemon was spawned with —
+    /// first-writer-wins, per ADR-0005.
     pub fn for_connection(&self) -> Self {
+        let session_id = self
+            .next_session_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut sessions) = self.active_sessions.lock() {
+            sessions.insert(
+                session_id,
+                SessionSummary {
+                    session_id,
+                    last_touched_file: None,
+                    last_touched_at: utc_now_iso8601(),
+                    tool_calls: 0,
+                },
+            );
+        }
         Self {
+            session_id,
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             ..self.clone()
         }
+    }
+
+    /// Clone of the shared `active_sessions` map plus this connection's own
+    /// `session_id` — for the daemon's accept loop to deregister this
+    /// connection's entry when it ends, without needing broader field
+    /// access. Mirrors the existing `phase_handle`/`embed_status_handle`
+    /// pattern (a narrow accessor instead of a `pub(crate)` field).
+    pub(crate) fn session_registry_handle(
+        &self,
+    ) -> (
+        Arc<Mutex<std::collections::HashMap<u64, SessionSummary>>>,
+        u64,
+    ) {
+        (self.active_sessions.clone(), self.session_id)
     }
     /// Opens a new dedicated read-only connection to the same DB file.
     /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
@@ -131,6 +175,7 @@ impl CalmServer {
             }
             log.explored_files.insert(path.to_string(), now);
         }
+        self.touch_active_session(Some(path));
     }
 
     /// Records that `path` was written via `edit_lines`/`edit_symbol` — see
@@ -138,6 +183,34 @@ impl CalmServer {
     pub(crate) fn mark_written(&self, path: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             log.written_files.insert(path.to_string());
+        }
+        self.touch_active_session(Some(path));
+    }
+
+    /// Refreshes this connection's own entry in the shared `active_sessions`
+    /// map — `last_touched_file` (when `path` is `Some`), `last_touched_at`,
+    /// and `tool_calls` (read from `session_log`, already bumped by
+    /// `timed_tool` before any handler body runs). Called from `track_file`/
+    /// `mark_written` rather than `track_symbol`, since a qualified symbol
+    /// name isn't reliably path-shaped across every indexed language — file-
+    /// level granularity is what `session_context.other_active_sessions`
+    /// promises, not symbol-level. A no-op whenever this entry was never
+    /// inserted in the first place (a bare `new`/`new_with_preset` instance,
+    /// `session_id == 0` — see `for_connection`).
+    fn touch_active_session(&self, path: Option<&str>) {
+        let tool_calls = self
+            .session_log
+            .lock()
+            .map(|log| log.tool_calls)
+            .unwrap_or(0);
+        if let Ok(mut sessions) = self.active_sessions.lock() {
+            if let Some(entry) = sessions.get_mut(&self.session_id) {
+                if let Some(path) = path {
+                    entry.last_touched_file = Some(path.to_string());
+                }
+                entry.last_touched_at = utc_now_iso8601();
+                entry.tool_calls = tool_calls;
+            }
         }
     }
 

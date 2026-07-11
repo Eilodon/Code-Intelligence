@@ -96,6 +96,37 @@ pub async fn serve_unix_daemon(
     Ok(())
 }
 
+/// RAII guard ensuring a connection's `active_connections` decrement and
+/// `active_sessions` entry removal both run even if the connection-handling
+/// future panics mid-flight — `Drop` still executes during a panic unwind,
+/// unlike code sequenced after an `.await` inside the same async block,
+/// which a panic skips entirely (the task dies before reaching it). Closes
+/// a gap found during TEMPORAL specialist review of the session-awareness
+/// work: without this, a panicking connection task leaked its
+/// `active_connections` count forever — silently defeating idle-shutdown,
+/// since `is_idle` gates on `active_connections == 0` — and would now also
+/// leak a phantom `SessionSummary` in `active_sessions`, visible to every
+/// other connection's `session_context.other_active_sessions` forever.
+/// Pre-existing bug for the counter (this diff only adds the session half),
+/// fixed here rather than left half-fixed.
+struct ConnectionGuard {
+    active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    session_registry: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, crate::tools::SessionSummary>>,
+    >,
+    session_id: u64,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut sessions) = self.session_registry.lock() {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
+
 /// The daemon's whole service lifetime: accept connections, spawn one
 /// `serve_server_with_ct` task per connection, and watch for either
 /// SIGTERM/SIGINT (`ct` cancelled — reuses `bootstrap`'s existing handlers)
@@ -139,9 +170,24 @@ async fn run_accept_loop(
                 // every connection) is correct.
                 let conn_ct = ct.child_token();
                 let conn_server = server.for_connection();
+                // Captured *before* `conn_server` moves into
+                // `serve_server_with_ct` below — `session_registry_handle`
+                // returns cheap clones (an `Arc` and a `Copy` u64), not a
+                // borrow, so this doesn't fight the move.
+                let (session_registry, session_id) = conn_server.session_registry_handle();
                 let active = active_connections.clone();
                 active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(async move {
+                    // Constructed *before* the connection future runs, held
+                    // for the task's entire lifetime — its `Drop` is what
+                    // actually guarantees cleanup on every exit path
+                    // (normal return, error return, *and* panic), not the
+                    // code that used to run sequentially after the `match`.
+                    let _cleanup = ConnectionGuard {
+                        active_connections: active,
+                        session_registry,
+                        session_id,
+                    };
                     match rmcp::service::serve_server_with_ct(conn_server, stream, conn_ct).await {
                         Ok(service) => {
                             if let Err(e) = service.waiting().await {
@@ -150,7 +196,8 @@ async fn run_accept_loop(
                         }
                         Err(e) => tracing::warn!("daemon connection init failed: {e}"),
                     }
-                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // `_cleanup` drops here — decrements `active_connections`
+                    // and removes this session's `active_sessions` entry.
                 });
             }
             _ = ticker.tick() => {
@@ -863,5 +910,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&calm_dir);
+    }
+
+    #[test]
+    fn connection_guard_cleans_up_even_when_the_task_panics() {
+        // Direct test of the exact mechanism `run_accept_loop` relies on:
+        // `ConnectionGuard::drop` must run during a panic unwind, not just
+        // on a normal return — that's the whole reason it exists instead of
+        // plain code sequenced after the connection future. Found via
+        // TEMPORAL specialist review: without this guard, a panicking
+        // connection task silently leaked its `active_connections` count
+        // (defeating idle-shutdown) and its `active_sessions` entry
+        // (a phantom peer that never disappears).
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let registry: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<u64, crate::tools::SessionSummary>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        registry.lock().unwrap().insert(
+            7,
+            crate::tools::SessionSummary {
+                session_id: 7,
+                last_touched_file: None,
+                last_touched_at: "2026-07-11T00:00:00Z".into(),
+                tool_calls: 0,
+            },
+        );
+
+        let active_for_closure = active.clone();
+        let registry_for_closure = registry.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ConnectionGuard {
+                active_connections: active_for_closure,
+                session_registry: registry_for_closure,
+                session_id: 7,
+            };
+            panic!("simulated connection-handler panic");
+        }));
+
+        assert!(
+            result.is_err(),
+            "sanity check: the panic must have actually propagated out of catch_unwind \
+             (this test proves Drop runs *during* unwind, not that panics are swallowed)"
+        );
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "active_connections must be decremented even though the closure panicked"
+        );
+        assert!(
+            !registry.lock().unwrap().contains_key(&7),
+            "the session_id 7 entry must be removed even though the closure panicked"
+        );
     }
 }

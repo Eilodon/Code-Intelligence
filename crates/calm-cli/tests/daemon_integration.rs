@@ -210,6 +210,122 @@ fn calm_connect_forwards_preset_to_the_daemon_it_spawns() {
     );
 }
 
+/// Real, live, two-connection version of the `active_sessions`/
+/// `other_active_sessions` unit tests in `calm-server`'s own `tools.rs` —
+/// those prove the logic in-process; this proves the actual
+/// `run_accept_loop` spawn/cleanup path behaves the same way over a real
+/// Unix socket with two real subprocesses, the tier of test that's already
+/// caught real bugs neither `cargo check` nor an in-process unit test could
+/// (see this file's own header comment). Session-awareness work is flagged
+/// in the roadmap plan as touching the same concurrency-sensitive area that
+/// produced real production bugs before (WAL bloat, SIGTERM hangs,
+/// cross-process edit races) — this is the extra rigor that flag asks for.
+#[test]
+fn session_context_sees_a_second_live_connection_and_stops_seeing_it_after_it_closes() {
+    use std::io::{BufRead, BufReader};
+
+    let project = fresh_project();
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}
+"#;
+    let list_tools = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+"#;
+    let call_session_context = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_context","arguments":{}}}
+"#;
+
+    // Connection A: spawns the daemon (first connect for this project),
+    // stays open for the whole test — its stdin is deliberately never
+    // closed until the very end, unlike `send_initialize_and_capture`'s
+    // one-shot helper, since this test needs it alive while B connects.
+    let mut child_a = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning connection A");
+    let mut stdin_a = child_a.stdin.take().unwrap();
+    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    stdin_a.write_all(initialize).unwrap();
+    let mut init_a = String::new();
+    stdout_a.read_line(&mut init_a).expect("A: initialize response");
+    assert!(init_a.contains("\"protocolVersion\""), "A: bad initialize response: {init_a}");
+    // MCP requires an `initialized` notification before any other request —
+    // list_tools doubles as a second no-op-ish call that also confirms A's
+    // session is fully live before B connects.
+    let initialized = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#;
+    stdin_a.write_all(initialized).unwrap();
+    stdin_a.write_all(list_tools).unwrap();
+    let mut list_a = String::new();
+    stdout_a.read_line(&mut list_a).expect("A: tools/list response");
+
+    // Connection B: connects to the now-live daemon spawned by A (does not
+    // spawn its own).
+    let mut child_b = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning connection B");
+    let mut stdin_b = child_b.stdin.take().unwrap();
+    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    stdin_b.write_all(initialize).unwrap();
+    let mut init_b = String::new();
+    stdout_b.read_line(&mut init_b).expect("B: initialize response");
+    assert!(init_b.contains("\"protocolVersion\""), "B: bad initialize response: {init_b}");
+    stdin_b.write_all(initialized).unwrap();
+
+    // B asks session_context — A must show up in other_active_sessions.
+    stdin_b.write_all(call_session_context).unwrap();
+    let mut ctx_b_line = String::new();
+    stdout_b
+        .read_line(&mut ctx_b_line)
+        .expect("B: session_context response");
+    let ctx_b: serde_json::Value =
+        serde_json::from_str(&ctx_b_line).unwrap_or_else(|e| panic!("B: bad JSON ({e}): {ctx_b_line}"));
+    let text = ctx_b["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("B: unexpected tools/call shape: {ctx_b}"));
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let other = parsed["other_active_sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("B: other_active_sessions missing/not an array: {parsed}"));
+    assert_eq!(
+        other.len(),
+        1,
+        "B must see exactly A as another active session: {parsed}"
+    );
+
+    // Close A — deregisters its session_id from the shared registry.
+    drop(stdin_a);
+    let _ = child_a.wait();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // B asks again — A must be gone now.
+    stdin_b.write_all(call_session_context).unwrap();
+    let mut ctx_b_line2 = String::new();
+    stdout_b
+        .read_line(&mut ctx_b_line2)
+        .expect("B: second session_context response");
+    let ctx_b2: serde_json::Value = serde_json::from_str(&ctx_b_line2)
+        .unwrap_or_else(|e| panic!("B: bad JSON ({e}): {ctx_b_line2}"));
+    let text2 = ctx_b2["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed2: serde_json::Value = serde_json::from_str(text2).unwrap();
+    assert_eq!(
+        parsed2["other_active_sessions"],
+        serde_json::json!([]),
+        "B must no longer see A after A's connection closed: {parsed2}"
+    );
+
+    drop(stdin_b);
+    let _ = child_b.wait();
+}
+
 /// Several `calm serve --listen` candidates racing to spawn against the
 /// same fresh socket path — the exact scenario that caused the original
 /// N-process bug, now deliberately induced at the daemon layer instead of

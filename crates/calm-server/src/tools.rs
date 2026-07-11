@@ -108,6 +108,22 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 /// result's proximity boost by how long ago (in tool-calls, not wall-clock)
 /// the connecting file/symbol was last explored — a re-touch refreshes it,
 /// same "attention" semantics as re-reading something brings it back to mind.
+/// One connection's lightweight activity summary, visible to every *other*
+/// connection sharing the same daemon (unlike `SessionLog` below, which
+/// `for_connection` deliberately gives each connection its own private
+/// copy of) — backs `session_context.other_active_sessions` so an agent can
+/// tell "is anyone else touching this repo right now, and where". Always
+/// empty under a bare stdio `calm serve` (exactly one connection by
+/// construction — nothing else to see).
+#[derive(Clone, Serialize, JsonSchema)]
+pub(crate) struct SessionSummary {
+    pub(crate) session_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_touched_file: Option<String>,
+    pub(crate) last_touched_at: String,
+    pub(crate) tool_calls: u64,
+}
+
 struct SessionLog {
     tool_calls: u64,
     explored_symbols: std::collections::HashMap<String, u64>,
@@ -183,6 +199,22 @@ pub struct CalmServer {
     /// staying frozen at whatever existed at server startup.
     coverage: Arc<RwLock<calm_core::analysis::coverage::CoverageData>>,
     session_log: Arc<Mutex<SessionLog>>,
+    /// This connection's own key into `active_sessions` below — `0` for a
+    /// bare (non-daemon) `calm serve`/test-constructed instance, where
+    /// there is only ever one connection and this value is never looked up
+    /// by anyone. Allocated fresh per connection by `for_connection` from
+    /// `next_session_id`.
+    session_id: u64,
+    /// Monotonic counter allocating `session_id`s — shared (not reset) by
+    /// `for_connection`, unlike `session_log`. `AtomicU64` rather than a
+    /// `Mutex`-guarded counter since it's the one piece of session state
+    /// that's a pure counter with no compound invariant to protect.
+    next_session_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Every connection's `SessionSummary`, keyed by `session_id` — shared
+    /// (not reset) by `for_connection`, the mirror-image choice to
+    /// `session_log` staying private. Backs
+    /// `session_context.other_active_sessions`.
+    active_sessions: Arc<Mutex<std::collections::HashMap<u64, SessionSummary>>>,
     /// Serializes `edit_lines` write+reindex sequences — `rmcp` dispatches
     /// tool calls concurrently, so without this two overlapping edits could
     /// race on both the file (between atomic-write and the next read) and
@@ -1991,6 +2023,110 @@ mod tests {
             serde_json::json!(["src/only_in_a.rs"])
         );
         assert_eq!(b_ctx["explored_files"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_connection_allocates_unique_ids_and_active_sessions_is_shared_not_isolated() {
+        // Mirror-image property to the isolation test above: `session_log`
+        // is per-connection, but `active_sessions` must be the same shared
+        // map every connection sees (unlike `session_log`) — otherwise
+        // `other_active_sessions` could never see across connections at all.
+        let dir =
+            std::env::temp_dir().join(format!("ci_active_sessions_shared_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+
+        let (registry_a, id_a) = conn_a.session_registry_handle();
+        let (registry_b, id_b) = conn_b.session_registry_handle();
+        assert!(
+            std::sync::Arc::ptr_eq(&registry_a, &registry_b),
+            "active_sessions must be the same shared Arc across connections, not per-connection like session_log"
+        );
+        assert_ne!(id_a, id_b, "each for_connection call must allocate a distinct session_id");
+
+        let sessions = registry_a.lock().unwrap();
+        assert!(sessions.contains_key(&id_a), "conn_a's own entry must exist");
+        assert!(sessions.contains_key(&id_b), "conn_b's own entry must exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_other_active_sessions_excludes_self_and_reflects_last_touched_file() {
+        let dir = std::env::temp_dir().join(format!("ci_other_sessions_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+        conn_b.track_file("src/b_is_looking_at_this.rs");
+
+        let a_ctx = jv(conn_a.session_context());
+        let other = a_ctx["other_active_sessions"].as_array().unwrap();
+        assert_eq!(other.len(), 1, "conn_a must see exactly conn_b, not itself: {a_ctx}");
+        assert_eq!(
+            other[0]["last_touched_file"],
+            serde_json::json!("src/b_is_looking_at_this.rs")
+        );
+
+        let (_, id_a) = conn_a.session_registry_handle();
+        assert!(
+            other.iter().all(|s| s["session_id"] != id_a),
+            "conn_a's own entry must never appear in its own other_active_sessions: {a_ctx}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_other_active_sessions_empty_on_bare_non_daemon_server() {
+        // A plain `CalmServer::new` (no `for_connection` ever called — the
+        // real shape of a bare stdio `calm serve`, exactly one connection
+        // by construction) must report no other sessions at all, not an
+        // error or a phantom self-entry.
+        let dir = std::env::temp_dir().join(format!("ci_other_sessions_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let v = jv(server.session_context());
+        assert_eq!(v["other_active_sessions"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deregistering_a_session_removes_it_from_the_shared_registry() {
+        // Simulates exactly what `daemon.rs::run_accept_loop` does when a
+        // connection ends — proves the registry handle returned by
+        // `session_registry_handle` is genuinely the live shared map (a
+        // mutation through it is visible to every other clone), not a
+        // snapshot copy.
+        let dir = std::env::temp_dir().join(format!("ci_deregister_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+        let (registry_a, id_a) = conn_a.session_registry_handle();
+
+        assert_eq!(registry_a.lock().unwrap().len(), 2);
+        registry_a.lock().unwrap().remove(&id_a);
+
+        let b_ctx = jv(conn_b.session_context());
+        assert_eq!(
+            b_ctx["other_active_sessions"],
+            serde_json::json!([]),
+            "conn_b must no longer see conn_a after it deregisters: {b_ctx}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

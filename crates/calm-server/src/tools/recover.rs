@@ -227,6 +227,25 @@ impl CalmServer {
                 (frontier, false)
             };
 
+            // Excludes this connection's own entry — a bare stdio `calm
+            // serve` never inserted one in the first place (`session_id ==
+            // 0`, see `for_connection`), so this is always empty there.
+            // Sorted by `session_id` for deterministic output, not
+            // recency — an agent wanting "most recent" can sort
+            // client-side on `last_touched_at`.
+            let mut other_active_sessions: Vec<SessionSummary> = self
+                .active_sessions
+                .lock()
+                .map(|sessions| {
+                    sessions
+                        .values()
+                        .filter(|s| s.session_id != self.session_id)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            other_active_sessions.sort_by_key(|s| s.session_id);
+
             let sn = if pending_diff_impact {
                 // Outranks frontier exploration — an unverified write is the
                 // more urgent gap regardless of client/host (this signal
@@ -270,6 +289,7 @@ impl CalmServer {
                 files_pending_diff_impact,
                 calls_since_progress,
                 possibly_stuck,
+                other_active_sessions,
                 suggested_next: sn,
             })
         }))
@@ -377,6 +397,13 @@ pub(crate) struct SessionContextOutput {
     /// `calls_since_progress >= 10` — matches AGENTS.md's documented "after
     /// 10+ calls without convergence" cue for calling this tool.
     pub(crate) possibly_stuck: bool,
+    /// Every *other* connection currently sharing this daemon (this
+    /// session's own entry excluded) — always empty under a bare stdio
+    /// `calm serve`, where there is only ever one connection by
+    /// construction. Lets an agent notice "someone else is already editing
+    /// file X" before stepping on the same area, without needing full A2A
+    /// protocol support — see `CalmServer::active_sessions`.
+    pub(crate) other_active_sessions: Vec<SessionSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

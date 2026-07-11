@@ -260,6 +260,15 @@ fn ts_lang_elixir() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-haskell")]
+fn ts_lang_haskell() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_haskell::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-haskell"))]
+fn ts_lang_haskell() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -1161,6 +1170,59 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
         modifier_keywords: &[],
         shallow_detect: Some(crate::indexer::parser::detect_elixir),
+    },
+    // Haskell (Phase C, 2026-07-11): like elixir, the latest published
+    // grammar (0.23.1, unchanged since Nov 2024) is already ABI 14 — no
+    // cliff to pin below. Verified via a real AST dump on a fixture
+    // covering a `data` record, two `function` equations (one calling the
+    // other), a top-level zero-arg `main = do ...` (parses as `bind`, not
+    // `function` — see below), and a `let`-nested local binding.
+    //
+    // `function` (has parameters, `greet g = ...`) and `bind` (zero
+    // parameters, `main = ...`) both have a direct "name" field — but
+    // `bind` ALSO fires for local `let`/`where` bindings with the
+    // identical shape, so it needs a parent check ("declarations" vs
+    // "local_binds") `resolve_name_node` does explicitly; see its "bind"
+    // arm and doc comment. `apply`'s "function" field is the callee
+    // uniformly for both a plain call and (since application curries) each
+    // link of a multi-argument call chain — no sentinel needed, though a
+    // curried `foo x y` does produce one call-edge per application link
+    // (both naming "foo"), a minor precision rough edge, not a correctness
+    // bug.
+    //
+    // Deliberate scope cut for this pass: only "function"/"bind"/
+    // "data_type"/"class" become symbols — a bare type `signature`
+    // (`greet :: Greeter -> String`) is intentionally excluded (it would
+    // otherwise duplicate the real `function`/`bind` definition's symbol),
+    // which also means a typeclass method with no default implementation
+    // (only a signature inside `class ... where`) does not get its own
+    // symbol. "instance" is a `class_node_types` entry (for method
+    // class_context) but not itself a symbol, same treatment Rust's
+    // `impl_item` already gets.
+    LanguageSpec {
+        name: "haskell",
+        aliases: &[],
+        extensions: &["hs"],
+        constants: LangConstants {
+            function_node_types: &["function", "bind", "data_type", "class"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["apply"],
+            call_function_field: "function",
+            call_function_field_by_kind: &[],
+            class_node_types: &["class", "instance"],
+            class_name_field: "name",
+            definition_macro_names: &[],
+        },
+        ts_language: ts_lang_haskell,
+        branch_node_kinds: &["conditional", "case", "multi_way_if", "guard"],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        // Haskell line comments are `--`, block comments `{- ... -}` — same
+        // `--`-only shape as Lua, neither shared group applies.
+        line_comment_prefixes: &["--"],
+        modifier_keywords: &[],
+        shallow_detect: Some(crate::indexer::parser::detect_haskell),
     },
 ];
 

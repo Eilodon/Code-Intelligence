@@ -37,7 +37,13 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         "class_definition" | "class_declaration" => SymbolKind::Class,
         // Ruby's grammar uses the bare node kinds "class"/"module" (not
         // "class_declaration") — without this arm they fell through to the
-        // generic Function/Method default below.
+        // generic Function/Method default below. Haskell's typeclass node is
+        // ALSO literally named "class" (`class Named a where ...`) — since
+        // this function takes no language parameter, that string collides
+        // with Ruby's here and a typeclass maps to Class too (not the more
+        // semantically-apt Trait) as a result. Accepted as a minor labeling
+        // rough edge rather than threading a language parameter through
+        // this whole function for one cosmetic distinction.
         "class" | "module" => SymbolKind::Class,
         "struct_item" => SymbolKind::Struct,
         // Java records and C#/C++/C struct declarations are all fixed-field
@@ -95,7 +101,12 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // and resolve_name_node), Rust's `type_item`/`union_item`, and C#'s
         // `delegate_declaration` are all "this name refers to a type" —
         // distinct grammar node kinds for the same concept, so all map here.
-        "type_alias_declaration"
+        // Haskell's `data`/`newtype` declaration — verified via node-types.json,
+        // covers both sum types and single-constructor records; no separate
+        // struct/enum distinction attempted (documented scope cut, same
+        // category as Swift's class_declaration unification).
+        "data_type"
+        | "type_alias_declaration"
         | "type_spec"
         | "type_alias"
         | "type_item"
@@ -207,7 +218,17 @@ fn resolve_name_node<'a>(
     source: &str,
     lc: &crate::indexer::lang_constants::LangConstants,
 ) -> Option<tree_sitter::Node<'a>> {
-    if let Some(n) = node.child_by_field_name(lc.name_field) {
+    // Haskell's "bind" (`name = expr`, no parameters — e.g. `main = ...`)
+    // needs a parent check before accepting its otherwise-direct "name"
+    // field (see the "bind" arm below: the identical node shape also
+    // represents a *local* `let`/`where` binding, which must NOT become a
+    // symbol), so it's excluded from this generic fast path and handled
+    // entirely in the match instead. No other language's function-defining
+    // node kind is ever literally "bind", so this exclusion is inert
+    // everywhere else.
+    if node.kind() != "bind"
+        && let Some(n) = node.child_by_field_name(lc.name_field)
+    {
         return Some(n);
     }
     match node.kind() {
@@ -345,6 +366,23 @@ fn resolve_name_node<'a>(
                 "call" => first_arg.child_by_field_name("target"),
                 "identifier" => Some(first_arg),
                 _ => None,
+            }
+        }
+        // Haskell: `bind` is a zero-parameter definition (`main = ...`) —
+        // confirmed via a real AST dump to be the EXACT SAME node kind for
+        // both a real top-level definition and a local `let`/`where`
+        // binding (`let g = Greeter {...}` inside a do-block). Only the
+        // immediate parent tells them apart: a top-level bind's parent is
+        // the module's `declarations` node; a local one's parent is
+        // `local_binds` instead. Returning `None` for the local case (not
+        // just "less precise" — genuinely wrong to index a local variable
+        // as a module-level symbol) is what `test_haskell_real_grammar_
+        // symbols_and_calls_are_accurate`'s `let g = ...` fixture locks in.
+        "bind" => {
+            if node.parent().is_some_and(|p| p.kind() == "declarations") {
+                node.child_by_field_name("name")
+            } else {
+                None
             }
         }
         _ => None,
@@ -2163,6 +2201,31 @@ pub(crate) fn detect_elixir(s: &str) -> Option<(String, SymbolKind)> {
     }
     None
 }
+
+// Haskell shallow fallback: data/newtype/class declarations only,
+// deliberately no function-equation detection. Unlike every keyword-led
+// language here, a Haskell function definition (`greet g = ...`) has no
+// distinguishing keyword at all — a one-line prefix scan can't tell it
+// apart from a type signature (`greet :: ...`) or plain expression without
+// real parsing. The real tree-sitter path (see lang_constants.rs's Haskell
+// entry) handles this correctly; this fallback only runs when that grammar
+// isn't compiled in, so a declarations-only shallow index is a documented,
+// honest scope cut, same reasoning as Dart's shallow fallback.
+pub(crate) fn detect_haskell(s: &str) -> Option<(String, SymbolKind)> {
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("data ", SymbolKind::Type),
+        ("newtype ", SymbolKind::Type),
+        ("class ", SymbolKind::Trait),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3628,6 +3691,16 @@ public class FooTest {
         assert!(names.contains(&"greet"), "should detect def");
         assert!(names.contains(&"format_greeting"), "should detect defp");
     }
+
+    #[test]
+    fn test_shallow_haskell() {
+        let code = "data Greeter = Greeter { name :: String }\nnewtype Age = Age Int\nclass Named a where\n";
+        let syms = extract_symbols_shallow(code, "haskell", "a.hs");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Greeter"), "should detect data");
+        assert!(names.contains(&"Age"), "should detect newtype");
+        assert!(names.contains(&"Named"), "should detect class");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -4142,6 +4215,84 @@ class Foo {
              a call) — catches a phantom self-call regression (a def's own \
              name+params wrapper node, e.g. \"greet\" in `def greet(name) do`, \
              misread as an ordinary call to itself): {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-haskell")]
+    fn test_tier0_5_grammar_loads_haskell() {
+        assert!(
+            parse_tree("main :: IO ()\nmain = putStrLn \"hi\"\n", "haskell").is_some(),
+            "tree-sitter-haskell grammar should load and parse — locks the pinned ABI \
+             (=0.23.1, ABI 14)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-haskell")]
+    fn test_haskell_real_grammar_symbols_and_calls_are_accurate() {
+        // Haskell has two distinct top-level definition node kinds
+        // (verified via a real AST dump, not guessed): `function` (has
+        // parameters, e.g. `greet g = ...`) and `bind` (zero-arg value
+        // definitions like `main = ...`). Both have a direct "name" field,
+        // but `bind` ALSO shows up for local `let`/`where` bindings (e.g.
+        // `let g = Greeter {...}` inside a do-block) with the identical
+        // shape — only the immediate PARENT tells top-level and local
+        // bindings apart ("declarations" vs "local_binds"). This test's
+        // `main` (top-level, must appear) and the nested `let g = ...`
+        // (local, must NOT appear) both exist specifically to lock that
+        // distinction in.
+        let code = "data Greeter = Greeter { name :: String }\n\ngreet :: Greeter -> String\ngreet g = do\n  putStrLn \"hello\"\n  formatGreeting g\n\nformatGreeting :: Greeter -> String\nformatGreeting g = \"Hello, \" ++ name g\n\nmain :: IO ()\nmain = do\n  let g = Greeter { name = \"world\" }\n  putStrLn (greet g)\n";
+        let symbols = extract_symbols(code, "haskell", "a.hs").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"Greeter"),
+            "should detect data_type: {names:?}"
+        );
+        assert!(
+            names.contains(&"greet"),
+            "should detect function: {names:?}"
+        );
+        assert!(
+            names.contains(&"formatGreeting"),
+            "should detect second function: {names:?}"
+        );
+        assert!(
+            names.contains(&"main"),
+            "should detect top-level zero-arg `bind`: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|&&n| n == "g").count(),
+            0,
+            "the local `let g = ...` bind inside main's do-block must NOT be \
+             extracted as a symbol — catches the exact bug a naive `bind` \
+             arm (no parent check) would produce: {names:?}"
+        );
+
+        let greeter = symbols
+            .iter()
+            .find(|s| s.name == "Greeter")
+            .expect("Greeter should be found");
+        assert_eq!(greeter.kind, SymbolKind::Type);
+
+        let calls = extract_calls(code, "haskell", "a.hs").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "greet" && c.callee == "putStrLn"),
+            "bare call inside greet should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "greet" && c.callee == "formatGreeting"),
+            "second call inside greet should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "main" && c.callee == "putStrLn"),
+            "call inside main should produce a call edge: {calls:?}"
         );
     }
 }

@@ -113,7 +113,7 @@ Việc thật còn lại của Tier 1 hẹp hơn mục 4 mô tả: chỉ còn **
 | 5 | Rust: mở rộng `Connect`/`spawn_detached_daemon` nhận `--preset`/`--db-path` | 1 | ~0.5 ngày | **✅ Đã xong**, có integration test (`calm_connect_forwards_preset_to_the_daemon_it_spawns`) |
 | 6 | `mcp-launcher.sh`: default sang `calm connect` (Unix-only, có fallback) | 1 | ~0.5 ngày | **✅ Đã xong**, smoke-test live 3 kịch bản (no-args/extra-args/env opt-out) |
 | 7 | Concurrent-agent awareness (`active_sessions` trong `session_context`) | 3c | ~1 ngày + review | **✅ Đã xong**, qua TEMPORAL specialist-review (5/6 CONFIRMED SAFE, 1 finding LOW đã vá bằng `ConnectionGuard` RAII drop-guard + panic-safety test), có live 2-connection integration test |
-| 8 | Go SCIP `go.work` multi-module | 1 | ~2-3 ngày | không (research upstream scip-go trước khi chốt approach) |
+| 8 | Go SCIP `go.work` multi-module | 1 | ~2-3 ngày | **✅ Đã xong** — xác nhận upstream scip-go không có flag workspace native (WebSearch + Sourcegraph docs), dùng đúng cơ chế `sub_root`/`rebase_prefix` đã có sẵn; **chưa live-verify** vì không có scip-go binary trong môi trường này |
 | 9 | B7 (bản scripted, không cần LLM API) | 2 | ~2-3 ngày | không |
 | 10 | Agent-loop harness (net-new) | 2 | ~2-4 ngày | nên làm sau #9 để validate oracle trước |
 | 11 | B8 pilot (Haiku vs Opus/Sonnet, 4-6 task × 2 tier × 3-5 lần) | 2 | ~1-2 ngày + ~$20-50 chi phí API | việc #10 |

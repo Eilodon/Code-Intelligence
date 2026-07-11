@@ -1213,6 +1213,36 @@ pub(crate) struct CallerEntry {
     pub(crate) preview: Option<String>,
 }
 
+/// Deterministic fingerprint of a caller/callee result set, for
+/// `if_none_match`/`etag` conditional-fetch (same pattern as `source`'s own
+/// etag — see `range_checksum`/`hash_content`). Includes `preview` (not just
+/// the SQL columns) so a call site whose *line content* changed — but not
+/// its confidence/path/line-number — still gets a fresh etag; two calls
+/// with the same set of `(symbol, path, edge_confidence, edge_kind, line,
+/// preview)` tuples in the same order are guaranteed to hash identically.
+pub(crate) fn hash_caller_entries<'a>(entries: impl IntoIterator<Item = &'a CallerEntry>) -> String {
+    let mut buf = String::new();
+    for e in entries {
+        buf.push_str(&e.symbol);
+        buf.push('\u{1}');
+        buf.push_str(&e.path);
+        buf.push('\u{1}');
+        buf.push_str(&e.edge_confidence);
+        buf.push('\u{1}');
+        buf.push_str(&e.edge_kind);
+        buf.push('\u{1}');
+        if let Some(l) = e.line {
+            buf.push_str(&l.to_string());
+        }
+        buf.push('\u{1}');
+        if let Some(p) = &e.preview {
+            buf.push_str(p);
+        }
+        buf.push('\u{2}');
+    }
+    calm_core::indexer::pipeline::hash_content(&buf)
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct CalleeEntry {
     pub(crate) symbol: String,
@@ -1224,6 +1254,31 @@ pub(crate) struct CalleeEntry {
     pub(crate) line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) preview: Option<String>,
+}
+
+/// `CalleeEntry` counterpart of `hash_caller_entries` — same rationale and
+/// field set, just for `callees`'s direction.
+pub(crate) fn hash_callee_entries<'a>(entries: impl IntoIterator<Item = &'a CalleeEntry>) -> String {
+    let mut buf = String::new();
+    for e in entries {
+        buf.push_str(&e.symbol);
+        buf.push('\u{1}');
+        buf.push_str(&e.path);
+        buf.push('\u{1}');
+        buf.push_str(&e.edge_confidence);
+        buf.push('\u{1}');
+        buf.push_str(&e.edge_kind);
+        buf.push('\u{1}');
+        if let Some(l) = e.line {
+            buf.push_str(&l.to_string());
+        }
+        buf.push('\u{1}');
+        if let Some(p) = &e.preview {
+            buf.push_str(p);
+        }
+        buf.push('\u{2}');
+    }
+    calm_core::indexer::pipeline::hash_content(&buf)
 }
 
 #[derive(Serialize, JsonSchema)]

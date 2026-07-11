@@ -28,11 +28,16 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
+            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+
             let all: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
-                         FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
+                        "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                         FROM call_edges ce
+                         LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
+                         WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
@@ -53,7 +58,6 @@ impl CalmServer {
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {
-                let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
                 let max_depth = p
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callers.max_depth_cap))
@@ -83,6 +87,30 @@ impl CalmServer {
                 .partition(|e| e.edge_confidence == "ambiguous");
             let count = direct.len();
             let ambiguous_count = ambiguous.len();
+
+            // Fingerprint of the (direct, ambiguous) answer — lets a caller
+            // re-checking this same symbol after an unrelated edit elsewhere
+            // skip re-paying the full token cost when nothing changed here.
+            let etag = Some(hash_caller_entries(direct.iter().chain(ambiguous.iter())));
+            if p.if_none_match.is_some() && p.if_none_match == etag {
+                return ResolvedOutcome::success(CallersOutput {
+                    symbol: p.symbol,
+                    edges_ready: self.edges_ready(),
+                    direct: Vec::new(),
+                    direct_count: count,
+                    ambiguous: Vec::new(),
+                    ambiguous_count,
+                    direct_truncated: None,
+                    ambiguous_truncated: None,
+                    transitive,
+                    transitive_count,
+                    transitive_capped,
+                    etag,
+                    not_modified: Some(true),
+                    suggested_next: None,
+                });
+            }
+
             let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
             let sn = if has_textual || count > 10 {
                 suggested(
@@ -108,6 +136,19 @@ impl CalmServer {
             // advisory caveat rather than let an empty list read as proof.
             let no_usage_caveat =
                 (count == 0 && ambiguous_count == 0).then(|| Caveat::no_direct_usage(&p.symbol));
+
+            // Cap the raw per-entry dump AFTER everything above (etag, sn,
+            // caveat) has already looked at the full sets — direct_count/
+            // ambiguous_count stay the true totals no matter what gets
+            // truncated here.
+            let cap = config.callers.direct_list_cap;
+            let direct_truncated = (direct.len() > cap).then_some(true);
+            let ambiguous_truncated = (ambiguous.len() > cap).then_some(true);
+            let mut direct = direct;
+            let mut ambiguous = ambiguous;
+            direct.truncate(cap);
+            ambiguous.truncate(cap);
+
             let out = ResolvedOutcome::success(CallersOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
@@ -115,9 +156,13 @@ impl CalmServer {
                 direct_count: count,
                 ambiguous,
                 ambiguous_count,
+                direct_truncated,
+                ambiguous_truncated,
                 transitive,
                 transitive_count,
                 transitive_capped,
+                etag,
+                not_modified: None,
                 suggested_next: self.filter_sn(sn),
             });
             match no_usage_caveat {
@@ -151,11 +196,16 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
+            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+
             let all: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT to_symbol, to_path, edge_confidence, call_site_line, edge_kind
-                         FROM call_edges WHERE from_symbol = ?1 AND ruled_out_by_scip = 0",
+                        "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                         FROM call_edges ce
+                         LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
+                         WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
                     )
                     .unwrap();
                 // The call site lives in the symbol being inspected (`c.path`),
@@ -178,7 +228,6 @@ impl CalmServer {
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {
-                let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
                 let max_depth = p
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callees.max_depth_cap))
@@ -201,11 +250,47 @@ impl CalmServer {
                 .partition(|e| e.edge_confidence == "ambiguous");
             let count = direct.len();
             let ambiguous_count = ambiguous.len();
+
+            // Fingerprint of the (direct, ambiguous) answer — same
+            // conditional-fetch pattern as `callers`/`source`.
+            let etag = Some(hash_callee_entries(direct.iter().chain(ambiguous.iter())));
+            if p.if_none_match.is_some() && p.if_none_match == etag {
+                return ResolvedOutcome::success(CalleesOutput {
+                    symbol: p.symbol,
+                    edges_ready: self.edges_ready(),
+                    direct: Vec::new(),
+                    direct_count: count,
+                    ambiguous: Vec::new(),
+                    ambiguous_count,
+                    direct_truncated: None,
+                    ambiguous_truncated: None,
+                    transitive,
+                    transitive_count,
+                    transitive_capped,
+                    etag,
+                    not_modified: Some(true),
+                    suggested_next: None,
+                });
+            }
+
             let sn = if count > 0 {
                 suggested("path", "Trace specific call chain")
             } else {
                 None
             };
+
+            // Cap the raw per-entry dump AFTER etag/sn have already looked
+            // at the full sets — direct_count/ambiguous_count stay the true
+            // totals no matter what gets truncated here. Same
+            // `config.callees.direct_list_cap` as `callers`.
+            let cap = config.callees.direct_list_cap;
+            let direct_truncated = (direct.len() > cap).then_some(true);
+            let ambiguous_truncated = (ambiguous.len() > cap).then_some(true);
+            let mut direct = direct;
+            let mut ambiguous = ambiguous;
+            direct.truncate(cap);
+            ambiguous.truncate(cap);
+
             ResolvedOutcome::success(CalleesOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
@@ -213,9 +298,13 @@ impl CalmServer {
                 direct_count: count,
                 ambiguous,
                 ambiguous_count,
+                direct_truncated,
+                ambiguous_truncated,
                 transitive,
                 transitive_count,
                 transitive_capped,
+                etag,
+                not_modified: None,
                 suggested_next: self.filter_sn(sn),
             })
         }))
@@ -491,6 +580,12 @@ pub(crate) struct CallersParams {
     /// if `transitive` is `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_depth: Option<i64>,
+    /// `etag` from a prior `callers` call on this exact `symbol`/`path`/
+    /// `line` (with the same `transitive`/`max_depth`) — if the caller set
+    /// hasn't changed since, the response omits `direct`/`ambiguous` and
+    /// sets `not_modified: true` instead of re-sending them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) if_none_match: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -507,12 +602,33 @@ pub(crate) struct CallersOutput {
     pub(crate) ambiguous: Vec<CallerEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
+    /// `true` when `direct` was cut down to `config.callers.direct_list_cap`
+    /// entries — `direct_count` above is still the true total regardless.
+    /// A real hub symbol can have 50-200+ direct callers; without this cap
+    /// a single `callers` call on one could cost several thousand tokens
+    /// dumping near-duplicate entries (e.g. dozens of unit-test call sites
+    /// in one file) with the one production caller buried at the end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) direct_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ambiguous_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive: Option<Vec<TransitiveEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive_capped: Option<bool>,
+    /// Fingerprint of this response's `direct`+`ambiguous` (see
+    /// `hash_caller_entries`) — pass back as `if_none_match` on a later
+    /// `callers` call for the same symbol to skip re-sending them if
+    /// nothing changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) etag: Option<String>,
+    /// `true` when `if_none_match` matched this response's `etag` —
+    /// `direct`/`ambiguous` are empty in this case, not actually zero
+    /// callers; re-call without `if_none_match` for the real lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) not_modified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -545,6 +661,11 @@ pub(crate) struct CalleesParams {
     /// if `transitive` is `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_depth: Option<i64>,
+    /// `etag` from a prior `callees` call on this exact `symbol`/`path`/
+    /// `line` — if the callee set hasn't changed since, the response omits
+    /// `direct`/`ambiguous` and sets `not_modified: true` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) if_none_match: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -558,12 +679,23 @@ pub(crate) struct CalleesOutput {
     pub(crate) ambiguous: Vec<CalleeEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
+    /// See `CallersOutput::direct_truncated` — same
+    /// `config.callees.direct_list_cap`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) direct_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ambiguous_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive: Option<Vec<TransitiveEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive_capped: Option<bool>,
+    /// See `CallersOutput::etag`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) not_modified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

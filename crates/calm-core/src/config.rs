@@ -552,6 +552,13 @@ impl Default for PathConfig {
 pub struct DepthConfig {
     pub max_depth_cap: usize,
     pub transitive_timeout_ms: u64,
+    /// Max entries kept in `callers`/`callees`'s own `direct`/`ambiguous`
+    /// lists (single-hop, not the `transitive` BFS `max_depth_cap` already
+    /// caps above) before truncating. A real hub symbol can have 50-200+
+    /// direct callers with zero cap — `direct_count`/`ambiguous_count`
+    /// always report the true total regardless of this cap, so nothing
+    /// about scale is lost, only the raw per-entry dump beyond this size.
+    pub direct_list_cap: usize,
 }
 
 impl Default for DepthConfig {
@@ -559,6 +566,7 @@ impl Default for DepthConfig {
         Self {
             max_depth_cap: 4,
             transitive_timeout_ms: 3000,
+            direct_list_cap: 25,
         }
     }
 }

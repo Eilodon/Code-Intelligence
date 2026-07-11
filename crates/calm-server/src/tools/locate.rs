@@ -57,7 +57,7 @@ impl CalmServer {
                             kind: r.kind,
                             line_start: r.line_start,
                             line_end: r.line_end,
-                            score: Some(r.score),
+                            score: Some(round_score(r.score)),
                             match_type: Some(r.match_type),
                             snippet: r.snippet,
                         })
@@ -148,7 +148,7 @@ impl CalmServer {
                         kind: r.kind,
                         line_start: r.line_start,
                         line_end: r.line_end,
-                        score: Some(r.score),
+                        score: Some(round_score(r.score)),
                         match_type: Some(r.match_type),
                         snippet: r.snippet,
                     })
@@ -216,7 +216,7 @@ impl CalmServer {
                         kind: r.kind,
                         line_start: r.line_start,
                         line_end: r.line_end,
-                        score: Some(r.score),
+                        score: Some(round_score(r.score)),
                         match_type: Some(r.match_type),
                         snippet: r.snippet,
                     })
@@ -301,7 +301,7 @@ impl CalmServer {
                     kind: r.kind.clone(),
                     line_start: r.line_start,
                     line_end: r.line_end,
-                    score: Some(r.score),
+                    score: Some(round_score(r.score)),
                     match_type: Some(r.match_type.clone()),
                     snippet: r.snippet.clone(),
                 })
@@ -557,6 +557,17 @@ pub(crate) fn apply_include_tests_filter(
     filter_truncated
 }
 
+/// Rounds a search/RRF score to 4 decimal places before it ever reaches
+/// JSON serialization. Raw `f64` fusion scores (see `rrf_merge_n`) commonly
+/// serialize as 15-17 significant digits (e.g. `0.01639344262295082`) that
+/// carry no decision-relevant information for an LLM consumer — only
+/// relative ordering/rough magnitude matters, never full float precision.
+/// Purely representational: does not change ranking, since all scores in a
+/// result set are rounded identically.
+pub(crate) fn round_score(score: f64) -> f64 {
+    (score * 10_000.0).round() / 10_000.0
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SearchResultItem {
     pub(crate) name: String,
@@ -756,6 +767,33 @@ pub(crate) struct LocateOutput {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn round_score_cuts_float_noise_without_changing_relative_order() {
+        // Real RRF fusion score observed live from this repo's own index
+        // (search("round_score", kind="hybrid") top hit) before this change —
+        // 17 significant digits, none of them decision-relevant to an LLM.
+        let raw_top = 0.17456140350877192_f64;
+        let raw_second = 0.051372997711670476_f64;
+
+        let rounded_top = round_score(raw_top);
+        let rounded_second = round_score(raw_second);
+
+        assert_eq!(rounded_top, 0.1746);
+        assert_eq!(rounded_second, 0.0514);
+        // Rounding must never invert relative order within one result set —
+        // it's purely representational, not a re-ranking.
+        assert!(rounded_top > rounded_second);
+
+        let raw_json = serde_json::to_string(&raw_top).unwrap();
+        let rounded_json = serde_json::to_string(&rounded_top).unwrap();
+        assert_eq!(raw_json, "0.17456140350877192");
+        assert_eq!(rounded_json, "0.1746");
+        assert!(
+            rounded_json.len() < raw_json.len(),
+            "rounded score must serialize shorter than the raw f64"
+        );
+    }
 
     /// Regression for `locate`'s token cost: `build_file_overview` must cap the
     /// symbol list when `max_symbols` is set (the `locate` path), reporting the

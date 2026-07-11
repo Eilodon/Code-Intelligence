@@ -33,6 +33,8 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
+            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+
             // For edit_lines/edit_symbol's expected_hash — computed the same
             // way apply_hunks hashes a range, so this checksum is directly
             // usable without a separate round trip to learn it.
@@ -49,8 +51,11 @@ impl CalmServer {
             let callers: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
-                         FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
+                        "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                         FROM call_edges ce
+                         LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
+                         WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
@@ -73,8 +78,11 @@ impl CalmServer {
             let callees: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT to_symbol, to_path, edge_confidence, call_site_line, edge_kind
-                         FROM call_edges WHERE from_symbol = ?1 AND ruled_out_by_scip = 0",
+                        "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                         FROM call_edges ce
+                         LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
+                         WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
                     )
                     .unwrap();
                 let from_path = c.path.clone();
@@ -93,8 +101,6 @@ impl CalmServer {
                 .filter_map(|r| r.ok())
                 .collect()
             };
-
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
 
             let blast_radius = {
                 let (entries, _capped) = transitive_bfs(
@@ -138,6 +144,9 @@ impl CalmServer {
             // real, confirmed caller count was low or zero — the same
             // "confirmed caller" definition `symbols.caller_count` already
             // uses elsewhere in this codebase, now applied consistently here.
+            //
+            // Computed from the FULL `callers` (before any truncation below)
+            // — risk/dead-code must never be skewed by the display cap.
             let confirmed_caller_count = callers
                 .iter()
                 .filter(|c| c.edge_confidence != "ambiguous")
@@ -195,12 +204,41 @@ impl CalmServer {
             .flatten()
             .map(TrendOutput::from);
 
+            // Conditional-fetch — ONLY `callers`/`callees` are ever gated
+            // behind this etag. risk_assessment/dead_code_confidence/
+            // blast_radius/trend/co_changed_files/range_checksum above are
+            // already fully (re)computed from live data regardless of a
+            // match, and are never omitted — this is the mandatory pre-edit
+            // safety tool, so none of those may go silently stale.
+            let edges_etag = Some(calm_core::indexer::pipeline::hash_content(&format!(
+                "{}\u{3}{}",
+                hash_caller_entries(callers.iter()),
+                hash_callee_entries(callees.iter()),
+            )));
+            let edges_not_modified = p.if_none_match.is_some() && p.if_none_match == edges_etag;
+
+            let (callers, callees, callers_truncated, callees_truncated) = if edges_not_modified {
+                (Vec::new(), Vec::new(), None, None)
+            } else {
+                let caller_cap = config.callers.direct_list_cap;
+                let callee_cap = config.callees.direct_list_cap;
+                let callers_truncated = (callers.len() > caller_cap).then_some(true);
+                let callees_truncated = (callees.len() > callee_cap).then_some(true);
+                let mut callers = callers;
+                let mut callees = callees;
+                callers.truncate(caller_cap);
+                callees.truncate(callee_cap);
+                (callers, callees, callers_truncated, callees_truncated)
+            };
+
             ResolvedOutcome::success(EditContextOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
                 index_freshness: self.phase_str(),
                 callers,
                 callees,
+                callers_truncated,
+                callees_truncated,
                 blast_radius,
                 range_checksum,
                 risk_assessment: risk,
@@ -208,6 +246,8 @@ impl CalmServer {
                 dead_code_source: dead_code_source.to_string(),
                 trend,
                 co_changed_files,
+                edges_etag,
+                edges_not_modified: edges_not_modified.then_some(true),
                 suggested_next: self.filter_sn(suggested(
                     "diff_impact",
                     "MANDATORY after changes — verify blast radius",
@@ -521,6 +561,16 @@ pub(crate) struct EditContextParams {
     /// response's `line_start`/`line_end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// `edges_etag` from a prior `edit_context` call on this exact symbol —
+    /// if the caller/callee lists haven't changed since, the response omits
+    /// `callers`/`callees` and sets `edges_not_modified: true`. Every other
+    /// field (`risk_assessment`, `dead_code_confidence`, `blast_radius`,
+    /// `trend`, `co_changed_files`, `range_checksum`) is always recomputed
+    /// and returned in full regardless — never gated behind this etag, since
+    /// this is the mandatory pre-edit safety tool and none of those may go
+    /// silently stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) if_none_match: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -581,6 +631,13 @@ pub(crate) struct EditContextOutput {
     pub(crate) index_freshness: String,
     pub(crate) callers: Vec<CallerEntry>,
     pub(crate) callees: Vec<CalleeEntry>,
+    /// `true` when `callers` was cut down to `config.callers.direct_list_cap`
+    /// entries (a real hub symbol can have 50-200+) — `blast_radius`'s own
+    /// counts are unaffected, only this raw per-entry dump is capped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) callers_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) callees_truncated: Option<bool>,
     pub(crate) blast_radius: BlastRadiusInfo,
     /// Hash of the symbol's current `[line_start, line_end]` — pass this
     /// straight to `edit_lines`/`edit_symbol` as `expected_hash` to skip
@@ -607,6 +664,13 @@ pub(crate) struct EditContextOutput {
     /// symbol's file often enough to clear `config.cochange.min_co_changes`
     /// — not an error signal, most edits legitimately have none.
     pub(crate) co_changed_files: Vec<CoChangedFileOutput>,
+    /// Fingerprint of `callers`+`callees` only (see `if_none_match` on
+    /// `EditContextParams`) — every other field above is always fresh on
+    /// every call, never gated behind this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edges_etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edges_not_modified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

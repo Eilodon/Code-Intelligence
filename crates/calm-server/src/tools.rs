@@ -1562,6 +1562,7 @@ mod tests {
                 line: None,
                 transitive: false,
                 max_depth: None,
+                if_none_match: None,
             })),
         );
 
@@ -1611,6 +1612,7 @@ mod tests {
                 line: None,
                 transitive: true,
                 max_depth: Some(5),
+                if_none_match: None,
             })),
         );
 
@@ -1652,6 +1654,7 @@ mod tests {
                 symbol: "a".into(),
                 path: None,
                 line: None,
+                if_none_match: None,
             },
         ));
         let v = jv(output);
@@ -1709,6 +1712,7 @@ mod tests {
                 symbol: "has".into(),
                 path: None,
                 line: None,
+                if_none_match: None,
             },
         ));
         let v = jv(output);
@@ -1722,6 +1726,129 @@ mod tests {
             v["risk_assessment"], "low",
             "12 ambiguous-confidence callers (name-collision noise) must not \
              read as high risk when zero of them are confirmed — got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_risk_assessment_stays_correct_when_callers_list_is_truncated() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.hub', 'hub', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn hub()', '', 'hub', 30, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // 30 confirmed (non-ambiguous) callers — past both the risk
+            // threshold (>10 => "high") and direct_list_cap (25), so this
+            // proves risk_assessment is computed from the TRUE total, not
+            // just whatever survives truncation in the output `callers`.
+            for i in 0..30 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES (?1, 'mod.hub', 'src/caller.rs', 'src/lib.rs', 'resolved', ?2)",
+                    rusqlite::params![format!("mod.caller_{i}"), i + 1],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "hub".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["risk_assessment"], "high",
+            "risk must reflect all 30 confirmed callers (>10 threshold), not just the capped 25 shown: {v}"
+        );
+        assert_eq!(
+            v["callers"].as_array().unwrap().len(),
+            25,
+            "callers list itself must still be capped: {v}"
+        );
+        assert_eq!(v["callers_truncated"], true, "{v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_edges_etag_conditional_fetch_omits_only_callers_and_callees() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "foo".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+        let etag = first["edges_etag"]
+            .as_str()
+            .expect("first call must report edges_etag")
+            .to_string();
+        assert!(first.get("edges_not_modified").is_none());
+        let first_risk = first["risk_assessment"].clone();
+        let first_range_checksum = first["range_checksum"].clone();
+
+        let second = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "foo".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: Some(etag),
+                },
+            )),
+        );
+        assert_eq!(second["edges_not_modified"], true, "{second}");
+        assert_eq!(second["callers"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["callees"].as_array().unwrap().len(), 0, "{second}");
+        // Everything else must still be fully present and fresh, never
+        // gated behind edges_etag — this is the mandatory pre-edit tool.
+        assert_eq!(
+            second["risk_assessment"], first_risk,
+            "risk_assessment must always be recomputed and present, even on an edges-not-modified response: {second}"
+        );
+        assert_eq!(
+            second["range_checksum"], first_range_checksum,
+            "range_checksum must always be present: {second}"
+        );
+        assert!(
+            second.get("dead_code_confidence").is_some(),
+            "dead_code_confidence must always be present: {second}"
+        );
+        assert!(
+            second.get("blast_radius").is_some(),
+            "blast_radius must always be present: {second}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1776,6 +1903,7 @@ mod tests {
                 symbol: "model_fn".into(),
                 path: None,
                 line: None,
+                if_none_match: None,
             },
         ));
         let v = jv(output);
@@ -1813,6 +1941,7 @@ mod tests {
                 symbol: "a".into(),
                 path: None,
                 line: None,
+                if_none_match: None,
             },
         ));
         let v = jv(output);
@@ -1857,6 +1986,7 @@ mod tests {
                 symbol: "a".into(),
                 path: None,
                 line: None,
+                if_none_match: None,
             },
         ));
         let v = jv(output);
@@ -3092,6 +3222,7 @@ mod tests {
                 line: Some(41),
                 transitive: false,
                 max_depth: None,
+                if_none_match: None,
             })),
         );
         assert_eq!(
@@ -3105,6 +3236,365 @@ mod tests {
             "the fan-out edge is bucketed as ambiguous"
         );
         assert_eq!(v["ambiguous"][0]["edge_confidence"], "ambiguous");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callers_if_none_match_returns_not_modified() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        let etag = first["etag"]
+            .as_str()
+            .expect("first call must report an etag")
+            .to_string();
+        assert!(
+            first.get("not_modified").is_none(),
+            "first call has nothing to compare against, must not be not_modified: {first}"
+        );
+        assert_eq!(first["direct_count"], 1);
+        assert_eq!(first["direct"].as_array().unwrap().len(), 1);
+
+        let second = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: Some(etag.clone()),
+            })),
+        );
+        assert_eq!(
+            second["not_modified"], true,
+            "matching if_none_match must report not_modified: {second}"
+        );
+        assert_eq!(
+            second["etag"], etag,
+            "etag must stay stable across calls when the caller set is unchanged"
+        );
+        assert_eq!(
+            second["direct"].as_array().unwrap().len(),
+            0,
+            "not_modified response must omit the direct list: {second}"
+        );
+        assert_eq!(
+            second["direct_count"], 1,
+            "direct_count must still report the true total even when direct is omitted: {second}"
+        );
+
+        let stale = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: Some("deadbeefdeadbeef".into()),
+            })),
+        );
+        assert!(
+            stale.get("not_modified").is_none(),
+            "a stale/wrong if_none_match must fall through to a full response: {stale}"
+        );
+        assert_eq!(stale["direct"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callers_truncates_direct_list_past_cap_but_keeps_true_count() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 30, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // 30 direct callers — comfortably past the default direct_list_cap
+            // (25) so the cap must actually engage, the same shape as a real
+            // hub symbol (verified live against `extract_symbols`, 67 direct
+            // callers, in this repo's own index).
+            for i in 0..30 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES (?1, 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', ?2)",
+                    rusqlite::params![format!("mod.caller_{i}"), i + 1],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+
+        assert_eq!(v["direct_count"], 30, "true total must be reported regardless of cap: {v}");
+        assert_eq!(
+            v["direct"].as_array().unwrap().len(),
+            25,
+            "direct list itself must be capped at config.callers.direct_list_cap (25): {v}"
+        );
+        assert_eq!(v["direct_truncated"], true, "must flag that truncation happened: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callers_orders_non_test_callers_before_test_callers_even_when_alphabetically_later() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_istest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 21, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // 20 test callers in a path that sorts BEFORE the real caller's
+            // path alphabetically ('a_tests.rs' < 'z_prod.rs') — reproduces
+            // the real extract_symbols shape (66 test call sites in
+            // parser.rs vs. 1 real caller in a later-sorting file), just
+            // with a small cap (3) so the test runs fast.
+            for i in 0..20 {
+                let test_symbol = format!("a_tests.rs::test_case_{i}");
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                     VALUES (?1, ?1, 'function', 'rust', 'a_tests.rs', ?2, ?2, '', '', '', 0, 0, 0, 1)",
+                    rusqlite::params![test_symbol, i + 1],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES (?1, 'mod.foo', 'a_tests.rs', 'src/lib.rs', 'resolved', ?2)",
+                    rusqlite::params![test_symbol, i + 1],
+                )
+                .unwrap();
+            }
+            // the one real (non-test) production caller
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('z_prod.rs::real_caller', 'real_caller', 'function', 'rust', 'z_prod.rs', 1, 1, '', '', '', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('z_prod.rs::real_caller', 'mod.foo', 'z_prod.rs', 'src/lib.rs', 'textual', 99)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+
+        assert_eq!(v["direct_count"], 21, "true total: {v}");
+        let direct = v["direct"].as_array().unwrap();
+        assert!(
+            direct
+                .iter()
+                .any(|e| e["symbol"] == "z_prod.rs::real_caller"),
+            "the one real production caller must appear in direct (within the default cap) \
+             despite its path sorting alphabetically after all 20 test-file call sites: {v}"
+        );
+        assert_eq!(
+            direct[0]["symbol"], "z_prod.rs::real_caller",
+            "non-test callers must be ordered before test callers, so the production \
+             caller should be first, not buried behind 20 test call sites: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callees_includes_call_site_line_preview_and_edges_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_callees_line_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/caller.rs"), "fn bar() {\n    foo();\n}\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.bar', 'bar', 'function', 'rust', 'src/caller.rs', 1, 3, 'fn bar()', '', 'bar', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                symbol: "bar".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+
+        assert_eq!(v["edges_ready"], false, "edges not built yet in this test");
+        assert_eq!(v["direct"][0]["line"], 2);
+        assert_eq!(v["direct"][0]["preview"], "foo();");
+        assert_eq!(v["direct"][0]["symbol"], "mod.foo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callees_if_none_match_returns_not_modified() {
+        let dir = std::env::temp_dir().join(format!("ci_callees_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.bar', 'bar', 'function', 'rust', 'src/caller.rs', 1, 1, 'fn bar()', '', 'bar', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = jv(
+            server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                symbol: "bar".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        let etag = first["etag"]
+            .as_str()
+            .expect("first call must report an etag")
+            .to_string();
+        assert!(first.get("not_modified").is_none());
+        assert_eq!(first["direct_count"], 1);
+
+        let second = jv(
+            server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                symbol: "bar".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: Some(etag.clone()),
+            })),
+        );
+        assert_eq!(second["not_modified"], true, "{second}");
+        assert_eq!(second["direct"].as_array().unwrap().len(), 0, "{second}");
+        assert_eq!(second["direct_count"], 1, "{second}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callees_truncates_direct_list_past_cap_but_keeps_true_count() {
+        let dir = std::env::temp_dir().join(format!("ci_callees_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.bar', 'bar', 'function', 'rust', 'src/caller.rs', 1, 1, 'fn bar()', '', 'bar', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // 30 direct callees, comfortably past the default direct_list_cap (25).
+            for i in 0..30 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES ('mod.bar', ?1, 'src/caller.rs', 'src/lib.rs', 'resolved', ?2)",
+                    rusqlite::params![format!("mod.callee_{i}"), i + 1],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                symbol: "bar".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+
+        assert_eq!(v["direct_count"], 30, "{v}");
+        assert_eq!(v["direct"].as_array().unwrap().len(), 25, "{v}");
+        assert_eq!(v["direct_truncated"], true, "{v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

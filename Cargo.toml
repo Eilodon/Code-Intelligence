@@ -93,6 +93,12 @@ tree-sitter-dart = "=0.0.4"
 # API) is the modern `tree-sitter-language = "0.1.0"` shim, same pattern as
 # kotlin-ng/scala.
 tree-sitter-lua = "=0.2.0"
+# Phase C (2026-07-11): unlike every other Tier-0.5 grammar pinned in this
+# file, tree-sitter-elixir's LATEST published version (0.3.5) is already
+# ABI 14 — no cliff to pin below. Still pinned EXACT per this file's policy
+# (verified via downloaded .crate tarball + src/parser.c grep, not assumed).
+# Real dependency is the modern `tree-sitter-language = "0.1.0"` shim.
+tree-sitter-elixir = "=0.3.5"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"

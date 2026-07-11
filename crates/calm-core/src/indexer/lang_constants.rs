@@ -25,6 +25,21 @@ pub struct LangConstants {
     pub class_node_types: &'static [&'static str],
     /// Field on a class node naming the type (Rust `impl` uses `type`, others `name`).
     pub class_name_field: &'static str,
+    /// Callee names that structurally look like an ordinary call (a
+    /// `call_node_types` match) but actually introduce a new definition —
+    /// needed for a homoiconic/macro-based grammar where there is no
+    /// distinct function-definition node kind at all. Elixir is the only
+    /// current example: `def foo(x) do...end` parses as a macro *call* to
+    /// `def`, structurally identical to `format_greeting(x)` — the only way
+    /// to tell them apart is the callee's actual TEXT, which neither
+    /// `resolve_name_node` nor `walk_calls` can normally see (they dispatch
+    /// on node *kind*, never content). When non-empty, `resolve_name_node`
+    /// checks a `call_node_types` match's callee text against this list to
+    /// recognize a definition (see its `"call"` arm), and `walk_calls`
+    /// excludes that same node from being treated as an ordinary call site
+    /// (see `is_definition_macro_call`). Empty for every other language —
+    /// zero behavior change there.
+    pub definition_macro_names: &'static [&'static str],
 }
 
 /// Per-language descriptor consolidating every source-level dispatch point a
@@ -236,6 +251,15 @@ fn ts_lang_lua() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-elixir")]
+fn ts_lang_elixir() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_elixir::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-elixir"))]
+fn ts_lang_elixir() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -259,6 +283,7 @@ const JS_TS_CONSTANTS: LangConstants = LangConstants {
     call_function_field_by_kind: &[],
     class_node_types: &["class_declaration"],
     class_name_field: "name",
+    definition_macro_names: &[],
 };
 
 const JS_TS_BRANCH_KINDS: &[&str] = &[
@@ -296,6 +321,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_definition"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_python,
         branch_node_kinds: &[
@@ -336,6 +362,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["impl_item", "trait_item"],
             class_name_field: "type",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_rust,
         branch_node_kinds: &[
@@ -377,6 +404,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &[],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_go,
         branch_node_kinds: &[
@@ -449,6 +477,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
                 "record_declaration",
             ],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_java,
         branch_node_kinds: &[
@@ -492,6 +521,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class", "module"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_ruby,
         branch_node_kinds: &[],
@@ -540,6 +570,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
                 "trait_declaration",
             ],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_php,
         branch_node_kinds: &[],
@@ -596,6 +627,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_declaration", "object_declaration"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_kotlin,
         branch_node_kinds: &[],
@@ -653,6 +685,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_declaration", "protocol_declaration"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_swift,
         branch_node_kinds: &[],
@@ -703,6 +736,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
                 "enum_declaration",
             ],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_csharp,
         branch_node_kinds: &[],
@@ -742,6 +776,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &[],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_shell,
         branch_node_kinds: &[],
@@ -776,6 +811,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &[],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_c,
         branch_node_kinds: &[],
@@ -818,6 +854,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_specifier", "struct_specifier", "enum_specifier"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_cpp,
         branch_node_kinds: &[],
@@ -867,6 +904,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &[],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_r,
         // `switch()` in R is an ordinary call, not grammar-level branching, so
@@ -917,6 +955,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_definition", "object_definition", "trait_definition"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_scala,
         branch_node_kinds: &[
@@ -993,6 +1032,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &["class_definition"],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_dart,
         branch_node_kinds: &[
@@ -1046,6 +1086,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             call_function_field_by_kind: &[],
             class_node_types: &[],
             class_name_field: "name",
+            definition_macro_names: &[],
         },
         ts_language: ts_lang_lua,
         branch_node_kinds: &[
@@ -1064,6 +1105,62 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         // `function foo()` the shallow detector's prefix check matches.
         modifier_keywords: &["local "],
         shallow_detect: Some(crate::indexer::parser::detect_lua),
+    },
+    // Elixir (Phase C, 2026-07-11): the latest published grammar (0.3.5) is
+    // already ABI 14 — no cliff to pin below here, unlike every other
+    // Tier-0.5 grammar so far (still pinned EXACT per this file's policy).
+    //
+    // Architecturally unlike every other language in this registry: Elixir
+    // is homoiconic, so `def`/`defp`/`defmodule`/etc are ordinary MACRO
+    // CALLS, not a distinct grammar node kind at all — verified via a real
+    // AST dump, not guessed: `def greet(name) do...end` parses as
+    // `(call target: (identifier "def") (arguments (call target: (identifier
+    // "greet") (arguments (identifier "name")))) (do_block ...))`,
+    // structurally identical to an ordinary call like `format_greeting(x)`
+    // except for the literal TEXT of the `target` identifier. Neither
+    // `resolve_name_node` nor `walk_calls` normally look at node TEXT, only
+    // node KIND — `definition_macro_names` (see its doc comment on
+    // `LangConstants`) is the escape hatch this required, generalized (not
+    // Elixir-only in the type system) rather than a one-off hack.
+    //
+    // Deliberate scope cut for this pass, not full Elixir support:
+    // - Only "def"/"defp" are recognized as definitions. defmodule,
+    //   defmacro(p), defprotocol, defimpl, defguard(p), defdelegate,
+    //   defstruct, defexception are NOT — defmodule itself never becomes a
+    //   symbol, so there is also no module-based `class_context` (every
+    //   function is a flat `SymbolKind::Function`, same treatment as
+    //   Lua/Go's lack of `class_node_types`). Left as documented future
+    //   work rather than attempted under this pass's time budget.
+    // - `call_node_types: &["call"]` means ordinary calls (`IO.puts(...)`,
+    //   `format_greeting(x)`) DO get call-graph edges — verified via
+    //   `test_elixir_real_grammar_symbols_and_calls_are_accurate`, which
+    //   also asserts a `def`/`defp` node is never itself misread as a call
+    //   site (the nested `call` representing a function's own name+params,
+    //   e.g. the "greet" in `def greet(name) do`, sits inside `def`'s own
+    //   `arguments` — outside any `do_block` — so it's never visited with
+    //   the function's body as its enclosing context).
+    LanguageSpec {
+        name: "elixir",
+        aliases: &[],
+        extensions: &["ex", "exs"],
+        constants: LangConstants {
+            function_node_types: &["call"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["call"],
+            call_function_field: "target",
+            call_function_field_by_kind: &[],
+            class_node_types: &[],
+            class_name_field: "name",
+            definition_macro_names: &["def", "defp"],
+        },
+        ts_language: ts_lang_elixir,
+        branch_node_kinds: &[],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        modifier_keywords: &[],
+        shallow_detect: Some(crate::indexer::parser::detect_elixir),
     },
 ];
 

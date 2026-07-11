@@ -181,8 +181,30 @@ pub fn extract_symbols_from_tree(
 /// a `variable_declarator` child (only followed when the declarator's value is
 /// itself a function literal, so plain `const x = 5` is not treated as a
 /// symbol).
+/// Whether `node` is a call this language's grammar can't structurally
+/// distinguish from a real definition (Elixir: `def foo(x) do...end` is
+/// literally a macro *call* to `def`) — checked by callee TEXT via
+/// `definition_macro_names`, since no node-kind-level signal exists. Empty
+/// `definition_macro_names` (every language but Elixir) means this is
+/// always `false` — zero behavior change for everyone else.
+fn is_definition_macro_call(
+    node: tree_sitter::Node,
+    source: &str,
+    lc: &crate::indexer::lang_constants::LangConstants,
+) -> bool {
+    if lc.definition_macro_names.is_empty() {
+        return false;
+    }
+    let Some(target) = node.child_by_field_name("target") else {
+        return false;
+    };
+    let target_text = &source[target.byte_range()];
+    lc.definition_macro_names.contains(&target_text)
+}
+
 fn resolve_name_node<'a>(
     node: tree_sitter::Node<'a>,
+    source: &str,
     lc: &crate::indexer::lang_constants::LangConstants,
 ) -> Option<tree_sitter::Node<'a>> {
     if let Some(n) = node.child_by_field_name(lc.name_field) {
@@ -300,6 +322,31 @@ fn resolve_name_node<'a>(
         "lambda_expression" => node
             .child_by_field_name("parameters")
             .and_then(|p| p.child_by_field_name("name")),
+        // Elixir: homoiconic grammar, `def`/`defp` are macro calls (node
+        // kind "call"), not a distinct definition node — see
+        // `is_definition_macro_call` above and `LangConstants::
+        // definition_macro_names`'s doc comment for the full story. Once
+        // recognized as a real definition (not an ordinary call, which
+        // falls through to `None` here, same as this arm never firing for
+        // any other language), the defined name is the macro's own first
+        // argument: a nested `call` (`greet(name)`, even with zero args —
+        // `greet()` is still a `call`) when parens are present, or a bare
+        // `identifier` when parens are omitted entirely (`def foo do
+        // ...end` — valid Elixir). Verified via a real AST dump, not
+        // guessed.
+        "call" if is_definition_macro_call(node, source, lc) => {
+            let mut cursor = node.walk();
+            let arguments = node
+                .children(&mut cursor)
+                .find(|c| c.kind() == "arguments")?;
+            let mut arg_cursor = arguments.walk();
+            let first_arg = arguments.children(&mut arg_cursor).next()?;
+            match first_arg.kind() {
+                "call" => first_arg.child_by_field_name("target"),
+                "identifier" => Some(first_arg),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -352,7 +399,7 @@ fn walk_symbols(
 ) {
     // A symbol defined here belongs to the class we are currently inside.
     if lc.function_node_types.contains(&node.kind())
-        && let Some(name_node) = resolve_name_node(node, lc)
+        && let Some(name_node) = resolve_name_node(node, source, lc)
     {
         let name = source[name_node.byte_range()].to_string();
 
@@ -1128,7 +1175,7 @@ fn walk_calls(
     // all). Without this, a call made *inside* one of those forms silently
     // got attributed to no enclosing symbol (or the wrong one).
     if consts.function_node_types.contains(&node.kind())
-        && let Some(name_node) = resolve_name_node(node, consts)
+        && let Some(name_node) = resolve_name_node(node, source, consts)
     {
         current = Some((
             source[name_node.byte_range()].to_string(),
@@ -1144,6 +1191,7 @@ fn walk_calls(
     };
 
     if consts.call_node_types.contains(&node.kind())
+        && !is_definition_macro_call(node, source, consts)
         && let Some((enc_name, enc_line)) = &current
         && let field_name = consts
             .call_function_field_by_kind
@@ -1237,8 +1285,24 @@ fn walk_calls(
         });
     }
 
+    // Elixir: a definition-macro call's own "arguments" child is its
+    // SIGNATURE (the name+params wrapper `resolve_name_node` above just
+    // extracted the name from, e.g. "greet" in `def greet(name) do`), not
+    // real code — recursing into it would visit that same nested
+    // `call(target: "greet")` node again as an ordinary call site and
+    // record a phantom self-call (`greet` "calling" itself). Skipped only
+    // for a `is_definition_macro_call` node, which is only ever true when
+    // `definition_macro_names` is non-empty (Elixir only) — every other
+    // language keeps recursing into every child exactly as before. Found
+    // via a real failing assertion (`extract_calls` returning a bogus
+    // `RawCall { enclosing_name: "greet", callee: "greet" }` edge), not
+    // guessed.
+    let skip_definition_signature = is_definition_macro_call(node, source, consts);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if skip_definition_signature && child.kind() == "arguments" {
+            continue;
+        }
         walk_calls(
             child,
             source,
@@ -2087,6 +2151,17 @@ pub(crate) fn detect_lua(s: &str) -> Option<(String, SymbolKind)> {
     let rest = s.strip_prefix("function ")?;
     let name = lua_ident_at_start(rest)?;
     Some((name, SymbolKind::Function))
+}
+
+pub(crate) fn detect_elixir(s: &str) -> Option<(String, SymbolKind)> {
+    for kw in ["def ", "defp "] {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, SymbolKind::Function));
+        }
+    }
+    None
 }
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
@@ -3544,6 +3619,15 @@ public class FooTest {
             "should detect method-colon function"
         );
     }
+
+    #[test]
+    fn test_shallow_elixir() {
+        let code = "def greet(name) do\ndefp format_greeting(name) do\n";
+        let syms = extract_symbols_shallow(code, "elixir", "a.ex");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"greet"), "should detect def");
+        assert!(names.contains(&"format_greeting"), "should detect defp");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -3985,6 +4069,79 @@ class Foo {
                 && c.callee == "greet"
                 && c.receiver.as_deref() == Some("g")),
             "method-colon call on a local var should produce a call edge with receiver: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-elixir")]
+    fn test_tier0_5_grammar_loads_elixir() {
+        assert!(
+            parse_tree("def main do\nend\n", "elixir").is_some(),
+            "tree-sitter-elixir grammar should load and parse — locks the pinned ABI \
+             (=0.3.5, ABI 14)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-elixir")]
+    fn test_elixir_real_grammar_symbols_and_calls_are_accurate() {
+        // Elixir's grammar is homoiconic: `def`/`defp`/`defmodule`/etc are
+        // ordinary macro *calls*, not a distinct node kind — structurally
+        // indistinguishable from `IO.puts(...)` without checking the
+        // callee's actual TEXT ("def" vs anything else). `definition_macro_names`
+        // (LangConstants) is what makes that text check possible; see its
+        // doc comment and the Elixir LanguageSpec entry in lang_constants.rs.
+        // Scope cut for this pass: only "def"/"defp" are recognized as
+        // definitions (not defmodule/defmacro/defprotocol/etc), and there is
+        // no class_context (no module-nesting support) — every function is
+        // a flat top-level SymbolKind::Function, same treatment as Lua/Go's
+        // lack of class_node_types.
+        let code = "defmodule Greeter do\n  def greet(name) do\n    IO.puts(\"hello\")\n    format_greeting(name)\n  end\n\n  defp format_greeting(name) do\n    \"Hello, \" <> name\n  end\nend\n";
+        let symbols = extract_symbols(code, "elixir", "a.ex").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"greet"), "should detect def: {names:?}");
+        assert!(
+            names.contains(&"format_greeting"),
+            "should detect defp: {names:?}"
+        );
+        assert!(
+            !names.contains(&"defmodule") && !names.contains(&"Greeter"),
+            "defmodule itself should NOT be extracted as a symbol in this pass: {names:?}"
+        );
+
+        let greet = symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("greet should be found");
+        assert_eq!(greet.kind, SymbolKind::Function);
+
+        let calls = extract_calls(code, "elixir", "a.ex").unwrap();
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "greet"
+                && c.callee == "puts"
+                && c.receiver.as_deref() == Some("IO")),
+            "qualified call (IO.puts) should produce a call edge with receiver: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "greet" && c.callee == "format_greeting"),
+            "bare call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.callee == "def" || c.callee == "defp"),
+            "def/defp must never themselves be misread as an ordinary call site: {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "exactly 2 real call edges expected (IO.puts and format_greeting from \
+             greet, and <> from format_greeting counts as a binary_operator not \
+             a call) — catches a phantom self-call regression (a def's own \
+             name+params wrapper node, e.g. \"greet\" in `def greet(name) do`, \
+             misread as an ordinary call to itself): {calls:?}"
         );
     }
 }

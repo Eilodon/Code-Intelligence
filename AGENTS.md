@@ -161,8 +161,15 @@ edit_context("getUserByEmail")
 ```
 edit_symbol("getUserByEmail", expected_hash=<range_checksum from edit_context>, new_text="...")
   # confirm:true required if risk_assessment=="high" or is_hub — edit_context already told you which
+edit_symbol("getUserByEmail", position="after", new_text="...")
+  # INSERT relative to a symbol instead of replacing it: "before" / "after" (new sibling) /
+  # "append_inside" (end of body). Anchored on a fresh parse of the file on disk — no line
+  # numbers, no expected_hash, no preview round trip; immune to stale line offsets. Use this
+  # for "add a new test/function after X" instead of computing edit_lines line numbers.
 edit_lines(path="Cargo.toml", edits=[{start_line, end_line, new_text}])
   # for anything outside a parsed symbol body — imports, config, docs; edit_symbol only covers symbols
+  # a hash match proves CONTENT, not POSITION: if the response carries other_matches/"position
+  # warning", the range's content exists elsewhere too — re-check line numbers before applying
 ```
 
 After `edit_context` confirms you understand the blast radius, make the change:

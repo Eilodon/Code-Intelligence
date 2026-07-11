@@ -28,7 +28,7 @@ impl CalmServer {
 
     #[tool(
         name = "edit_symbol",
-        description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context) to its [line_start, line_end] and replaces the whole thing in one hunk. USE WHEN: replacing an entire function/class/method body by name. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those."
+        description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position=\"replace\" swaps the symbol's whole [line_start, line_end] for new_text in one hunk (needs expected_hash). position=\"before\"/\"after\"/\"append_inside\" instead INSERTS new_text relative to the symbol, anchored on a fresh parse of the file on disk — no line numbers, no expected_hash, no preview round trip, immune to stale line offsets (append_inside = end of a class/function body; after = new sibling below it, e.g. a new test after the last existing test). USE WHEN: replacing an entire function/class/method body by name, or inserting new code relative to one. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those."
     )]
     pub(crate) fn edit_symbol(
         &self,
@@ -48,11 +48,34 @@ impl CalmServer {
                     SymbolResolution::Found(c) => *c,
                 }
             };
-            let hunk = calm_core::edit::HunkRequest {
-                start_line: c.line_start as usize,
-                end_line: c.line_end as usize,
-                expected_hash: p.expected_hash,
-                new_text: p.new_text,
+            let hunk = match p.position.as_deref().unwrap_or("replace") {
+                "replace" => calm_core::edit::HunkRequest {
+                    start_line: c.line_start as usize,
+                    end_line: c.line_end as usize,
+                    expected_hash: p.expected_hash,
+                    new_text: p.new_text,
+                },
+                pos @ ("before" | "after" | "append_inside") => {
+                    let position = match pos {
+                        "before" => calm_core::edit::InsertPosition::Before,
+                        "after" => calm_core::edit::InsertPosition::After,
+                        _ => calm_core::edit::InsertPosition::AppendInside,
+                    };
+                    match insertion_hunk_for(&self.project_root, &c, position, &p.new_text) {
+                        Ok(h) => h,
+                        Err(detail) => return ResolvedOutcome::error(detail),
+                    }
+                }
+                other => {
+                    return ResolvedOutcome::error(error_detail(
+                        "INVALID_POSITION",
+                        &format!(
+                            "unknown position {other:?} — use \"replace\" (default), \
+                             \"before\", \"after\", or \"append_inside\""
+                        ),
+                        false,
+                    ));
+                }
             };
             self.edit_lines_impl(&c.path, vec![hunk], p.confirm)
                 .into_resolved()
@@ -65,7 +88,10 @@ impl CalmServer {
     /// pre-edit symbol ranges) → atomic write → reindex (same
     /// `reindex_changed` + `embed_pending*` gate the file watcher uses, so
     /// the DB is never observably staler than a watcher-driven update) →
-    /// post-edit symbol lookup for the response.
+    /// post-edit symbol lookup for the response. Failures BEFORE the write
+    /// are tool errors; failures AFTER it surface as a success with
+    /// `index_stale: true` — the disk write already happened, and reporting
+    /// it as an error made agents re-apply edits that had in fact landed.
     fn edit_lines_impl(
         &self,
         path: &str,
@@ -137,7 +163,45 @@ impl CalmServer {
             .map(EditHunkResultOutput::from)
             .collect();
 
+        // A hash proves WHAT is at a range, not WHERE the range is: when the
+        // same content exists at other line windows of this file (a lone `}`
+        // line has dozens of twins), a stale line number can still hash-match
+        // and the edit lands at the wrong spot. Surface that on every
+        // response that reports such a hunk — preview AND applied.
+        let ambiguity_note = {
+            let flagged: Vec<String> = outcome
+                .results
+                .iter()
+                .filter(|r| r.content_occurrences > 1)
+                .map(|r| {
+                    format!(
+                        "{}..{} ({} identical elsewhere)",
+                        r.start_line,
+                        r.end_line,
+                        r.content_occurrences - 1
+                    )
+                })
+                .collect();
+            (!flagged.is_empty()).then(|| {
+                format!(
+                    "position warning — the content of range(s) {} also appears elsewhere in \
+                     this file, so a hash match verifies content, not position; double-check \
+                     the line numbers or anchor on structure with edit_symbol \
+                     position=\"before\"/\"after\"/\"append_inside\"",
+                    flagged.join(", ")
+                )
+            })
+        };
+
         if !outcome.all_applied {
+            let mut note = String::from(
+                "nothing written — some hunk was a preview or had a stale hash; \
+                 retry with the current_hash shown for each hunk",
+            );
+            if let Some(a) = &ambiguity_note {
+                note.push_str(". ");
+                note.push_str(a);
+            }
             return ToolOutcome::success(EditLinesOutput {
                 path: path.to_string(),
                 applied: false,
@@ -145,11 +209,8 @@ impl CalmServer {
                 parse_status: None,
                 touched_symbols: vec![],
                 risk_assessment: None,
-                note: Some(
-                    "nothing written — some hunk was a preview or had a stale hash; \
-                     retry with the current_hash shown for each hunk"
-                        .into(),
-                ),
+                index_stale: None,
+                note: Some(note),
                 suggested_next: None,
             });
         }
@@ -207,76 +268,99 @@ impl CalmServer {
             ));
         }
 
-        let mut write_conn = match calm_core::db::conn::open_writer(&self.db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                drop(_cross_guard);
-                drop(_guard);
-                return ToolOutcome::error(error_detail(
-                    "DB_ERROR",
-                    &format!(
-                        "wrote {path} but could not open DB to reindex: {e} — call indexing_status"
-                    ),
-                    true,
-                ));
-            }
-        };
-        match calm_core::indexer::pipeline::reindex_changed(&mut write_conn, &self.project_root) {
-            Ok(summary) if !summary.is_noop() => {
-                if let Some(model) = self.embedder() {
-                    if let Err(e) = calm_core::embedding::embed_pending(&write_conn, model.as_ref())
-                    {
-                        tracing::error!("edit_lines: incremental embedding failed: {e}");
+        // From here on the file on disk already holds the new content, so an
+        // index-refresh failure must NOT surface as a tool error: the error
+        // envelope is indistinguishable from the pre-write failures above
+        // ("nothing was written"), and agents receiving the old
+        // REINDEX_FAILED error re-verified or re-applied edits that had in
+        // fact succeeded. Collect the failure and report it as a stale-index
+        // warning on a success response instead.
+        let mut index_stale: Option<String> = None;
+        match calm_core::db::conn::open_writer(&self.db_path) {
+            Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
+            Ok(mut write_conn) => {
+                match calm_core::indexer::pipeline::reindex_changed(
+                    &mut write_conn,
+                    &self.project_root,
+                ) {
+                    Ok(summary) if !summary.is_noop() => {
+                        if let Some(model) = self.embedder() {
+                            if let Err(e) =
+                                calm_core::embedding::embed_pending(&write_conn, model.as_ref())
+                            {
+                                tracing::error!("edit_lines: incremental embedding failed: {e}");
+                            }
+                            if let Err(e) = calm_core::embedding::embed_pending_chunks(
+                                &write_conn,
+                                model.as_ref(),
+                            ) {
+                                tracing::error!(
+                                    "edit_lines: incremental chunk embedding failed: {e}"
+                                );
+                            }
+                        }
+                        // This reindex just ran rebuild_graph, which DELETEs every
+                        // call_edges row — including all `formal` upgrades from the
+                        // SCIP/LSP overlays — and re-resolves syntactically. The
+                        // watcher can't restore them either: by the time its file
+                        // event fires, this reindex already updated the hashes, so
+                        // its own reindex_changed is a no-op and its overlay hook
+                        // never runs. Root cause of the formal tier silently dying
+                        // after every CALM-tool edit (observed live 2026-07-10:
+                        // 0 formal edges in a DB whose sidecar recorded 2863
+                        // upgrades 30 minutes earlier). Fire-and-forget on a
+                        // background thread — same posture as the watcher's own
+                        // post-reindex hook — so the edit response isn't held for a
+                        // ~20s rust-analyzer batch run; `run_all_coalesced` keeps
+                        // rapid successive edits from stacking concurrent passes.
+                        #[cfg(feature = "scip-overlay")]
+                        {
+                            let root = self.project_root.clone();
+                            let db = self.db_path.clone();
+                            std::thread::spawn(move || {
+                                crate::scip_overlay::run_all_coalesced(&root, &db);
+                            });
+                        }
                     }
-                    if let Err(e) =
-                        calm_core::embedding::embed_pending_chunks(&write_conn, model.as_ref())
-                    {
-                        tracing::error!("edit_lines: incremental chunk embedding failed: {e}");
-                    }
+                    Ok(_) => {}
+                    Err(e) => index_stale = Some(format!("reindex failed: {e}")),
                 }
-                // This reindex just ran rebuild_graph, which DELETEs every
-                // call_edges row — including all `formal` upgrades from the
-                // SCIP/LSP overlays — and re-resolves syntactically. The
-                // watcher can't restore them either: by the time its file
-                // event fires, this reindex already updated the hashes, so
-                // its own reindex_changed is a no-op and its overlay hook
-                // never runs. Root cause of the formal tier silently dying
-                // after every CALM-tool edit (observed live 2026-07-10:
-                // 0 formal edges in a DB whose sidecar recorded 2863
-                // upgrades 30 minutes earlier). Fire-and-forget on a
-                // background thread — same posture as the watcher's own
-                // post-reindex hook — so the edit response isn't held for a
-                // ~20s rust-analyzer batch run; `run_all_coalesced` keeps
-                // rapid successive edits from stacking concurrent passes.
-                #[cfg(feature = "scip-overlay")]
-                {
-                    let root = self.project_root.clone();
-                    let db = self.db_path.clone();
-                    std::thread::spawn(move || {
-                        crate::scip_overlay::run_all_coalesced(&root, &db);
-                    });
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                drop(write_conn);
-                drop(_cross_guard);
-                drop(_guard);
-                return ToolOutcome::error(error_detail(
-                    "REINDEX_FAILED",
-                    &format!(
-                        "wrote {path} but reindex failed: {e} — index may be stale, call indexing_status"
-                    ),
-                    true,
-                ));
             }
         }
-        drop(write_conn);
         drop(_cross_guard);
         drop(_guard);
 
+        // Session tracking must reflect what hit the disk even when the
+        // index refresh didn't: skipping these on the stale path exempted
+        // the write from the diff_impact pre-commit gate.
         self.track_file(path);
         self.mark_written(path);
+
+        if let Some(detail) = index_stale {
+            let mut note = format!(
+                "edit APPLIED — {path} on disk is correct, but the index could not be \
+                 refreshed ({detail}); do NOT re-apply or rewrite. Symbol line numbers may \
+                 be stale until the index recovers"
+            );
+            if let Some(a) = &ambiguity_note {
+                note.push_str(". ");
+                note.push_str(a);
+            }
+            return ToolOutcome::success(EditLinesOutput {
+                path: path.to_string(),
+                applied: true,
+                hunks: hunks_output,
+                parse_status: Some(parse_status.to_string()),
+                touched_symbols: vec![],
+                risk_assessment: risk,
+                index_stale: Some(true),
+                note: Some(note),
+                suggested_next: self.filter_sn(suggested(
+                    "indexing_status",
+                    "Index is stale after a successful write — check and recover",
+                )),
+            });
+        }
 
         let touched_symbols = {
             let conn = match self.make_read_conn() {
@@ -289,6 +373,7 @@ impl CalmServer {
                         parse_status: Some(parse_status.to_string()),
                         touched_symbols: vec![],
                         risk_assessment: risk,
+                        index_stale: None,
                         note: Some("edit applied but could not re-query touched symbols".into()),
                         suggested_next: None,
                     });
@@ -310,7 +395,8 @@ impl CalmServer {
             parse_status: Some(parse_status.to_string()),
             touched_symbols,
             risk_assessment: risk,
-            note: None,
+            index_stale: None,
+            note: ambiguity_note,
             suggested_next: self.filter_sn(suggested(
                 "diff_impact",
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
@@ -381,6 +467,71 @@ fn compute_touch_risk(
     (risk, hub_hit, touched)
 }
 
+/// Builds the insertion hunk for `edit_symbol`'s `position` modes. The
+/// indexed `[line_start, line_end]` of `c` is only a hint here: the range
+/// is re-resolved from a fresh parse of the file on disk, so an index left
+/// stale by an earlier failed reindex can't steer the insertion to a wrong
+/// offset — the exact failure mode of trusting remembered line numbers.
+/// Languages without a parse tree (docs, configs, shallow-tier grammars)
+/// fall back to the indexed range; the anchor-line hash pre-filled by
+/// `insertion_hunk` still conflict-checks the write either way.
+fn insertion_hunk_for(
+    project_root: &std::path::Path,
+    c: &CandidateRow,
+    position: calm_core::edit::InsertPosition,
+    new_text: &str,
+) -> Result<calm_core::edit::HunkRequest, ErrorDetail> {
+    let full_path = project_root.join(&c.path);
+    let live = std::fs::read_to_string(&full_path).map_err(|e| {
+        error_detail("READ_FAILED", &format!("could not read {}: {e}", c.path), false)
+    })?;
+    let (line_start, line_end) =
+        match calm_core::indexer::parser::extract_symbols(&live, &c.language, &c.path) {
+            Ok(symbols) => match best_live_range(&symbols, &c.name, c.line_start) {
+                Some(range) => range,
+                None => {
+                    return Err(error_detail(
+                        "STALE_SYMBOL",
+                        &format!(
+                            "'{}' was not found in a fresh parse of {} — the index entry is \
+                             stale; call indexing_status, then re-resolve the symbol",
+                            c.name, c.path
+                        ),
+                        true,
+                    ));
+                }
+            },
+            Err(_) => (c.line_start as usize, c.line_end as usize),
+        };
+    calm_core::edit::insertion_hunk(&live, line_start, line_end, position, new_text).ok_or_else(
+        || {
+            error_detail(
+                "INVALID_RANGE",
+                &format!(
+                    "resolved range {line_start}..{line_end} is out of bounds for {} on disk",
+                    c.path
+                ),
+                true,
+            )
+        },
+    )
+}
+
+/// Picks the live-parse occurrence of `name` whose start is nearest the
+/// indexed one — same-named symbols (overloads, `#[cfg]` twins) tie-break
+/// to the least-shifted candidate.
+fn best_live_range(
+    symbols: &[calm_core::indexer::parser::ParsedSymbol],
+    name: &str,
+    indexed_start: i64,
+) -> Option<(usize, usize)> {
+    symbols
+        .iter()
+        .filter(|s| s.name == name)
+        .min_by_key(|s| (s.line_start as i64 - indexed_start).abs())
+        .map(|s| (s.line_start, s.line_end))
+}
+
 // ---------------------------------------------------------------------------
 // Params / Output
 // ---------------------------------------------------------------------------
@@ -434,10 +585,27 @@ pub(crate) struct EditSymbolParams {
     pub(crate) line: Option<i64>,
     /// Same contract as `edit_lines`' hunk `expected_hash` — omit to
     /// preview the symbol's current hash/content instead of writing.
+    /// Ignored by the insertion `position` modes, which anchor and hash
+    /// themselves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expected_hash: Option<String>,
-    /// Full replacement text for the symbol's `[line_start, line_end]`.
+    /// With the default `position` ("replace"): full replacement text for
+    /// the symbol's `[line_start, line_end]`. With an insertion `position`:
+    /// the new code to insert — the symbol itself is left untouched.
     pub(crate) new_text: String,
+    /// One of `"replace"` (default), `"before"`, `"after"`,
+    /// `"append_inside"`. `"replace"` swaps the symbol's whole range for
+    /// `new_text`. The other three INSERT `new_text` relative to the
+    /// symbol: `"before"` = directly above it, `"after"` = directly below
+    /// it (a new sibling — e.g. add a test after the last test in a
+    /// module), `"append_inside"` = at the end of its body (above the
+    /// closing delimiter when one exists). Insertion modes re-resolve the
+    /// symbol's range from a fresh parse of the file on disk and pre-fill
+    /// the anchor hash themselves, so no `expected_hash`, preview round
+    /// trip, or line arithmetic is needed — they cannot land at a stale
+    /// line offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position: Option<String>,
     #[serde(default)]
     pub(crate) confirm: bool,
 }
@@ -458,6 +626,12 @@ pub(crate) struct EditHunkResultOutput {
     /// now ends at (`start_line` is unchanged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) new_end_line: Option<i64>,
+    /// Present when the range's pre-edit content is byte-identical to N
+    /// OTHER line windows of this file (a lone `}` line, say): the hash
+    /// proves content, not position — verify the line numbers point where
+    /// intended, or anchor structurally via edit_symbol's `position`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) other_matches: Option<i64>,
 }
 
 impl From<&calm_core::edit::HunkResult> for EditHunkResultOutput {
@@ -475,6 +649,8 @@ impl From<&calm_core::edit::HunkResult> for EditHunkResultOutput {
             current_hash: r.current_hash.clone(),
             old_text: r.old_text.clone(),
             new_end_line: applied.then_some(r.new_end_line as i64),
+            other_matches: (r.content_occurrences > 1)
+                .then_some(r.content_occurrences as i64 - 1),
         }
     }
 }
@@ -502,6 +678,12 @@ pub(crate) struct EditLinesOutput {
     pub(crate) touched_symbols: Vec<TouchedSymbolOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) risk_assessment: Option<String>,
+    /// `true` only when `applied` is `true` but the post-write index
+    /// refresh failed: the file on disk holds the new content — do NOT
+    /// re-apply — while symbol line numbers served from the index may lag
+    /// until it recovers (see `note`, and call `indexing_status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) index_stale: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

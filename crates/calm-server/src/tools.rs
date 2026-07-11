@@ -4445,6 +4445,7 @@ mod tests {
                 line: None,
                 expected_hash: Some(hash),
                 new_text: "def helper():\n    return 42\n".into(),
+                position: None,
                 confirm: false,
             },
         ));
@@ -4455,6 +4456,153 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 42\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stale-index failure mode insertion modes exist for: the indexed
+    /// row remembers wrong line numbers, but the anchor comes from a fresh
+    /// parse of the file on disk, so the insertion lands where the symbol
+    /// lives NOW — and needs no expected_hash/preview round trip.
+    #[test]
+    fn edit_symbol_position_append_inside_anchors_on_live_parse() {
+        let (dir, server) = test_server("edit_symbol_append_inside");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            // deliberately stale range: the index claims lines 3..4
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 3, 4, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "    x = 2".into(),
+                position: Some("append_inside".into()),
+                confirm: false,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(v["hunks"][0]["status"], "applied");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n    x = 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_after_adds_sibling() {
+        let (dir, server) = test_server("edit_symbol_after");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "def other():\n    return 2".into(),
+                position: Some("after".into()),
+                confirm: false,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\ndef other():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_reports_other_matches_on_generic_content() {
+        let (dir, server) = test_server("edit_other_matches");
+        std::fs::write(dir.join("a.rs"), "fn a() {\n}\nfn b() {\n}\n").unwrap();
+
+        // preview a lone `}` line — line 4 is byte-identical
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: None,
+                    new_text: String::new(),
+                }],
+                confirm: false,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], false, "response: {v}");
+        assert_eq!(v["hunks"][0]["other_matches"], 1, "response: {v}");
+        let note = v["note"].as_str().unwrap();
+        assert!(note.contains("position warning"), "note: {note}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed post-write reindex is a warning on a SUCCESS response, not
+    /// an error: the old REINDEX_FAILED error envelope was
+    /// indistinguishable from "nothing was written" and drove agents to
+    /// re-verify or re-apply edits that had in fact landed on disk.
+    #[test]
+    fn edit_lines_reindex_failure_reports_applied_with_index_stale() {
+        let (dir, server) = test_server("edit_reindex_fail");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        // make the post-write reindex fail deterministically
+        server.db().execute("DROP TABLE file_index", []).unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
+        let v = jv(out);
+        assert!(
+            v.get("error").is_none_or(serde_json::Value::is_null),
+            "must not be an error envelope: {v}"
+        );
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(v["index_stale"], true, "response: {v}");
+        let note = v["note"].as_str().unwrap();
+        assert!(note.contains("do NOT re-apply"), "note: {note}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -54,6 +54,13 @@ pub struct HunkResult {
     /// application means a hunk's own start position never shifts,
     /// regardless of how many lines hunks below it added or removed).
     pub new_end_line: usize,
+    /// How many same-length line windows of the pre-edit file (this range
+    /// included) are byte-identical to `old_text`. Anything above 1 means
+    /// `expected_hash` can only vouch for the CONTENT at this range, not
+    /// its POSITION — a stale line number that happens to point at another
+    /// identical window (a lone `}` line, say) still hash-matches and the
+    /// edit lands there instead.
+    pub content_occurrences: usize,
 }
 
 #[derive(Debug)]
@@ -186,8 +193,10 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
     let mut results = Vec::with_capacity(sorted.len());
     let mut all_applied = true;
     for h in &sorted {
-        let old_text: String = lines[h.start_line - 1..h.end_line].concat();
+        let window = &lines[h.start_line - 1..h.end_line];
+        let old_text: String = window.concat();
         let current_hash = hash_content(&old_text);
+        let content_occurrences = lines.windows(window.len()).filter(|w| **w == *window).count();
         let status = match &h.expected_hash {
             None => {
                 all_applied = false;
@@ -208,6 +217,7 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
             old_text,
             status,
             new_end_line,
+            content_occurrences,
         });
     }
 
@@ -235,6 +245,75 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
         new_content: Some(new_content),
         results,
         all_applied: true,
+    })
+}
+
+/// Where `insertion_hunk` places `new_text` relative to a symbol's
+/// `[line_start, line_end]` range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    /// Directly above `line_start` — the symbol shifts down untouched.
+    Before,
+    /// Directly below `line_end` — a new sibling after the symbol.
+    After,
+    /// At the end of the symbol's body: above `line_end` when that line is
+    /// a bare closing delimiter (`}`/`)`/`]`, or `end` for Ruby/Lua/
+    /// Elixir), below it otherwise (Python-style bodies with no closer).
+    AppendInside,
+}
+
+/// Builds a pure-insertion hunk pinned to a single anchor line of
+/// `content`, so callers add code relative to structure instead of doing
+/// line arithmetic against a possibly-stale snapshot: the anchor line is
+/// re-emitted verbatim inside the hunk's `new_text` and its current hash is
+/// pre-filled as `expected_hash`, so `apply_hunks` still conflict-checks
+/// the write against exactly what was read here. An insertion below a
+/// final line lacking a trailing newline adds one (the inserted text must
+/// start on its own line). Returns `None` when the range is out of bounds.
+pub fn insertion_hunk(
+    content: &str,
+    line_start: usize,
+    line_end: usize,
+    position: InsertPosition,
+    new_text: &str,
+) -> Option<HunkRequest> {
+    let lines = split_lines_inclusive(content);
+    if line_start < 1 || line_end < line_start || line_end > lines.len() {
+        return None;
+    }
+    let mut insert = new_text.to_string();
+    if !insert.ends_with('\n') {
+        insert.push('\n');
+    }
+    let insert_above = match position {
+        InsertPosition::Before => true,
+        InsertPosition::After => false,
+        InsertPosition::AppendInside => {
+            let last = lines[line_end - 1].trim();
+            last.starts_with('}')
+                || last.starts_with(')')
+                || last.starts_with(']')
+                || last == "end"
+                || last.starts_with("end ")
+        }
+    };
+    let anchor = match position {
+        InsertPosition::Before => line_start,
+        _ => line_end,
+    };
+    let anchor_line = lines[anchor - 1];
+    let combined = if insert_above {
+        format!("{insert}{anchor_line}")
+    } else if anchor_line.ends_with('\n') {
+        format!("{anchor_line}{insert}")
+    } else {
+        format!("{anchor_line}\n{insert}")
+    };
+    Some(HunkRequest {
+        start_line: anchor,
+        end_line: anchor,
+        expected_hash: Some(hash_content(anchor_line)),
+        new_text: combined,
     })
 }
 
@@ -509,5 +588,114 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_content_occurrences_flags_generic_ranges() {
+        let src = "fn a() {\n}\nfn b() {\n}\nfn c() {\n}\n";
+        // previewing the lone `}` on line 2 — lines 4 and 6 are identical
+        let out = apply_hunks(
+            src,
+            &[HunkRequest {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: None,
+                new_text: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.results[0].content_occurrences, 3);
+
+        // a distinctive line matches only itself
+        let out = apply_hunks(
+            src,
+            &[HunkRequest {
+                start_line: 1,
+                end_line: 1,
+                expected_hash: None,
+                new_text: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.results[0].content_occurrences, 1);
+
+        // multi-line windows count too: [`}`, `fn b() {`] appears once
+        let out = apply_hunks(
+            src,
+            &[HunkRequest {
+                start_line: 2,
+                end_line: 3,
+                expected_hash: None,
+                new_text: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.results[0].content_occurrences, 1);
+    }
+
+    #[test]
+    fn test_insertion_hunk_append_inside_brace_body() {
+        let src = "mod tests {\n    fn old() {}\n}\n";
+        let h =
+            insertion_hunk(src, 1, 3, InsertPosition::AppendInside, "    fn newer() {}").unwrap();
+        assert_eq!((h.start_line, h.end_line), (3, 3));
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(
+            out.new_content.unwrap(),
+            "mod tests {\n    fn old() {}\n    fn newer() {}\n}\n"
+        );
+    }
+
+    #[test]
+    fn test_insertion_hunk_append_inside_end_keyword_body() {
+        let src = "def f\n  x = 1\nend\n";
+        let h = insertion_hunk(src, 1, 3, InsertPosition::AppendInside, "  y = 2").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(out.new_content.unwrap(), "def f\n  x = 1\n  y = 2\nend\n");
+    }
+
+    #[test]
+    fn test_insertion_hunk_append_inside_no_closer_appends_below() {
+        let src = "def f():\n    x = 1\n";
+        let h = insertion_hunk(src, 1, 2, InsertPosition::AppendInside, "    y = 2").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(out.new_content.unwrap(), "def f():\n    x = 1\n    y = 2\n");
+    }
+
+    #[test]
+    fn test_insertion_hunk_before_and_after() {
+        let src = "fn a() {}\nfn b() {}\n";
+        let h = insertion_hunk(src, 2, 2, InsertPosition::Before, "fn mid() {}").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(out.new_content.unwrap(), "fn a() {}\nfn mid() {}\nfn b() {}\n");
+
+        let h = insertion_hunk(src, 2, 2, InsertPosition::After, "fn tail() {}").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(out.new_content.unwrap(), "fn a() {}\nfn b() {}\nfn tail() {}\n");
+    }
+
+    #[test]
+    fn test_insertion_hunk_after_eof_without_trailing_newline() {
+        let src = "fn a() {}";
+        let h = insertion_hunk(src, 1, 1, InsertPosition::After, "fn b() {}").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(out.new_content.unwrap(), "fn a() {}\nfn b() {}\n");
+    }
+
+    #[test]
+    fn test_insertion_hunk_stale_anchor_is_conflict() {
+        let src = "fn a() {\n}\n";
+        let h = insertion_hunk(src, 1, 2, InsertPosition::AppendInside, "    let x = 1;").unwrap();
+        // the file changes under us before the hunk is applied
+        let changed = "fn a() {\n    let y = 2;\n}\n";
+        let out = apply_hunks(changed, &[h]).unwrap();
+        assert!(!out.all_applied);
+        assert!(matches!(out.results[0].status, HunkStatus::Conflict));
+    }
+
+    #[test]
+    fn test_insertion_hunk_out_of_bounds_is_none() {
+        assert!(insertion_hunk("one\n", 1, 2, InsertPosition::After, "x").is_none());
+        assert!(insertion_hunk("one\n", 0, 1, InsertPosition::Before, "x").is_none());
     }
 }

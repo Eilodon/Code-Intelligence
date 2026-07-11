@@ -5,8 +5,10 @@
   from 3 different sessions), triggering implementation ahead of the original "giữ Deferred" plan
   below. Milestones M2-M5 (`d553c3f`→`ef75371`, 2026-07-10) shipped daemon+forwarder, idle-timeout,
   and enforced version-handshake, all tested — see "Update 2026-07-10" near the end of this file.
-  Opt-in only: `calm serve`'s default stdio behavior is unchanged; not yet the default entry point
-  for the npm/plugin distribution (`scripts/mcp-launcher.sh` still execs plain `calm serve`).
+  Opt-in only: `calm serve`'s default stdio behavior is unchanged. Became the default entry point
+  for the npm/plugin distribution too as of 2026-07-11 — `scripts/mcp-launcher.sh` now defaults to
+  `calm connect` when safe (Unix + no extra launcher args), falling back to plain `calm serve`
+  otherwise; see "Update 2026-07-11" near the end of this file.
 - **Date**: 2026-07-07 (draft), 2026-07-07 (revised sau review kỹ thuật)
 - **Decision makers**: TBD (draft do Claude chuẩn bị theo yêu cầu, cần chủ dự án duyệt)
 - **Related**: fix `load_embedder_readonly`/`owns_indexer_lock` (`crates/calm-server/src/lib.rs`,
@@ -291,6 +293,22 @@ ship:
   `try_connect_current` SIGTERM daemon cũ rồi tự spawn lại bản mới khi build không khớp
   (`daemon.rs:322-522`).
 
-**Vẫn còn opt-in, chưa phải default**: `scripts/mcp-launcher.sh` vẫn `exec` thẳng `calm serve`,
-chưa chuyển sang `calm connect` — xem kế hoạch triển khai ở
-`docs/superskills/plans/2026-07-11-market-position-and-roadmap.md` §5.3.
+## Update 2026-07-11: default entry point flipped — `mcp-launcher.sh` now defaults to `calm connect`
+
+`crates/calm-cli/src/main.rs`'s `Connect` variant gained `--preset`/`--db-path` (forwarded through
+`connect_or_spawn`/`spawn_detached_daemon` only when this specific `connect` invocation is the one
+that spawns the daemon — a live daemon already running keeps whatever it started with, same as
+always). Verified by a real subprocess integration test
+(`calm_connect_forwards_preset_to_the_daemon_it_spawns`,
+`crates/calm-cli/tests/daemon_integration.rs`), not just "it compiles."
+
+`scripts/mcp-launcher.sh` now defaults to `calm connect` when both hold: Unix (`Commands::Connect`
+is still `#[cfg(unix)]`-gated at the enum level) and zero extra args were passed to the launcher
+itself — any custom invocation (e.g. an external consumer passing `--preset`/other flags today)
+keeps the original `calm serve` stdio path unchanged, deliberately conservative rather than trying
+to parse which extra flags are daemon-safe. `CI_MCP_LAUNCHER_NO_DAEMON=1` is an explicit opt-out for
+the initial rollout. Smoke-tested live (not just unit-tested): no-args → daemon files
+(`daemon.sock`/`daemon.meta`) appear and a real `initialize` round-trips over the connect/relay path;
+an extra arg → falls back to plain `calm serve`, no daemon files; the opt-out env var → same
+fallback. See `docs/superskills/plans/2026-07-11-market-position-and-roadmap.md` §5.3 for the full
+plan this closed out.

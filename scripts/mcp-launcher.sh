@@ -88,9 +88,40 @@ for arg in "$@"; do
   esac
 done
 
+# `calm connect` (opt-in shared daemon, ADR-0005) collapses multiple MCP
+# client sessions on the same repo into one background indexer/watcher
+# instead of one process per session — see
+# docs/adr/0005-daemon-forwarder-shared-process.md. Defaults to it when
+# safe:
+#   - Unix only (Commands::Connect is #[cfg(unix)]-gated at the enum level
+#     on the Rust side — a non-Unix build doesn't even have the subcommand,
+#     clap exits hard rather than falling back on its own).
+#   - No extra args passed to this launcher. `calm connect` only
+#     understands --project-root/--preset/--db-path (not --listen, or any
+#     future serve-only flag) — reliably telling "--foo bar" (space form)
+#     apart from a lone positional token without a real arg-parser here
+#     isn't worth the risk of a subtly wrong heuristic, so any custom
+#     invocation just keeps today's `calm serve` behavior, unchanged.
+#   - CI_MCP_LAUNCHER_NO_DAEMON is not set to "1" (explicit opt-out, for
+#     the initial rollout or any environment where the daemon path turns
+#     out to be the wrong call).
+use_connect=0
+if [ "$#" -eq 0 ] && [ "${CI_MCP_LAUNCHER_NO_DAEMON:-0}" != "1" ]; then
+  case "$(uname -s)" in
+    Linux|Darwin) use_connect=1 ;;
+  esac
+fi
+if [ "$use_connect" -eq 1 ]; then
+  connect_args=(connect --project-root "$caller_pwd")
+  log "using shared daemon mode (calm connect) — set CI_MCP_LAUNCHER_NO_DAEMON=1 to opt out"
+fi
+
 try_exec() {
   local bin="$1"
   if [ -x "$bin" ]; then
+    if [ "$use_connect" -eq 1 ]; then
+      exec "$bin" "${connect_args[@]}"
+    fi
     exec "$bin" "${serve_args[@]}"
   fi
 }
@@ -143,6 +174,9 @@ try_exec_if_fresh() {
   local bin="$1"
   if [ -x "$bin" ] && ! is_lfs_pointer "$bin"; then
     if is_binary_fresh "$bin"; then
+      if [ "$use_connect" -eq 1 ]; then
+        exec "$bin" "${connect_args[@]}"
+      fi
       exec "$bin" "${serve_args[@]}"
     else
       log "found $bin but it predates the current source tree — rebuilding instead of using it stale"

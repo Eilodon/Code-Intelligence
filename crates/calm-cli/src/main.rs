@@ -47,6 +47,18 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
+        /// Database file path — forwarded to the daemon only if this
+        /// `connect` call is the one that spawns it (a live daemon already
+        /// running keeps whatever it was originally started with; this
+        /// can't retroactively change it). Same semantics as `serve
+        /// --db-path`.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Tool preset — same forwarding caveat as `--db-path` above. If
+        /// omitted, the spawned daemon resolves its own default from
+        /// config.json exactly as a direct `calm serve` would.
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// One-shot index of the project
     Index {
@@ -218,8 +230,12 @@ async fn main() -> Result<()> {
             calm_server::serve_stdio_with_preset(root, db, effective_preset).await?;
         }
         #[cfg(unix)]
-        Commands::Connect { project_root } => {
-            calm_server::daemon::connect_or_spawn(project_root).await?;
+        Commands::Connect {
+            project_root,
+            db_path,
+            preset,
+        } => {
+            calm_server::daemon::connect_or_spawn(project_root, preset, db_path).await?;
         }
         Commands::Index {
             project_root,

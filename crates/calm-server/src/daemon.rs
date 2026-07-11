@@ -381,7 +381,11 @@ fn remove_daemon_meta(calm_dir: &Path) {
 /// stdin<->socket verbatim — no JSON-RPC/MCP parsing here at all (ADR-0005
 /// §2: keep the forwarder protocol-version-agnostic, so it never needs to
 /// track the MCP protocol's own version).
-pub async fn connect_or_spawn(project_root: PathBuf) -> Result<()> {
+pub async fn connect_or_spawn(
+    project_root: PathBuf,
+    preset: Option<String>,
+    db_path: Option<PathBuf>,
+) -> Result<()> {
     let root = std::fs::canonicalize(&project_root).context("resolving --project-root")?;
     let calm_dir = root.join(".calm");
     // Deliberately NOT `create_dir_all(&calm_dir)` here: `.calm/` must be
@@ -399,7 +403,14 @@ pub async fn connect_or_spawn(project_root: PathBuf) -> Result<()> {
     // handle a missing directory/file gracefully.
     let socket_path = resolve_socket_path(&calm_dir);
 
-    let stream = connect_live_and_current(&root, &calm_dir, &socket_path).await?;
+    let stream = connect_live_and_current(
+        &root,
+        &calm_dir,
+        &socket_path,
+        preset.as_deref(),
+        db_path.as_deref(),
+    )
+    .await?;
     relay(stream).await
 }
 
@@ -450,12 +461,14 @@ async fn connect_live_and_current(
     project_root: &Path,
     calm_dir: &Path,
     socket_path: &Path,
+    preset: Option<&str>,
+    db_path: Option<&Path>,
 ) -> Result<tokio::net::UnixStream> {
     if let Some(stream) = try_connect_current(calm_dir, socket_path).await {
         return Ok(stream);
     }
 
-    spawn_detached_daemon(project_root, socket_path)?;
+    spawn_detached_daemon(project_root, socket_path, preset, db_path)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -525,7 +538,12 @@ fn signal_shutdown(pid: u32) {
 
 /// Spawns `calm serve --listen unix:<socket_path>` fully detached from this
 /// forwarder process.
-fn spawn_detached_daemon(project_root: &Path, socket_path: &Path) -> Result<()> {
+fn spawn_detached_daemon(
+    project_root: &Path,
+    socket_path: &Path,
+    preset: Option<&str>,
+    db_path: Option<&Path>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe().context("resolving current calm binary path")?;
@@ -534,8 +552,20 @@ fn spawn_detached_daemon(project_root: &Path, socket_path: &Path) -> Result<()> 
         .arg("--project-root")
         .arg(project_root)
         .arg("--listen")
-        .arg(format!("unix:{}", socket_path.display()))
-        .stdin(std::process::Stdio::null())
+        .arg(format!("unix:{}", socket_path.display()));
+    // Forwarded only when the `calm connect` invocation itself set them —
+    // omitting a flag here means the spawned `calm serve` resolves its own
+    // default exactly as a direct `calm serve` invocation would (preset
+    // falls back to config.json, db_path falls back to
+    // `calm_server::default_db_path`), so there's no duplicated
+    // default-resolution logic to keep in sync between the two commands.
+    if let Some(preset) = preset {
+        cmd.arg("--preset").arg(preset);
+    }
+    if let Some(db_path) = db_path {
+        cmd.arg("--db-path").arg(db_path);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         // New process group: the daemon must survive *this* forwarder's own

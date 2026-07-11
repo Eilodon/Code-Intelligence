@@ -160,6 +160,56 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     }
 }
 
+/// `--preset`/`--db-path` on `calm connect` must reach the daemon it spawns
+/// (crates/calm-server/src/daemon.rs::spawn_detached_daemon), not just be
+/// accepted by the CLI parser and silently dropped. Asserts on the visible
+/// effect: `tools/list` through a `--preset orient`-spawned daemon includes
+/// an orient-preset tool (`repo_overview`) and excludes an edit-preset-only
+/// one (`edit_context`) — if the flag weren't forwarded, the daemon would
+/// spawn under the "full" default and both would be present.
+#[test]
+fn calm_connect_forwards_preset_to_the_daemon_it_spawns() {
+    let project = fresh_project();
+
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}
+"#;
+    let list_tools = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+"#;
+
+    let mut child = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .arg("--preset")
+        .arg("orient")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning calm connect --preset orient");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(initialize).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        stdin.write_all(list_tools).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("calm connect --preset orient should exit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("\"repo_overview\""),
+        "orient preset must include repo_overview, got stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("\"edit_context\""),
+        "orient preset must NOT include edit_context — if it's present, --preset wasn't forwarded to the spawned daemon. stdout: {stdout}"
+    );
+}
+
 /// Several `calm serve --listen` candidates racing to spawn against the
 /// same fresh socket path — the exact scenario that caused the original
 /// N-process bug, now deliberately induced at the daemon layer instead of

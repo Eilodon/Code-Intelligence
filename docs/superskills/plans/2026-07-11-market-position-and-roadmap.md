@@ -106,13 +106,13 @@ Việc thật còn lại của Tier 1 hẹp hơn mục 4 mô tả: chỉ còn **
 
 | # | Việc | Tier | Effort | Phụ thuộc |
 |---|---|---|---|---|
-| 1 | Sửa status ADR-0004, ADR-0002, ADR-0005, plan doc 25-lang, comment `daemon.rs:11-15` | 0 | < 1 giờ | không |
-| 2 | Script lint đối chiếu ADR có "Update" section vs status header | 0 | ~30 phút | không |
-| 3 | `review_pr` MCP Prompt | 3a | < 1 giờ | không |
-| 4 | `test_gap_hotspots` tool mới | 3b | ~0.5 ngày | không |
-| 5 | Rust: mở rộng `Connect`/`spawn_detached_daemon` nhận `--preset`/`--db-path` | 1 | ~0.5 ngày | không |
-| 6 | `mcp-launcher.sh`: default sang `calm connect` (Unix-only, có fallback) | 1 | ~0.5 ngày | việc #5 |
-| 7 | Concurrent-agent awareness (`active_sessions` trong `session_context`) | 3c | ~1 ngày + review | nên làm sau #6 (daemon mode phổ biến hơn), cần specialist-review vì đụng vùng code từng có bug production |
+| 1 | Sửa status ADR-0004, ADR-0002, ADR-0005, plan doc 25-lang, comment `daemon.rs:11-15` | 0 | < 1 giờ | **✅ Đã xong** |
+| 2 | Script lint đối chiếu ADR có "Update" section vs status header | 0 | ~30 phút | **✅ Đã xong** (`scripts/check-adr-staleness.sh`) |
+| 3 | `review_pr` MCP Prompt | 3a | < 1 giờ | **✅ Đã xong** |
+| 4 | `test_gap_hotspots` tool mới | 3b | ~0.5 ngày | **✅ Đã xong** |
+| 5 | Rust: mở rộng `Connect`/`spawn_detached_daemon` nhận `--preset`/`--db-path` | 1 | ~0.5 ngày | **✅ Đã xong**, có integration test (`calm_connect_forwards_preset_to_the_daemon_it_spawns`) |
+| 6 | `mcp-launcher.sh`: default sang `calm connect` (Unix-only, có fallback) | 1 | ~0.5 ngày | **✅ Đã xong**, smoke-test live 3 kịch bản (no-args/extra-args/env opt-out) |
+| 7 | Concurrent-agent awareness (`active_sessions` trong `session_context`) | 3c | ~1 ngày + review | nên làm sau #6 (daemon mode phổ biến hơn — giờ đã là default) — cần specialist-review vì đụng vùng code từng có bug production |
 | 8 | Go SCIP `go.work` multi-module | 1 | ~2-3 ngày | không (research upstream scip-go trước khi chốt approach) |
 | 9 | B7 (bản scripted, không cần LLM API) | 2 | ~2-3 ngày | không |
 | 10 | Agent-loop harness (net-new) | 2 | ~2-4 ngày | nên làm sau #9 để validate oracle trước |
@@ -130,15 +130,15 @@ Việc #1-4 gần như miễn phí và không rủi ro — nên làm ngay, gộp
 - **`daemon.rs:11-15`** comment → xoá "no idle-timeout yet/no version-handshake enforcement yet", ghi rõ cả 2 đã ship + test nào cover.
 - **Process fix**: `adr-commit` là skill **global** (`~/.claude/skills/`), sửa nó ảnh hưởng mọi project khác trên máy, và định dạng ADR của nó (`docs/superskills/adrs/`) không khớp convention thật của CALM (`docs/adr/000N-*.md`, living doc có "Update" section). Đừng sửa skill global. Thay vào đó: 1 script nhỏ local trong repo, grep `docs/adr/*.md` tìm file có section "Update" rồi cảnh báo cần soát lại status header — chạy như một bước doc-lint/CI, đúng tinh thần "feature-flag parity check" plan 25-lang đã tự đề xuất ở §1.9.
 
-### 5.3 Tier 1 — chi tiết (phạm vi đã thu hẹp sau khi sửa tiền đề sai)
+### 5.3 Tier 1 — chi tiết (việc #5+#6 đã xong 2026-07-11 chiều; #8 vẫn mở)
 
-**(a) `mcp-launcher.sh` default sang `calm connect`** — thật sự chưa bắt đầu (271 dòng script, không có logic daemon/connect nào). 2 blocker cụ thể agent tìm ra mà báo cáo gốc không nhắc:
-1. `Commands::Connect` bị `#[cfg(unix)]` ở **cấp enum-variant** (`crates/calm-cli/src/main.rs:45-50`) — build không phải Unix thì subcommand không tồn tại, clap báo lỗi cứng chứ không tự fallback.
-2. `Connect{project_root}` chỉ nhận `--project-root`, không có `--preset`/`--db-path` — client nào đang set custom preset sẽ vỡ nếu launcher chuyển sang `connect` mà không mở rộng trước.
+**(a) `mcp-launcher.sh` default sang `calm connect` — ÐÃ XONG.** 2 blocker đã xử lý đúng thứ tự:
+1. `Commands::Connect` vẫn `#[cfg(unix)]` ở cấp enum-variant — không đổi (không thể/không nên fallback runtime cho non-Unix); launcher tự check `uname -s` trước khi thử `connect`.
+2. `Connect` giờ nhận thêm `--preset`/`--db-path`, forward đúng qua `connect_or_spawn`/`spawn_detached_daemon` — xác minh bằng integration test thật (`calm_connect_forwards_preset_to_the_daemon_it_spawns`), không chỉ build sạch.
 
-→ Việc #5 (mở rộng Rust CLI/`spawn_detached_daemon` để forward `--preset`/`--db-path`) **phải làm trước** việc #6 (sửa shell script), không được đảo thứ tự.
+Launcher chỉ bật `calm connect` khi **không có extra arg nào** (tránh rủi ro pha trộn `--foo bar` dạng 2-token với positional token) và trên Unix; có `CI_MCP_LAUNCHER_NO_DAEMON=1` để opt-out. Smoke-test live 3 kịch bản (không arg → daemon files xuất hiện + JSON-RPC round-trip thật; có extra arg → fallback `calm serve`; env opt-out → fallback) đều đúng thiết kế.
 
-**(b) Go SCIP `go.work` multi-module** — effort Medium, không Small. Code hiện tại chạy `scip-go index --module-root <root>` đúng 1 lần (`scip/runner.rs:116-128`), không có enumerate/merge. Cần: (1) parse `go.work`'s `use` directives, (2) chạy scip-go per-module rồi merge output (rebase path) — **hoặc** xác nhận scip-go có flag `--workspace` native trước (chưa verify upstream, có thể giảm xuống Small nếu có), (3) mở rộng cache-key fingerprint cho mọi `go.mod`/`go.sum` thành viên, không chỉ root.
+**(b) Go SCIP `go.work` multi-module** — effort Medium, không Small, **vẫn mở**. Code hiện tại chạy `scip-go index --module-root <root>` đúng 1 lần (`scip/runner.rs:116-128`), không có enumerate/merge. Cần: (1) parse `go.work`'s `use` directives, (2) chạy scip-go per-module rồi merge output (rebase path) — **hoặc** xác nhận scip-go có flag `--workspace` native trước (chưa verify upstream, có thể giảm xuống Small nếu có), (3) mở rộng cache-key fingerprint cho mọi `go.mod`/`go.sum` thành viên, không chỉ root.
 
 ### 5.4 Tier 2 — chi tiết (B7/B8)
 

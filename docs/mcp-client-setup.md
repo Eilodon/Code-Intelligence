@@ -91,6 +91,22 @@ Nếu SHA256 sai (nghi ngờ download hỏng hoặc bị can thiệp), launcher 
 exec** binary đó — log lỗi rõ ràng ra stderr rồi tự động build từ source
 thay vì dừng hẳn, để server vẫn luôn khởi động được.
 
+## Chế độ daemon dùng chung (mặc định từ 2026-07-11)
+
+Dù binary nào ở trên được chọn, launcher mặc định gọi nó qua `calm connect`
+thay vì `calm serve` khi cả hai điều kiện đúng: đang chạy trên Unix (macOS/
+Linux) và không có arg nào khác được truyền vào launcher. `calm connect` kết
+nối (hoặc spawn nếu chưa có) 1 daemon dùng chung cho cả project — nhiều
+client/session cùng mở 1 project sẽ chia sẻ chung 1 indexer/watcher/embedder
+thay vì mỗi session tự chạy riêng (xem `docs/adr/0005-daemon-forwarder-
+shared-process.md`). Nhận biết: `.calm/daemon.sock`/`daemon.meta`/
+`daemon.log` xuất hiện trong thư mục project.
+
+Bất kỳ arg tùy chỉnh nào (ví dụ client config tự thêm `--preset`) đều làm
+launcher quay về `calm serve` như trước đây, không thay đổi. Muốn tắt hẳn
+chế độ daemon (ví dụ môi trường không muốn chia sẻ process giữa các
+session) thì set `CI_MCP_LAUNCHER_NO_DAEMON=1`.
+
 ## Client đã có sẵn config trong repo
 
 Ba file sau đều trỏ vào `scripts/mcp-launcher.sh`, khác nhau ở tên field

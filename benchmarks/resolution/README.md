@@ -26,12 +26,27 @@ mỗi lần chạy để biết chính xác commit nào được đo):
 | js | expressjs/express | nhỏ, thật |
 | php | monicahq/monica | app PHP/Laravel thật, có composer.json cho PSR-4 |
 | sql | jOOQ/sakila | mirror đa dialect (postgres/mysql/sql-server/…) của sample DB sakila |
+| kotlin | square/kotlinpoet | code-gen lib thật, nhiều method trùng tên |
+| swift | apple/swift-argument-parser | nhỏ, gọn, real-world |
+| scala | lihaoyi/requests-scala | HTTP client nhỏ, thật |
+| dart | dart-lang/args | CLI args parser nhỏ, thật |
+| lua | kikito/middleclass | OOP lib nhỏ, có kế thừa/method dispatch thật |
+| elixir | dashbitco/nimble_options | options-validation lib nhỏ |
+| haskell | kowainik/co-log | logging lib nhỏ |
+| ocaml | ocsigen/lwt | concurrency lib thật, call graph có ý nghĩa |
+| zig | MasterQ32/zig-args | CLI args parser nhỏ |
+| powershell | dahlbyk/posh-git | module PowerShell nhỏ, thật |
+| groovy | http-builder-ng/http-builder-ng | HTTP client Groovy thật |
+
+11 ngôn ngữ Phase B/C (Phase E, 2026-07-11) — batched vào cùng 1 lần chạy thay vì 11 lần riêng lẻ,
+đúng tinh thần §1.7 của kế hoạch 25-ngôn-ngữ (đo tier-distribution, không phải accuracy tuyệt đối).
 
 ## Chạy
 
 ```bash
-cargo build --release -p calm-cli   # không cần --features scip-overlay — Phase 2 provider
-                                     # chưa tồn tại cho ngôn ngữ nào trong 8 cái này
+cargo build --release -p calm-cli --features tier0-5,lang-kotlin,lang-swift,lang-scala,lang-dart,lang-lua,lang-elixir,lang-haskell,lang-ocaml,lang-zig,lang-powershell,lang-groovy
+                                     # scip-overlay không bắt buộc cho benchmark này — chỉ Rust có
+                                     # provider chạy "harmless" trên corpus ngoại ngữ (đóng góp 0 edge)
 benchmarks/.venv/bin/python benchmarks/resolution/run_benchmark.py
 ```
 
@@ -89,6 +104,53 @@ trong bảng dưới đây **bị nhiễu bởi noise thật** (nhiều "symbol"
 Phase 2 SCIP provider. `overlay_match_rate` = `null` cho mọi dòng (không phải `0.0`) — có chủ đích,
 xem docstring của `run_benchmark.py`.
 
+**Cập nhật (2026-07-11, đo lại cùng lần với Phase B/C bên dưới):** SQL giờ **không còn 0 symbols**
+— `language_for_extension` đã map `.sql` từ lâu (P3.3 đã triển khai xong sau bản đo 2026-07-07 ở
+trên). Số đo mới trên cùng corpus sakila: 333 symbols, 637 edges (27.5% resolved, 72.2% ambiguous,
+0% textual/formal). Bảng gốc phía trên giữ nguyên làm lịch sử — không sửa lại số cũ.
+
+## Kết quả đo Phase B/C — 11 ngôn ngữ mới (2026-07-11)
+
+Cùng corpus/phương pháp, batched vào 1 lần chạy (`--lang` không truyền → chạy toàn bộ 19 ngôn ngữ
+trong `CORPORA`, ghi đè `results.json` với bộ đầy đủ):
+
+| lang | symbols | edges | resolved% | inferred% | textual% | ambiguous% | wall(s) | commit |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| kotlin | 2,143 | 30,156 | 3.2% | 0.0% | 7.2% | **89.6%** | 8.1 | 8a390c9 |
+| swift | 2,144 | 6,426 | 8.4% | 0.1% | 16.6% | 74.9% | 5.9 | e579882 |
+| scala | 159 | 227 | 18.1% | 0.0% | 33.9% | 48.0% | 5.6 | e3619c1 |
+| dart | 178 | 0 | — | — | — | — | 5.5 | 7a2dfb5 |
+| lua | 69 | 5 | 100.0% | 0.0% | 0.0% | 0.0% | 5.6 | 359f0e2 |
+| elixir | 105 | 362 | 7.7% | 0.0% | 5.2% | 87.0% | 5.5 | b2d36ba |
+| haskell | 117 | 122 | 45.1% | 0.0% | 40.2% | 14.8% | 5.5 | 85490e9 |
+| ocaml | 1,684 | 30,457 | 6.7% | 0.0% | 7.1% | **86.3%** | 15.5 | 93a576b |
+| zig | 46 | 46 | 39.1% | 0.0% | 4.3% | 56.5% | 5.4 | fae95c8 |
+| powershell | 142 | 156 | 52.6% | 0.0% | 46.2% | 1.3% | 5.6 | bbc5ac3 |
+| groovy | 59 | 19 | 84.2% | 0.0% | 5.3% | 10.5% | 13.2 | 3f97e22 |
+
+**`dart` = 0 edges, đúng là 0 thật, không phải lỗi đo** — tài liệu hoá từ Phase C
+([[calm-25-language-expansion-research]]): grammar Dart không có node kind cho call-expression, nên
+`walk_calls` không có gì để trích xuất — 178 symbols (class/method) vẫn được index đầy đủ, chỉ riêng
+call-graph là khoảng trống đã biết trước, có chủ đích (deliberate scope cut, không phải bug).
+
+**`inferred%` = 0.0% cho toàn bộ 11 ngôn ngữ mới** — hợp lý, không phải lỗi: Tier-2 (`type_map`
+receiver inference) hiện chỉ implement cho các ngôn ngữ Tier-0 gốc (Python/JS/TS/Java/C#) — 11 ngôn
+ngữ Phase B/C đều là Tier-0.5 (tree-sitter thuần, không type_map), nên mọi đóng góp không-ambiguous
+đến từ `resolved` (same-file/same-dir) hoặc rơi thẳng xuống `ambiguous`/`textual`.
+
+**Kotlin/OCaml có `ambiguous%` cực cao (89.6%/86.3%)** — cùng nguyên nhân gốc đã thấy ở fmt (C++)
+92.5%: method/hàm tên phổ biến trùng lặp (Kotlin: `builder`, `build`, `addStatement`, … của
+kotlinpoet's fluent API; OCaml: `bind`/`return`/`map` của lwt's monadic combinator style) khiến
+`MAX_CALLEE_CANDIDATES` fan-out cao — đúng là ứng viên formal-tier ưu tiên cao nếu có provider thật
+(Kotlin đã có qua scip-java, xem Phase D.2; OCaml/Scala/Haskell/Elixir/Zig/Dart/Lua/PowerShell/
+Groovy/Swift chưa có provider nào — ngoài phạm vi 25-ngôn-ngữ kế hoạch gốc, không tính vào Phase D).
+
+**Lua/PowerShell có `ambiguous%` rất thấp (0%/1.3%)** — không phải "resolver tốt hơn", mà là corpus
+nhỏ + ít trùng tên hàm: middleclass (lua) chỉ 69 symbols, hầu như mỗi method một tên riêng; posh-git
+tương tự. Không nên so sánh trực tiếp "ambiguous% thấp = ngôn ngữ này resolve tốt hơn Kotlin" — kích
+thước/phong cách API của corpus ảnh hưởng trực tiếp, đúng giới hạn "không có oracle" đã nêu ở mục
+Giới hạn bên dưới.
+
 ## Diễn giải
 
 - **`ambiguous` là trần chính, không phải `textual`** — đây là phát hiện quan trọng nhất, và khác
@@ -121,7 +183,9 @@ xem docstring của `run_benchmark.py`.
 - **Không có oracle** — khác B2, đây không đo đúng/sai (precision/recall), chỉ đo phân bố tier.
   Không suy luận "resolved% cao = tốt hơn" giữa 2 ngôn ngữ khác nhau mà không xét đặc thù ngôn ngữ đó
   (C không có method call nên không có gì để "inferred", không có nghĩa C kém hơn C#).
-- **1 repo/ngôn ngữ, 1 lần đo** — không phải benchmark suite đa-repo theo quy mô (xem `docs/superskills/plans/...`'s §7 gợi ý mở rộng: gin/guava/redis/fmt/express/monica/sakila + eShopOnWeb là điểm khởi đầu, chưa phải danh sách cuối).
+- **1 repo/ngôn ngữ, 1 lần đo** — không phải benchmark suite đa-repo theo quy mô (19 ngôn ngữ × 1
+  corpus/ngôn ngữ kể từ Phase E, chưa phải danh sách cuối — thêm ngôn ngữ/repo mới chỉ cần 1 dòng
+  trong `CORPORA` của `run_benchmark.py`, không cần sửa code khác).
 - **C/C++ noise đã biết, chưa tách** — xem mục bug ở trên; số `ambiguous`/`symbols_total` cho C/C++
   cao hơn thực tế một phần chưa định lượng được.
 - **`.calm/config.json`'s `semantic_search.enabled=false`** — benchmark này tắt embeddings để đo

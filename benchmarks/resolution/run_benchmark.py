@@ -85,6 +85,21 @@ CORPORA: dict[str, tuple[str, str]] = {
     "js": ("https://github.com/expressjs/express.git", "express"),
     "php": ("https://github.com/monicahq/monica.git", "monica"),
     "sql": ("https://github.com/jOOQ/sakila.git", "sakila (multi-dialect mirror)"),
+    # Phase E (2026-07-11): the 11 Phase B/C languages, batched into this
+    # same run rather than 9 separate clone+run cycles (deliberate per the
+    # 25-language-expansion plan's own §1.7 note) — real, modest-size OSS
+    # repos, not synthetic fixtures.
+    "kotlin": ("https://github.com/square/kotlinpoet.git", "kotlinpoet"),
+    "swift": ("https://github.com/apple/swift-argument-parser.git", "swift-argument-parser"),
+    "scala": ("https://github.com/lihaoyi/requests-scala.git", "requests-scala"),
+    "dart": ("https://github.com/dart-lang/args.git", "args"),
+    "lua": ("https://github.com/kikito/middleclass.git", "middleclass"),
+    "elixir": ("https://github.com/dashbitco/nimble_options.git", "nimble_options"),
+    "haskell": ("https://github.com/kowainik/co-log.git", "co-log"),
+    "ocaml": ("https://github.com/ocsigen/lwt.git", "lwt"),
+    "zig": ("https://github.com/MasterQ32/zig-args.git", "zig-args"),
+    "powershell": ("https://github.com/dahlbyk/posh-git.git", "posh-git"),
+    "groovy": ("https://github.com/http-builder-ng/http-builder-ng.git", "http-builder-ng"),
 }
 
 

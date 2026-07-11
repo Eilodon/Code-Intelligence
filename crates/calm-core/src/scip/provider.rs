@@ -257,9 +257,28 @@ fn js_lockfile_hash(root: &Path) -> String {
 /// `go_resolve_binary`, deliberately simpler than Python/TS's `npx` fallback
 /// (there's no equivalently ubiquitous "run this artifact on demand" tool
 /// bundled with a JDK the way `npx` ships with `npm`).
+///
+/// `dirty_langs` also carries `"kotlin"` (Phase D.2, 2026-07-11) — the same
+/// `scip-java index` invocation indexes a mixed Java+Kotlin Gradle/Maven
+/// module in one pass (`scip-java` bundles Kotlin support via its own
+/// `kotlinc` compiler-plugin integration, confirmed by the tool's own
+/// `--help`/docs — it is not a Java-only indexer), mirroring `TYPESCRIPT`'s
+/// established precedent for one provider spanning more than one
+/// `file_index.language` value. `lang` deliberately stays `"java"` (the
+/// existing display/cache-filename string) rather than gaining a second
+/// selector — `scip_refresh`/`refresh_language` already dispatch this whole
+/// provider under the single `"java"` name the same way `"javascript"`
+/// alone dispatches `TYPESCRIPT` for both JS and TS; no new config struct
+/// exists for Kotlin either — it rides along under `Config.java.scip`,
+/// exactly like TS rides along under `Config.js.scip`. `ingest_occurrences`
+/// (`scip/ingest.rs`) is purely path/line-driven with no per-provider
+/// language filter, so Kotlin occurrences flow through unchanged once a
+/// `.scip` index containing them exists — confirmed by reading the
+/// function signature directly (`&[ScipOccurrence]`, no `provider` param at
+/// all).
 pub const JAVA: ScipProvider = ScipProvider {
     lang: "java",
-    dirty_langs: &["java"],
+    dirty_langs: &["java", "kotlin"],
     resolve_binary: super::runner::java_resolve_binary,
     build_command: super::runner::java_build_command,
     timeout: super::runner::JAVA_SCIP_TIMEOUT,

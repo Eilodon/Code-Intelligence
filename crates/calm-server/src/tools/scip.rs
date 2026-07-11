@@ -5,7 +5,7 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "scip_refresh",
-        description = "Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java/csharp/php/c), bypassing the configured refresh policy — e.g. to force a run for an on_demand/min_interval provider without waiting. USE WHEN: you need formal-tier call edges immediately and know a source-of-truth indexer (rust-analyzer/scip-go/scip-python/scip-typescript/scip-java/scip-dotnet/scip-php/scip-clang) is available. Can block for a while (up to a few minutes for a large project, longer for Java/C++'s full build-tool invocation) since it may invoke a real external indexer — not for routine use."
+        description = "Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java/csharp/php/c), bypassing the configured refresh policy — e.g. to force a run for an on_demand/min_interval provider without waiting. \"java\" also covers Kotlin (scip-java indexes a mixed Java+Kotlin module in one pass, same as \"javascript\" covering TypeScript). USE WHEN: you need formal-tier call edges immediately and know a source-of-truth indexer (rust-analyzer/scip-go/scip-python/scip-typescript/scip-java/scip-dotnet/scip-php/scip-clang) is available. Can block for a while (up to a few minutes for a large project, longer for Java/C++'s full build-tool invocation) since it may invoke a real external indexer — not for routine use."
     )]
     pub(crate) fn scip_refresh(
         &self,

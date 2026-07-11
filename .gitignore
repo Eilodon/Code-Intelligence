@@ -2,6 +2,15 @@
 /target/
 crates/calm-core/tests/fixtures/rust_workspace/target/
 
+# Gradle build/cache output — left behind by scip-java's real Gradle
+# invocation when the D.2 kotlin_overlay_upgrades_ambiguous_smart_cast_calls_*
+# ignored test runs against multi_lang_workspace/kotlin. `scip-java index`'s
+# own `--cleanup` only removes its own semanticdb/targetroot temp state, not
+# Gradle's own directories.
+crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/.gradle/
+crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/build/
+crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/index.scip
+
 # Index database (per-project, generated)
 .calm/
 *.db

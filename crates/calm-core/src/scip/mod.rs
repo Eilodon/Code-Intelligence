@@ -1111,6 +1111,128 @@ mod tests {
             .unwrap();
         assert_eq!(conf, "formal");
     }
+    /// Live integration: real `scip-java` against
+    /// `multi_lang_workspace/kotlin` (Phase D.2, 2026-07-11) — proves the
+    /// `JAVA` provider's `dirty_langs` extension actually resolves Kotlin
+    /// occurrences end to end, not just that the config field compiles.
+    /// Ignored by default — same prerequisites as the Java test above (a
+    /// `scip-java` launcher on `PATH`, plus a JDK and a Gradle new enough
+    /// for the Kotlin Gradle plugin — this repo's system `gradle` was found
+    /// to be 4.4.1 during the session that wrote this test, too old for
+    /// `kotlin("jvm") version "1.9.22"`; a `gradle` 8.x ahead of it on
+    /// `PATH` is required). `scip-java` drives a real Gradle build
+    /// (confirmed live: `clean scipPrintDependencies scipCompileAll`).
+    ///
+    /// The fixture's `Dispatcher.dispatch` deliberately calls
+    /// `handler.process()` from two different `is X ->` smart-cast branches
+    /// of the same `when` on the same variable — CALM's own syntactic
+    /// resolver cannot follow Kotlin smart-casting, so both call sites land
+    /// as `ambiguous` with the same 2 candidates (`AlphaHandler::process`/
+    /// `BetaHandler::process`) before this overlay runs. `scip-java`'s real
+    /// Kotlin type-checker resolves each site to its OWN specific target
+    /// and correctly rules out the other branch's candidate — asserting
+    /// both sites land on the RIGHT one each (not just "some edge went
+    /// formal") is the actual value proposition of a real semantic indexer
+    /// over the heuristic resolver, and was verified once by hand before
+    /// this test was written (`calm scip-run --lang java` against a copy of
+    /// this exact fixture: 8 edges upgraded, 2 fan-out siblings ruled out).
+    #[test]
+    #[ignore]
+    fn kotlin_overlay_upgrades_ambiguous_smart_cast_calls_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/kotlin");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let before_alpha: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'src/main/kotlin/com/example/Handlers.kt::Dispatcher::dispatch' \
+                   AND to_symbol = 'src/main/kotlin/com/example/Handlers.kt::AlphaHandler::process' \
+                   AND call_site_line = 23",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before_alpha, "ambiguous",
+            "fixture must start ambiguous — CALM's syntactic resolver can't follow Kotlin smart-casts"
+        );
+
+        let java = crate::config::JavaConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        let stats = run_java_overlay_and_log(&conn, &fixture, &java).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one Kotlin edge upgraded to formal via the java provider"
+        );
+
+        // Line 23 (`is AlphaHandler -> handler.process()`) must resolve to
+        // AlphaHandler's own process(), not BetaHandler's.
+        let (alpha_conf, alpha_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'src/main/kotlin/com/example/Handlers.kt::Dispatcher::dispatch' \
+                   AND to_symbol = 'src/main/kotlin/com/example/Handlers.kt::AlphaHandler::process' \
+                   AND call_site_line = 23",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(alpha_conf, "formal");
+        assert_eq!(alpha_src.as_deref(), Some("scip"));
+
+        // Line 24 (`is BetaHandler -> handler.process()`) must resolve to
+        // BetaHandler's own process(), not AlphaHandler's.
+        let (beta_conf, beta_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'src/main/kotlin/com/example/Handlers.kt::Dispatcher::dispatch' \
+                   AND to_symbol = 'src/main/kotlin/com/example/Handlers.kt::BetaHandler::process' \
+                   AND call_site_line = 24",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(beta_conf, "formal");
+        assert_eq!(beta_src.as_deref(), Some("scip"));
+
+        // And the WRONG cross-pairing at each site must still be ambiguous
+        // (ruled out, not silently upgraded) — this is the actual
+        // disambiguation proof, not just "something changed".
+        let wrong_at_23: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'src/main/kotlin/com/example/Handlers.kt::Dispatcher::dispatch' \
+                   AND to_symbol = 'src/main/kotlin/com/example/Handlers.kt::BetaHandler::process' \
+                   AND call_site_line = 23",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_23, "ambiguous");
+        let wrong_at_24: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'src/main/kotlin/com/example/Handlers.kt::Dispatcher::dispatch' \
+                   AND to_symbol = 'src/main/kotlin/com/example/Handlers.kt::AlphaHandler::process' \
+                   AND call_site_line = 24",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_24, "ambiguous");
+    }
 
     /// Live integration: real `scip-dotnet` against
     /// `multi_lang_workspace/csharp` (P2.3). Ignored by default — requires a

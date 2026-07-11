@@ -23,6 +23,7 @@ mod orient;
 mod recover;
 mod scip;
 mod security;
+mod testgap;
 mod trace;
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,7 @@ impl CalmServer {
         router.merge(Self::scip_tool_router());
         router.merge(Self::lsp_tool_router());
         router.merge(Self::security_tool_router());
+        router.merge(Self::testgap_tool_router());
         router.merge(Self::inspect_tool_router());
         router.merge(Self::edit_tool_router());
         router
@@ -295,6 +297,17 @@ fn ci_prompts() -> Vec<rmcp::model::Prompt> {
                     .with_required(true),
             ]),
         ),
+        rmcp::model::Prompt::new(
+            "review_pr",
+            Some(
+                "Review a PR/commit range for risk: blast radius across every changed symbol, whether any changed file is also a churn/complexity hotspot, and current fitness-gate status.",
+            ),
+            Some(vec![
+                rmcp::model::PromptArgument::new("range")
+                    .with_description("Git commit range understood by `git diff`, e.g. \"main..HEAD\" or \"HEAD~3..HEAD\"")
+                    .with_required(true),
+            ]),
+        ),
     ]
 }
 
@@ -340,6 +353,16 @@ fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Opt
                  2. Call file_overview(\"{path}\") (or dependencies(\"{path}\") for a whole module) to see what's there and how it connects to the rest of the codebase.\n\
                  3. Call hotspots(top_n=5) and check whether any hotspot falls under `{path}` — that's where the riskiest code in this area is.\n\
                  Summarize: what does this area do, what's its role in the codebase, and what should I be careful about here?"
+            ))
+        }
+        "review_pr" => {
+            let range = arg("range");
+            Some(format!(
+                "Review the PR/commit range `{range}` for risk:\n\
+                 1. Call diff_impact(commits=\"{range}\") for the full blast radius — every changed symbol's callers, risk_assessment, and suggested_reviewers.\n\
+                 2. Call hotspots(top_n=5) and cross-check: does any file diff_impact flagged also show up here? A changed file that's also a churn×complexity hotspot compounds risk beyond what either signal shows alone.\n\
+                 3. Call fitness_report() for the current gate status — did this range's changes push any metric closer to (or past) its threshold?\n\
+                 Summarize: aggregate risk level, any hotspot/changed-file overlap, and whether fitness gates still pass — flag anything that needs a human reviewer before merge."
             ))
         }
         _ => None,
@@ -638,10 +661,13 @@ mod tests {
     }
 
     #[test]
-    fn ci_prompts_lists_all_three_with_required_arguments() {
+    fn ci_prompts_lists_all_four_with_required_arguments() {
         let prompts = ci_prompts();
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["review_symbol", "debug_symbol", "onboard_area"]);
+        assert_eq!(
+            names,
+            vec!["review_symbol", "debug_symbol", "onboard_area", "review_pr"]
+        );
         for p in &prompts {
             assert!(p.description.is_some(), "{}: missing description", p.name);
             let args = p
@@ -693,6 +719,18 @@ mod tests {
         assert!(text.contains("crates/calm-core/src/graph"));
         assert!(text.contains("repo_overview("));
         assert!(text.contains("hotspots("));
+    }
+
+    #[test]
+    fn render_prompt_review_pr_substitutes_range_and_mentions_workflow_tools() {
+        let mut args = serde_json::Map::new();
+        args.insert("range".into(), serde_json::json!("main..HEAD"));
+
+        let text = render_prompt("review_pr", &Some(args)).unwrap();
+        assert!(text.contains("main..HEAD"));
+        assert!(text.contains("diff_impact("));
+        assert!(text.contains("hotspots("));
+        assert!(text.contains("fitness_report("));
     }
 
     #[test]

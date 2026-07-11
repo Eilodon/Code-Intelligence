@@ -3,16 +3,23 @@
 //! 1. **DB read** (caller thread, sync): load candidate edges + the source
 //!    text of their files, then let go of the connection.
 //! 2. **LSP session** (dedicated OS thread, its own single-threaded tokio
-//!    runtime): spawn rust-analyzer, resolve each call site, return plain
-//!    data. A dedicated thread — NOT an inline `block_on` — because the MCP
-//!    tool that calls this already runs on the server's ambient tokio
-//!    runtime, where a nested `block_on` panics ("Cannot start a runtime
-//!    from within a runtime"; reproduced 2026-07-10). The thread boundary
-//!    also keeps `rusqlite::Connection` (`!Sync`) entirely out of async code.
+//!    runtime): spawn the provider's server, resolve each call site, return
+//!    plain data. A dedicated thread — NOT an inline `block_on` — because
+//!    the MCP tool that calls this already runs on the server's ambient
+//!    tokio runtime, where a nested `block_on` panics ("Cannot start a
+//!    runtime from within a runtime"; reproduced 2026-07-10). The thread
+//!    boundary also keeps `rusqlite::Connection` (`!Sync`) entirely out of
+//!    async code.
 //! 3. **DB write** (caller thread, sync): re-verify each hit is still an
 //!    upgradable row and apply it, counting rows actually changed — a
 //!    concurrent `rebuild_graph` (`DELETE FROM call_edges` + reinsert) makes
 //!    snapshot ids stale, so `to_upgrade.len()` would over-report.
+//!
+//! Generalized (D.0, 2026-07-11) from a Rust-only pass into a table-driven
+//! one over `LspProvider` (`lsp::provider`) — same shape/reasoning as
+//! `scip::provider::ScipProvider` — so `resolve_binary`, the candidate-edge
+//! language filter, and the `MinInterval` sidecar are all per-provider
+//! instead of hardcoded to rust-analyzer.
 //!
 //! Fail-silent like `scip::run_overlay_for`: every failure mode returns
 //! `Ok(LspIngestStats::default())`, leaving the graph untouched.
@@ -27,7 +34,7 @@ use crate::config::{LspConfig, RefreshPolicy};
 use crate::lsp::client::{
     DefinitionOutcome, LspClient, PositionEncoding, path_to_uri, uri_to_path,
 };
-use crate::scip::runner::resolve_binary;
+use crate::lsp::provider::LspProvider;
 
 /// Bounds every individual LSP request round-trip. Live probe data
 /// (2026-07-10, rust-analyzer 1.96 on the `rust_workspace` fixture): replies
@@ -76,21 +83,14 @@ struct ResolvedSite {
     def_line_zero_based: u32,
 }
 
-/// Run the LSP resolve-time overlay for Rust (`config.rust.lsp`) — the
-/// `lsp_refresh` MCP tool's `force: true` entry point, and (if ever wired to
-/// an automatic caller) the `force: false` one gated by `cfg.policy`.
-pub fn refresh(
-    conn: &Connection,
-    root: &Path,
-    config: &crate::config::Config,
-    force: bool,
-) -> anyhow::Result<LspIngestStats> {
-    run_lsp_overlay(conn, root, &config.rust.lsp, force)
-}
-
+/// Run the LSP resolve-time overlay for one `provider` — the `lsp_refresh`
+/// MCP tool's `force: true` entry point (via `lsp::refresh_language`), and
+/// (if ever wired to an automatic caller) the `force: false` one gated by
+/// `cfg.policy`.
 pub fn run_lsp_overlay(
     conn: &Connection,
     root: &Path,
+    provider: &LspProvider,
     cfg: &LspConfig,
     force: bool,
 ) -> anyhow::Result<LspIngestStats> {
@@ -99,26 +99,30 @@ pub fn run_lsp_overlay(
     }
     // Cheap DB check before ever probing for a binary or spawning anything —
     // same reasoning as scip::run_overlay_for's provider_has_any_files gate.
-    if !has_any_rust_files(conn) {
+    if !has_any_lang_files(conn, provider.langs) {
         return Ok(LspIngestStats::default());
     }
-    if !force && !policy_allows_automatic_run(cfg.policy, root) {
+    if !force && !policy_allows_automatic_run(provider, cfg.policy, root) {
         tracing::info!(
-            "LSP overlay: refresh policy ({}) skips this automatic run — \
+            "LSP overlay ({}): refresh policy ({}) skips this automatic run — \
              use the `lsp_refresh` MCP tool to force it",
+            provider.name,
             cfg.policy
         );
         return Ok(LspIngestStats::default());
     }
-    let Some(bin) = resolve_binary(cfg.binary.as_deref(), root) else {
+    let Some(bin) = (provider.resolve_binary)(cfg.binary.as_deref(), root) else {
         if cfg.enabled == Some(true) {
-            tracing::info!("LSP overlay enabled but no rust-analyzer found — skipping");
+            tracing::info!(
+                "LSP overlay enabled but no {} found — skipping",
+                provider.name
+            );
         }
         return Ok(LspIngestStats::default());
     };
 
     // ---- Phase 1: DB read (sync, caller thread) ----
-    let rows = load_candidate_edges(conn)?;
+    let rows = load_candidate_edges(conn, provider.langs)?;
     if rows.is_empty() {
         return Ok(LspIngestStats::default());
     }
@@ -202,12 +206,13 @@ pub fn run_lsp_overlay(
         match_rate,
     };
     tracing::info!(
-        "LSP overlay: {} of {} attempted call sites upgraded to formal (match_rate={:.2})",
+        "LSP overlay ({}): {} of {} attempted call sites upgraded to formal (match_rate={:.2})",
+        provider.name,
         stats.upgraded,
         stats.attempted,
         stats.match_rate
     );
-    write_last_run_stats(root, &stats);
+    write_last_run_stats(root, provider, &stats);
     Ok(stats)
 }
 
@@ -252,10 +257,10 @@ async fn resolve_loop(
     resolutions: &mut Vec<ResolvedSite>,
     attempted: &mut usize,
 ) -> anyhow::Result<()> {
-    // Warm-up: a freshly spawned rust-analyzer answers `null` (not "please
-    // retry"!) to definition requests until initial indexing settles —
-    // observed live: null, null, -32801, then correct, over ~5.4s on a tiny
-    // fixture. An early `null` is therefore not authoritative; keep
+    // Warm-up: a freshly spawned server answers `null` (not "please retry"!)
+    // to definition requests until initial indexing settles — observed live
+    // on rust-analyzer: null, null, -32801, then correct, over ~5.4s on a
+    // tiny fixture. An early `null` is therefore not authoritative; keep
     // re-asking the first few sites until one resolves or the warm-up budget
     // expires, and only then trust `NotFound` answers.
     let warmup_deadline = tokio::time::Instant::now() + WARMUP_BUDGET;
@@ -331,19 +336,27 @@ async fn resolve_loop(
     Ok(())
 }
 
-fn load_candidate_edges(conn: &Connection) -> rusqlite::Result<Vec<CandidateEdge>> {
-    let mut stmt = conn.prepare(
+/// `langs`-filtered candidate edges: joins `file_index` on `from_path` so a
+/// provider only ever sees call sites in files of the languages it claims
+/// (`provider.langs`) — a gopls session must never be asked to open a `.rs`
+/// file just because that file also happened to have an unresolved edge.
+fn load_candidate_edges(conn: &Connection, langs: &[&str]) -> rusqlite::Result<Vec<CandidateEdge>> {
+    let placeholders = langs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
         "SELECT ce.id, ce.from_path, ce.call_site_line, ce.to_symbol, s.name \
          FROM call_edges ce \
          JOIN symbols s ON s.qualified_name = ce.to_symbol \
+         JOIN file_index fi ON fi.path = ce.from_path \
          WHERE ce.edge_confidence IN ('ambiguous', 'textual') \
            AND ce.formal_source IS NULL \
            AND ce.ruled_out_by_scip = 0 \
            AND ce.call_site_line IS NOT NULL \
            AND ce.from_path IS NOT NULL \
-           AND s.kind != 'heading'",
-    )?;
-    stmt.query_map([], |r| {
+           AND s.kind != 'heading' \
+           AND fi.language IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(rusqlite::params_from_iter(langs.iter()), |r| {
         Ok(CandidateEdge {
             id: r.get(0)?,
             from_path: r.get(1)?,
@@ -355,12 +368,18 @@ fn load_candidate_edges(conn: &Connection) -> rusqlite::Result<Vec<CandidateEdge
     .collect()
 }
 
-fn has_any_rust_files(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM file_index WHERE language = 'rust')",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
+/// Whether the project has at least one indexed file in any of `langs` —
+/// same idiom (and the same fail-open-on-error posture) as
+/// `scip::provider_has_any_files`.
+fn has_any_lang_files(conn: &Connection, langs: &[&str]) -> bool {
+    if langs.is_empty() {
+        return true;
+    }
+    let placeholders = langs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM file_index WHERE language IN ({placeholders}))");
+    conn.query_row(&sql, rusqlite::params_from_iter(langs.iter()), |r| {
+        r.get::<_, i64>(0)
+    })
     .map(|n| n != 0)
     .unwrap_or(true) // fail open, same posture as scip::provider_has_any_files
 }
@@ -401,11 +420,11 @@ fn uri_to_repo_path(uri: &lsp_types::Uri, root: &Path) -> Option<String> {
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-fn policy_allows_automatic_run(policy: RefreshPolicy, root: &Path) -> bool {
+fn policy_allows_automatic_run(provider: &LspProvider, policy: RefreshPolicy, root: &Path) -> bool {
     match policy {
         RefreshPolicy::OnSave => true,
         RefreshPolicy::OnDemand => false,
-        RefreshPolicy::MinInterval(secs) => match read_last_run_unix(root) {
+        RefreshPolicy::MinInterval(secs) => match read_last_run_unix(provider, root) {
             None => true,
             Some(last) => {
                 let now = std::time::SystemTime::now()
@@ -418,19 +437,19 @@ fn policy_allows_automatic_run(policy: RefreshPolicy, root: &Path) -> bool {
     }
 }
 
-fn read_last_run_unix(root: &Path) -> Option<u64> {
-    let path = root.join(".calm").join("lsp-stats.json");
+fn read_last_run_unix(provider: &LspProvider, root: &Path) -> Option<u64> {
+    let path = root.join(".calm").join(provider.stats_file_name);
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("last_run_unix").and_then(|x| x.as_u64())
 }
 
-fn write_last_run_stats(root: &Path, stats: &LspIngestStats) {
+fn write_last_run_stats(root: &Path, provider: &LspProvider, stats: &LspIngestStats) {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let path = root.join(".calm").join("lsp-stats.json");
+    let path = root.join(".calm").join(provider.stats_file_name);
     let _ = std::fs::write(
         &path,
         serde_json::json!({
@@ -446,6 +465,7 @@ fn write_last_run_stats(root: &Path, stats: &LspIngestStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::provider;
 
     #[test]
     fn explicit_off_is_a_noop_even_when_rust_analyzer_is_on_path() {
@@ -457,7 +477,7 @@ mod tests {
             policy: RefreshPolicy::OnDemand,
         };
         assert_eq!(
-            run_lsp_overlay(&conn, Path::new("."), &cfg, false).unwrap(),
+            run_lsp_overlay(&conn, Path::new("."), &provider::RUST_ANALYZER, &cfg, false).unwrap(),
             LspIngestStats::default()
         );
     }
@@ -477,8 +497,33 @@ mod tests {
             policy: RefreshPolicy::OnDemand,
         };
         assert_eq!(
-            run_lsp_overlay(&conn, Path::new("."), &cfg, false).unwrap(),
+            run_lsp_overlay(&conn, Path::new("."), &provider::RUST_ANALYZER, &cfg, false).unwrap(),
             LspIngestStats::default()
+        );
+    }
+
+    /// The generalization's own gate: a project with ONLY Rust files must be
+    /// a no-op for the GOPLS provider — proves `langs`-based filtering
+    /// actually discriminates between providers, not just that the old
+    /// Rust-only gate still works.
+    #[test]
+    fn zero_go_files_is_a_noop_for_gopls_even_with_rust_files_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_index (path, hash, language, last_indexed) VALUES ('main.rs', 'h', 'rust', 0.0)",
+            [],
+        )
+        .unwrap();
+        let cfg = LspConfig {
+            enabled: Some(true),
+            binary: None,
+            policy: RefreshPolicy::OnDemand,
+        };
+        assert_eq!(
+            run_lsp_overlay(&conn, Path::new("."), &provider::GOPLS, &cfg, true).unwrap(),
+            LspIngestStats::default(),
+            "gopls must not run against a project with zero .go files"
         );
     }
 
@@ -501,7 +546,7 @@ mod tests {
             policy: RefreshPolicy::OnDemand,
         };
         assert_eq!(
-            run_lsp_overlay(&conn, Path::new("."), &cfg, false).unwrap(),
+            run_lsp_overlay(&conn, Path::new("."), &provider::RUST_ANALYZER, &cfg, false).unwrap(),
             LspIngestStats::default(),
             "OnDemand must block an automatic (force=false) run"
         );
@@ -522,6 +567,39 @@ mod tests {
         // And the serde path for a config.json that never mentions `lsp`:
         let parsed: crate::config::RustConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.lsp.policy, RefreshPolicy::OnDemand);
+    }
+
+    /// The `MinInterval`-sidecar fix this generalization exists to make
+    /// safe: two providers running back-to-back must not clobber each
+    /// other's last-run timestamp (the pre-generalization code had exactly
+    /// one hardcoded `lsp-stats.json` for all of them).
+    #[test]
+    fn stats_files_are_provider_specific_not_shared() {
+        let dir = std::env::temp_dir().join(format!(
+            "calm_lsp_stats_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".calm")).unwrap();
+
+        write_last_run_stats(&dir, &provider::RUST_ANALYZER, &LspIngestStats::default());
+        assert!(
+            read_last_run_unix(&provider::GOPLS, &dir).is_none(),
+            "gopls must not see rust-analyzer's sidecar"
+        );
+        assert!(read_last_run_unix(&provider::RUST_ANALYZER, &dir).is_some());
+
+        write_last_run_stats(&dir, &provider::GOPLS, &LspIngestStats::default());
+        assert!(
+            read_last_run_unix(&provider::CLANGD, &dir).is_none(),
+            "clangd must not see gopls's sidecar"
+        );
+        assert!(read_last_run_unix(&provider::GOPLS, &dir).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -592,7 +670,7 @@ mod tests {
             binary: None,
             policy: RefreshPolicy::OnDemand,
         };
-        let stats = run_lsp_overlay(&conn, &fixture, &cfg, true).unwrap();
+        let stats = run_lsp_overlay(&conn, &fixture, &provider::RUST_ANALYZER, &cfg, true).unwrap();
         assert!(
             stats.upgraded > 0,
             "expected at least one edge upgraded to formal (attempted={})",

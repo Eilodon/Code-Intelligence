@@ -483,7 +483,11 @@ fn insertion_hunk_for(
 ) -> Result<calm_core::edit::HunkRequest, ErrorDetail> {
     let full_path = project_root.join(&c.path);
     let live = std::fs::read_to_string(&full_path).map_err(|e| {
-        error_detail("READ_FAILED", &format!("could not read {}: {e}", c.path), false)
+        error_detail(
+            "READ_FAILED",
+            &format!("could not read {}: {e}", c.path),
+            false,
+        )
     })?;
     let (line_start, line_end) =
         match calm_core::indexer::parser::extract_symbols(&live, &c.language, &c.path) {
@@ -649,8 +653,7 @@ impl From<&calm_core::edit::HunkResult> for EditHunkResultOutput {
             current_hash: r.current_hash.clone(),
             old_text: r.old_text.clone(),
             new_end_line: applied.then_some(r.new_end_line as i64),
-            other_matches: (r.content_occurrences > 1)
-                .then_some(r.content_occurrences as i64 - 1),
+            other_matches: (r.content_occurrences > 1).then_some(r.content_occurrences as i64 - 1),
         }
     }
 }

@@ -149,15 +149,28 @@ impl LspClient {
     /// `textDocument/didOpen` for `path` so the server has live content to
     /// resolve positions against. The overlay's per-file grouping already
     /// guarantees at most one call per file per session.
+    /// `textDocument/didOpen` for `path` so the server has live content to
+    /// resolve positions against. The overlay's per-file grouping already
+    /// guarantees at most one call per file per session.
     pub async fn open_file(&mut self, path: &Path, uri: &Uri, text: &str) -> Result<()> {
+        // LSP `languageId` per extension, covering every provider Phase D
+        // wires (rust-analyzer/gopls/clangd; python kept for future use even
+        // though no Python LSP overlay exists yet). Falls back to the LSP
+        // spec's own generic `"plaintext"` for an unmapped/missing
+        // extension rather than lying "rust" for a non-Rust file — the
+        // pre-generalization default this replaces (D.0, 2026-07-11).
         let language_id = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|ext| match ext {
                 "rs" => "rust",
+                "py" => "python",
+                "go" => "go",
+                "c" | "h" => "c",
+                "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
                 other => other,
             })
-            .unwrap_or("rust")
+            .unwrap_or("plaintext")
             .to_string();
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
@@ -170,7 +183,6 @@ impl LspClient {
         self.notify("textDocument/didOpen", serde_json::to_value(params)?)
             .await
     }
-
     /// `textDocument/definition` at `(uri, line, character)` — 0-indexed,
     /// `character` in the negotiated `self.encoding`'s units.
     pub async fn definition(

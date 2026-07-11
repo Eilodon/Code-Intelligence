@@ -597,6 +597,7 @@ mod tests {
                 insert_missing: None,
                 policy: crate::config::RefreshPolicy::OnSave,
             },
+            lsp: crate::config::LspConfig::default(),
         };
         assert_eq!(
             run_go_overlay_and_log(&conn, Path::new("."), &go).unwrap(),
@@ -721,6 +722,7 @@ mod tests {
                 insert_missing: None,
                 policy: crate::config::RefreshPolicy::OnSave,
             },
+            lsp: crate::config::LspConfig::default(),
         };
         assert_eq!(
             run_clang_overlay_and_log(&conn, Path::new("."), &clang).unwrap(),
@@ -964,6 +966,7 @@ mod tests {
                 insert_missing: None,
                 policy: crate::config::RefreshPolicy::OnSave,
             },
+            lsp: crate::config::LspConfig::default(),
         };
         let stats = run_go_overlay_and_log(&conn, &fixture, &go).unwrap();
         assert!(

@@ -172,6 +172,15 @@ fn default_lsp_policy() -> RefreshPolicy {
 #[serde(default)]
 pub struct GoConfig {
     pub scip: ScipConfig,
+    /// LSP resolve-time overlay (gopls `textDocument/definition`) — same
+    /// role and gating contract as `RustConfig.lsp`, added when the LSP
+    /// overlay was generalized from a Rust-only pass into a per-language
+    /// provider table (D.0, 2026-07-11). `#[derive(Default)]` on this
+    /// struct already calls `LspConfig::default()` for this field, so no
+    /// manual `impl Default` is needed here the way `RustConfig` doesn't
+    /// need one either.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 /// Python's overlay config (P2.4) — same `ScipConfig` shape and same
@@ -261,6 +270,15 @@ pub struct PhpConfig {
 #[serde(default)]
 pub struct ClangConfig {
     pub scip: ScipConfig,
+    /// LSP resolve-time overlay (clangd `textDocument/definition`) — same
+    /// role as `RustConfig.lsp`/`GoConfig.lsp`, added when the LSP overlay
+    /// was generalized (D.0, 2026-07-11). Unlike `scip`, this field's
+    /// default policy is `OnDemand` (via `LspConfig::default()`), not
+    /// `MinInterval(900)` — see `LspConfig`'s own doc comment for why an
+    /// LSP overlay's per-reindex cost profile differs from a batch SCIP
+    /// indexer's, independent of which language it's for.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 impl Default for ClangConfig {
@@ -270,6 +288,7 @@ impl Default for ClangConfig {
                 policy: RefreshPolicy::MinInterval(900),
                 ..Default::default()
             },
+            lsp: LspConfig::default(),
         }
     }
 }

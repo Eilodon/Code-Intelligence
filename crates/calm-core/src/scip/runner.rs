@@ -745,7 +745,7 @@ pub fn clang_toolchain_fingerprint(root: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn binary_runs(path: &Path) -> bool {
+pub(crate) fn binary_runs(path: &Path) -> bool {
     Command::new(path)
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -754,7 +754,6 @@ fn binary_runs(path: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-
 /// `<bin> --version` output, trimmed, or `""` if it can't be run. Used as part
 /// of the overlay cache key — any version change invalidates the cache.
 pub fn binary_version(bin: &Path) -> String {
@@ -811,10 +810,9 @@ fn rustup_which(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn dirs_home() -> Option<PathBuf> {
+pub(crate) fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
-
 fn newest_vscode_ra(home: &Path) -> Option<PathBuf> {
     let ext_dir = home.join(".vscode/extensions");
     let mut hits: Vec<PathBuf> = std::fs::read_dir(&ext_dir)

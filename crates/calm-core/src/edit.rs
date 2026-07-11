@@ -196,7 +196,10 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
         let window = &lines[h.start_line - 1..h.end_line];
         let old_text: String = window.concat();
         let current_hash = hash_content(&old_text);
-        let content_occurrences = lines.windows(window.len()).filter(|w| **w == *window).count();
+        let content_occurrences = lines
+            .windows(window.len())
+            .filter(|w| **w == *window)
+            .count();
         let status = match &h.expected_hash {
             None => {
                 all_applied = false;
@@ -667,11 +670,17 @@ mod tests {
         let src = "fn a() {}\nfn b() {}\n";
         let h = insertion_hunk(src, 2, 2, InsertPosition::Before, "fn mid() {}").unwrap();
         let out = apply_hunks(src, &[h]).unwrap();
-        assert_eq!(out.new_content.unwrap(), "fn a() {}\nfn mid() {}\nfn b() {}\n");
+        assert_eq!(
+            out.new_content.unwrap(),
+            "fn a() {}\nfn mid() {}\nfn b() {}\n"
+        );
 
         let h = insertion_hunk(src, 2, 2, InsertPosition::After, "fn tail() {}").unwrap();
         let out = apply_hunks(src, &[h]).unwrap();
-        assert_eq!(out.new_content.unwrap(), "fn a() {}\nfn b() {}\nfn tail() {}\n");
+        assert_eq!(
+            out.new_content.unwrap(),
+            "fn a() {}\nfn b() {}\nfn tail() {}\n"
+        );
     }
 
     #[test]

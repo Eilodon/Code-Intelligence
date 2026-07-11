@@ -1,8 +1,8 @@
-//! Runs all 8 language-specific SCIP confidence-upgrade overlays (rust, go,
-//! python, js, java, csharp, php, clang) concurrently instead of
-//! sequentially. Shared by both places that used to inline this as ~8
-//! near-identical sequential blocks: the startup indexer in `lib.rs` and the
-//! incremental-reindex watcher loop in `watcher.rs`.
+//! Runs all 9 language-specific SCIP confidence-upgrade overlays (rust, go,
+//! python, js, java, csharp, php, clang, ruby) concurrently instead of
+//! sequentially. Shared by both places that used to inline this as ~8 (now
+//! 9) near-identical sequential blocks: the startup indexer in `lib.rs` and
+//! the incremental-reindex watcher loop in `watcher.rs`.
 //!
 //! Why parallel is safe here even though every branch touches the same
 //! database: the expensive part of each branch is spawning + polling an
@@ -147,6 +147,14 @@ pub fn run_all(root: &Path, db_path: &Path) {
                     .map(|c| c.clang)
                     .unwrap_or_default();
                 calm_core::scip::run_clang_overlay_and_log(conn, root, &cfg)
+            });
+        });
+        s.spawn(|| {
+            run_one("ruby", db_path, |conn| {
+                let cfg = calm_core::config::load_config(root)
+                    .map(|c| c.ruby)
+                    .unwrap_or_default();
+                calm_core::scip::run_ruby_overlay_and_log(conn, root, &cfg)
             });
         });
     });

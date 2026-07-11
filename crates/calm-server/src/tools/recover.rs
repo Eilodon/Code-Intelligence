@@ -173,6 +173,14 @@ impl CalmServer {
         ) {
             out.push(PerLanguageOverlayStatus::new("c", s));
         }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::RUBY,
+            conn,
+            &self.project_root,
+            &config.ruby.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("ruby", s));
+        }
         out
     }
     #[tool(

@@ -26,6 +26,7 @@ pub struct Config {
     pub csharp: CSharpConfig,
     pub php: PhpConfig,
     pub clang: ClangConfig,
+    pub ruby: RubyConfig,
 }
 
 impl Default for Config {
@@ -68,6 +69,7 @@ impl Default for Config {
             csharp: CSharpConfig::default(),
             php: PhpConfig::default(),
             clang: ClangConfig::default(),
+            ruby: RubyConfig::default(),
         }
     }
 }
@@ -254,6 +256,30 @@ pub struct CSharpConfig {
 #[serde(default)]
 pub struct PhpConfig {
     pub scip: ScipConfig,
+}
+
+/// Ruby's overlay config (Phase D.1) — same `ScipConfig` shape and
+/// distinct-wrapper-struct reasoning as the others, but **not**
+/// `#[derive(Default)]` like Go/Python/JS/C#/PHP: `scip-ruby` runs a real
+/// (if best-effort on untyped files) Sorbet type-check pass over the whole
+/// project, closer in cost to Java/Clang's heavier providers than PHP's
+/// pure AST walk. Default `MinInterval(900)` matches `JavaConfig`'s/
+/// `ClangConfig`'s own default for the same reason.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RubyConfig {
+    pub scip: ScipConfig,
+}
+
+impl Default for RubyConfig {
+    fn default() -> Self {
+        Self {
+            scip: ScipConfig {
+                policy: RefreshPolicy::MinInterval(900),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// C/C++'s overlay config (P3.1) — same `ScipConfig` shape and distinct-

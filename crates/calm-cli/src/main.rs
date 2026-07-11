@@ -457,6 +457,24 @@ async fn main() -> Result<()> {
                         tracing::warn!("SCIP overlay (c) error (base graph intact): {e}")
                     }
                 }
+
+                let ruby_cfg = calm_core::config::load_config(&root)
+                    .map(|c| c.ruby)
+                    .unwrap_or_default();
+                match calm_core::scip::run_ruby_overlay_and_log(&conn, &root, &ruby_cfg) {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
+                        println!(
+                            "SCIP overlay (ruby): {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("SCIP overlay (ruby) error (base graph intact): {e}")
+                    }
+                }
             }
         }
         Commands::Doctor { project_root } => {

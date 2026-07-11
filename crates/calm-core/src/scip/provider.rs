@@ -404,6 +404,46 @@ fn php_composer_json_hash(root: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The 9th entry in the table (Phase D.1, 2026-07-11) — `scip-ruby`
+/// (Sourcegraph's fork of Sorbet, https://github.com/sourcegraph/scip-ruby).
+/// Live-verified end to end on a genuinely `# typed: false` (untyped)
+/// fixture, the exact scenario the plan flagged as needing real evidence
+/// before committing to a "formal tier" claim for Ruby: Sorbet performs
+/// real flow-sensitive type narrowing inside a `case handler when X ...
+/// when Y` even without any `sig` annotations (confirmed by inspecting the
+/// raw `.scip` output's hover-type strings — `handler (AlphaHandler)` /
+/// `handler (BetaHandler)` narrowed per-branch, `handler
+/// (T.any(AlphaHandler, BetaHandler))` before the narrowing point), which
+/// is exactly the kind of ambiguity CALM's syntactic resolver can't
+/// follow. See `scip::runner::ruby_resolve_binary`'s doc comment for a
+/// real, load-bearing gotcha found during this verification (the
+/// `gem install`-installed wrapper script refuses to run standalone).
+pub const RUBY: ScipProvider = ScipProvider {
+    lang: "ruby",
+    dirty_langs: &["ruby"],
+    resolve_binary: super::runner::ruby_resolve_binary,
+    build_command: super::runner::ruby_build_command,
+    timeout: super::runner::RUBY_SCIP_TIMEOUT,
+    cache_key: ruby_cache_key,
+    cache_file_name: "scip-ruby.cache",
+};
+
+fn ruby_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    super::cache::overlay_cache_key(
+        &super::runner::ruby_binary_version(bin),
+        &super::runner::ruby_toolchain_fingerprint(root),
+        &ruby_gemfile_lock_hash(root),
+        "", // no separate manifest analog beyond Gemfile.lock itself
+        dirty,
+    )
+}
+
+fn ruby_gemfile_lock_hash(root: &Path) -> String {
+    std::fs::read_to_string(root.join("Gemfile.lock"))
+        .map(|s| crate::indexer::pipeline::hash_content(&s))
+        .unwrap_or_default()
+}
+
 /// The 8th entry in the table (Phase 3 / P3.1) — **scaffolding only, no
 /// live verification**, unlike every other provider in this table. Two
 /// independent blockers made `scip-clang` unobtainable in this sandbox:

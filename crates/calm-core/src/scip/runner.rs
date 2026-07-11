@@ -631,6 +631,104 @@ pub fn php_toolchain_fingerprint(root: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The 9th entry in the table (Phase D.1, 2026-07-11) — `scip-ruby`
+/// (Sourcegraph's fork of Sorbet) has a real prebuilt gem
+/// (`gem install scip-ruby`), but its INSTALLED `bin/scip-ruby` is a thin
+/// RubyGems wrapper script that hard-requires `BUNDLE_GEMFILE` and refuses
+/// to run standalone ("Missing BUNDLE_GEMFILE environment variable /
+/// Expected to be invoked as 'bundle exec scip-ruby'") — confirmed live: it
+/// exits 1 on a bare `--version` probe too, so `binary_runs` fails closed
+/// (reports "not found") rather than silently misreporting a broken
+/// install as usable. `ruby_resolve_binary` therefore only ever looks for a
+/// `scip-ruby` launcher already on `PATH` that works standalone — the
+/// README's own "download binary and index" method (a raw platform binary,
+/// not the gem wrapper) is what actually satisfies this, same shape as
+/// `GO`'s `go_resolve_binary`.
+pub fn ruby_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(b) = override_bin {
+        candidates.push(PathBuf::from(b));
+    }
+    candidates.push(PathBuf::from("scip-ruby")); // PATH lookup via which-style probe
+    candidates.into_iter().find(|c| binary_runs(c))
+}
+
+/// `scip-ruby --gem-metadata <name@version> --index-file <out> .`, run with
+/// `root` as the working directory. `--index-file` takes a FILE path
+/// (confirmed against the real CLI reference docs, not the possibly-stale
+/// `--help` text alone: "The path for emitting the SCIP index. Defaults to
+/// `index.scip`" — a directory argument here silently emits nothing).
+/// `--gem-metadata` is always passed explicitly: without it, a project with
+/// no `Gemfile.lock`/`.gemspec` makes scip-ruby exit 1 ("Failed to find
+/// .gemspec file for identifying gem version"), which `run_indexer` would
+/// treat as a hard failure — passing a synthesized `name@version` (derived
+/// from `root`'s own directory name, version pinned to a constant) sidesteps
+/// this unconditionally, since the value only affects cross-repo navigation
+/// metadata, not same-repo occurrence resolution.
+pub fn ruby_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "calm-indexed-project".to_string());
+    let mut cmd = Command::new(bin);
+    cmd.arg("--gem-metadata")
+        .arg(format!("{name}@0.0.0"))
+        .arg("--index-file")
+        .arg(out)
+        .arg(".")
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Sorbet performs a real (if best-effort on `# typed: false` files) type
+/// check of the whole project on every run — heavier than a pure AST walk
+/// like PHP's, but not a full external build-tool invocation like Java/
+/// Clang's — `CSHARP_SCIP_TIMEOUT`'s budget is the closest existing match.
+pub const RUBY_SCIP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `scip-ruby --version`'s first line, trimmed, or `""` if it can't be run.
+pub fn ruby_binary_version(bin: &Path) -> String {
+    Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Cache-key input analogous to `php_toolchain_fingerprint`: which Ruby
+/// runtime is active can matter for how scip-ruby's own embedded parser
+/// behaves, though scip-ruby bundles its own Sorbet build rather than
+/// shelling out to a system `ruby` the way scip-php's underlying tool does
+/// — kept for parity with the other providers' cache-key shape regardless.
+pub fn ruby_toolchain_fingerprint(root: &Path) -> String {
+    Command::new("ruby")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// The 8th entry's timeout (P3.1) — same 600s budget as Java's, the other
 /// provider `ScipConfig::policy`'s own doc comment names as a "heavy future
 /// provider": `scip-clang` compiles and indexes one translation unit at a

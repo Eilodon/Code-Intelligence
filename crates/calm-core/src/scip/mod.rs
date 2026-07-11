@@ -401,6 +401,17 @@ pub fn run_clang_overlay_and_log(
     run_and_refresh(&provider::CLANG, conn, root, &cfg.scip, false)
 }
 
+/// Run the Ruby overlay (`provider::RUBY`) — same shape as the other
+/// providers. Like C#/PHP/C++, Ruby has no pre-existing formal tier to
+/// coexist with (not in `resolver::formal`'s stack-graphs registrations).
+pub fn run_ruby_overlay_and_log(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::RubyConfig,
+) -> anyhow::Result<ingest::IngestStats> {
+    run_and_refresh(&provider::RUBY, conn, root, &cfg.scip, false)
+}
+
 /// Manually refresh one or every SCIP provider right now, bypassing
 /// `cfg.policy`'s automatic-run gate (`force: true` — see
 /// `run_overlay_for`) — the shared entry point behind `calm scip run` and
@@ -427,6 +438,7 @@ pub fn refresh_language(
         "csharp",
         "php",
         "c",
+        "ruby",
     ];
     let want: &[&str] = match lang {
         None | Some("all") => &all,
@@ -436,7 +448,7 @@ pub fn refresh_language(
                 .expect("just checked contains"),
         ),
         Some(other) => anyhow::bail!(
-            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, csharp, php, c, all"
+            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, csharp, php, c, ruby, all"
         ),
     };
     let mut out = Vec::with_capacity(want.len());
@@ -452,13 +464,13 @@ pub fn refresh_language(
             "java" => run_and_refresh(&provider::JAVA, conn, root, &config.java.scip, true)?,
             "php" => run_and_refresh(&provider::PHP, conn, root, &config.php.scip, true)?,
             "c" => run_and_refresh(&provider::CLANG, conn, root, &config.clang.scip, true)?,
+            "ruby" => run_and_refresh(&provider::RUBY, conn, root, &config.ruby.scip, true)?,
             _ => unreachable!("want is filtered to `all` above"),
         };
         out.push((lang.to_string(), stats));
     }
     Ok(out)
 }
-
 /// Cheap, non-invoking snapshot of the overlay's readiness — never spawns an
 /// external indexer, just checks binary presence and compares the cache key
 /// that `run_overlay_for` would compute against what's already on disk.
@@ -795,7 +807,8 @@ mod tests {
         config.java.scip = off.clone();
         config.csharp.scip = off.clone();
         config.php.scip = off.clone();
-        config.clang.scip = off;
+        config.clang.scip = off.clone();
+        config.ruby.scip = off;
 
         let results = refresh_language(&conn, Path::new("."), &config, None).unwrap();
         let langs: Vec<&str> = results.iter().map(|(l, _)| l.as_str()).collect();
@@ -809,7 +822,8 @@ mod tests {
                 "java",
                 "csharp",
                 "php",
-                "c"
+                "c",
+                "ruby"
             ]
         );
         assert!(
@@ -820,7 +834,7 @@ mod tests {
 
         let results_explicit_all =
             refresh_language(&conn, Path::new("."), &config, Some("all")).unwrap();
-        assert_eq!(results_explicit_all.len(), 8);
+        assert_eq!(results_explicit_all.len(), 9);
     }
 
     /// A specific `lang` runs only that one provider.
@@ -1232,6 +1246,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wrong_at_24, "ambiguous");
+    }
+
+    /// Live integration: real `scip-ruby` against
+    /// `multi_lang_workspace/ruby` (Phase D.1, 2026-07-11) — the plan's own
+    /// flagged open question ("Sorbet vốn thiết kế cho codebase có type
+    /// annotation; cần research độ chính xác thật trên Ruby không có
+    /// annotation trước khi cam kết formal tier cho Ruby") answered with a
+    /// real binary against a genuinely `# typed: false` (untyped, no `sig`
+    /// blocks anywhere) fixture, not assumed.
+    ///
+    /// `route`'s `case handler when AlphaHandler ... when BetaHandler ...`
+    /// is the Ruby analogue of Kotlin's `is X ->` / Go's type switch: CALM's
+    /// syntactic resolver can't follow it, so `handler.process` in both
+    /// branches lands `ambiguous` with the same 2 candidates
+    /// (`AlphaHandler#process`/`BetaHandler#process`) before this overlay
+    /// runs. Confirmed by inspecting the raw `.scip` output's own
+    /// hover-type strings before writing this test: `handler (AlphaHandler)`
+    /// inside the first `when`, `handler (BetaHandler)` inside the second,
+    /// `handler (T.any(AlphaHandler, BetaHandler))` before the narrowing
+    /// point — Sorbet performs real flow-sensitive type narrowing on
+    /// `case/when` even with zero `sig` annotations in the file, and that
+    /// narrowing is what resolves each branch's `.process` call to its own
+    /// specific target and rules out the other. Ignored by default — needs
+    /// a *standalone* `scip-ruby` binary on `PATH` (the README's own
+    /// "download binary and index" method) — see
+    /// `scip::runner::ruby_resolve_binary`'s doc comment for why the
+    /// ordinary `gem install scip-ruby` wrapper script doesn't work here.
+    #[test]
+    #[ignore]
+    fn ruby_overlay_upgrades_ambiguous_case_when_calls_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/ruby");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let before_alpha: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.rb::Dispatcher::route' \
+                   AND to_symbol = 'handlers.rb::AlphaHandler::process' \
+                   AND call_site_line = 24",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before_alpha, "ambiguous",
+            "fixture must start ambiguous — CALM's syntactic resolver can't follow Ruby's case/when"
+        );
+
+        let ruby = crate::config::RubyConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        let stats = run_ruby_overlay_and_log(&conn, &fixture, &ruby).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one Ruby edge upgraded to formal via scip-ruby"
+        );
+
+        // Line 24 (`when AlphaHandler ... handler.process`) must resolve to
+        // AlphaHandler's own process, not BetaHandler's.
+        let (alpha_conf, alpha_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'handlers.rb::Dispatcher::route' \
+                   AND to_symbol = 'handlers.rb::AlphaHandler::process' \
+                   AND call_site_line = 24",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(alpha_conf, "formal");
+        assert_eq!(alpha_src.as_deref(), Some("scip"));
+
+        // Line 26 (`when BetaHandler ... handler.process`) must resolve to
+        // BetaHandler's own process, not AlphaHandler's.
+        let (beta_conf, beta_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'handlers.rb::Dispatcher::route' \
+                   AND to_symbol = 'handlers.rb::BetaHandler::process' \
+                   AND call_site_line = 26",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(beta_conf, "formal");
+        assert_eq!(beta_src.as_deref(), Some("scip"));
+
+        // The wrong cross-pairing at each site must still be ambiguous —
+        // the actual disambiguation proof, not just "something changed".
+        let wrong_at_24: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.rb::Dispatcher::route' \
+                   AND to_symbol = 'handlers.rb::BetaHandler::process' \
+                   AND call_site_line = 24",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_24, "ambiguous");
+        let wrong_at_26: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.rb::Dispatcher::route' \
+                   AND to_symbol = 'handlers.rb::AlphaHandler::process' \
+                   AND call_site_line = 26",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_26, "ambiguous");
     }
 
     /// Live integration: real `scip-dotnet` against

@@ -22,6 +22,7 @@ mod memory;
 mod orient;
 mod recover;
 mod scip;
+mod security;
 mod trace;
 
 // ---------------------------------------------------------------------------
@@ -209,6 +210,7 @@ impl CalmServer {
         router.merge(Self::recover_tool_router());
         router.merge(Self::scip_tool_router());
         router.merge(Self::lsp_tool_router());
+        router.merge(Self::security_tool_router());
         router.merge(Self::inspect_tool_router());
         router.merge(Self::edit_tool_router());
         router

@@ -8,11 +8,13 @@
 //! callers (`calm-cli`) gate `--listen`/`calm connect` behind `cfg(unix)`
 //! and fall back to plain `calm serve` (stdio) everywhere else.
 //!
-//! v1 scope: no idle-timeout yet (a future milestone), no version-handshake
-//! *enforcement* yet (`daemon.meta` is written here so `calm connect` can
-//! read it once that lands, but nothing here checks it). Opt-in only —
-//! `calm serve`'s default stdio behavior is completely unchanged by this
-//! module's existence.
+//! v1 (shipped 2026-07-10, milestones M2-M5): idle-timeout after ~30min genuinely idle
+//! (`IDLE_CHECK_INTERVAL`/`IDLE_CHECKS_BEFORE_SHUTDOWN` below, gated on indexing/embed status too,
+//! not just connection count) and version-handshake *enforcement* (`DaemonMeta::is_current`,
+//! `try_connect_current` below — a stale build gets SIGTERMed and respawned, not just detected).
+//! Opt-in only — `calm serve`'s default stdio behavior is completely unchanged by this module's
+//! existence, and this daemon path isn't yet the default entry point for the npm/plugin
+//! distribution (`scripts/mcp-launcher.sh` still execs plain `calm serve`).
 
 use std::path::{Path, PathBuf};
 

@@ -12,8 +12,9 @@ for formal name resolution in Tier-0 languages.
 ### Tier-0 (Stack Graphs — formal confidence)
 
 - **Python**: `tree-sitter-stack-graphs-python` v0.3 (pre-built `.tsg` rules + builtins)
-- **TypeScript / JavaScript / Java**: Future — requires `.tsg` rule authoring or
-  upstream crate availability
+- **TypeScript**: Shipped (`FormalResolver::load_typescript`, `crates/calm-core/src/resolver/formal.rs:385`, 2026-07-03)
+- **JavaScript**: Shipped (`load_javascript`, `formal.rs:425`, 2026-07-04)
+- **Java**: Shipped (`load_java`, `formal.rs:451`, 2026-07-06)
 
 ### ConservativeResolver (retained — not replaced)
 
@@ -41,18 +42,18 @@ upstream grammar, not a superset). Unlike Python, upstream's `builtins.ts` is no
 resolves real ECMAScript globals (`Array`, `.isArray`, etc. — verified by test, not assumed) — no
 DEBT-005-style synthetic stub needed.
 
-JavaScript and Java remain **not implemented**, and are riskier than TypeScript was:
+JavaScript and Java were **both since implemented** (Update below) — at the time of this section
+(2026-07-03) they were riskier than TypeScript for the reasons kept here for historical context:
 - **JavaScript**: `builtins.js` ships empty upstream (same as Python originally), but the fix isn't a
   drop-in DEBT-005-style stub — `stack-graphs.tsg` wires primitive-prototype builtins
   (`builtins_number`, `builtins_string`, `builtins_Regex_prototype`, ...) as nodes generated per-file
   on `@prog`'s own scope, not through the `<builtins>` file/`push_symbol` fallback edge Python and
-  TypeScript both use. Global *functions* (`parseInt`, `setTimeout`, ...) appear to have no fallback
-  path at all in the rules as written. Needs a from-scratch read of `stack-graphs.tsg` before any
-  stub is written, not a port of `PYTHON_BUILTINS_STUB`.
-- **Java**: `builtins.java` also ships empty, and `stack-graphs.tsg` has **zero** references to
-  "builtins" of any form — unclear whether/how `java.lang` auto-import (`String`, `Object`, `System`,
-  ...) is intended to resolve at all through this mechanism. Needs the deepest investigation of the
-  three before committing to an implementation approach.
+  TypeScript both use. Global *functions* (`parseInt`, `setTimeout`, ...) appeared to have no fallback
+  path in the rules as written at the time — resolved during implementation, see Update below.
+- **Java**: `builtins.java` also ships empty, and `stack-graphs.tsg` had **zero** references to
+  "builtins" of any form — how `java.lang` auto-import (`String`, `Object`, `System`, ...) resolves
+  through this mechanism needed the deepest investigation of the three — resolved during
+  implementation, see Update below.
 
 Dependency versions are otherwise ready whenever the above is resolved: `tree-sitter-stack-graphs-javascript`
 0.3.0 (needs `tree-sitter-javascript` pinned to exactly `0.23.1` — already the workspace's resolved
@@ -73,3 +74,10 @@ version) and `tree-sitter-stack-graphs-java` 0.5.0 (needs `tree-sitter-java` pin
 - **rust-analyzer style**: Too tightly coupled to Rust; not multi-language.
 - **LSP-based**: Requires running external language servers; high latency, hard to embed.
 - **Scope analysis from scratch**: Reinventing what Stack Graphs already solves.
+
+## Update (2026-07-06): JavaScript and Java shipped
+
+Both resolved during implementation, closing the open questions from Update (2026-07-03) above:
+`load_javascript` (`crates/calm-core/src/resolver/formal.rs:425`, 2026-07-04) and `load_java`
+(`formal.rs:451`, 2026-07-06). See `test_resolve_file_resolves_java_builtins` and the JS/TS
+equivalents in the same test module for what specifically got verified working, not just compiling.

@@ -1,6 +1,6 @@
 # ADR-0004: LSP như tầng nâng cấp confidence tùy chọn (không thay resolver mặc định)
 
-- **Status**: Proposed (draft — chờ review, chưa implement)
+- **Status**: Accepted & Partially Implemented — SCIP batch overlay shipped for Rust (2026-07-04) and live-LSP resolve-time overlay shipped for Rust/rust-analyzer (pilot, 2026-07-10, feature `lsp-overlay`, opt-in); Go/gopls and C+C++/clangd subsequently shipped too via a generalized `LspProvider` table (Phase D.0/D.3/D.4, 2026-07-11) — see "Update 2026-07-11" below.
 - **Date**: 2026-07-03
 - **Decision makers**: TBD (draft do Claude chuẩn bị theo yêu cầu, cần chủ dự án duyệt)
 - **Related**: ADR-0001 (Stack Graphs Scope), ADR-0002 (Formal Resolver), `docs/comparison.md`
@@ -327,3 +327,17 @@ chết im lặng cho tới thay đổi kế tiếp đi đúng đường watcher 
 sidecar ghi 2863 upgrade 30 phút trước). Đã fix: edit-tool giờ fan-out overlay nền sau reindex
 non-noop, có coalescing guard chống stack rust-analyzer khi edit liên tiếp. Không fix bug này thì
 mọi upgrade của cả SCIP lẫn LSP đều chỉ sống tới lần edit kế tiếp.
+
+## Update 2026-07-11: gopls (Go) và clangd (C/C++) đã ship — Pilot Plan gốc ở trên hoàn thành trễ 1 ngày
+
+"Update 2026-07-10" ở trên ghi nhận việc lệch khỏi Pilot Plan Go/gopls để ưu tiên Rust trước. Ngày
+hôm sau, Go/gopls và C+C++/clangd cũng đã ship — không phải theo đúng JSON-RPC client tự viết như
+Pilot Plan gốc mô tả (bước 1, dòng 111-113), mà bằng cách tổng quát hoá `LspClient` của Rust thành
+một bảng `LspProvider` data-driven (`crates/calm-core/src/lsp/provider.rs`: `RUST_ANALYZER`,
+`GOPLS`, `CLANGD`) tái dùng đúng phần protocol plumbing đã nêu ở mục 3 phía trên (Content-Length
+framing, id-routing, warm-up/retry) — xác nhận đúng dự đoán "mở rộng sang ngôn ngữ khác = thêm
+binary-discovery + config block, không phải viết lại client". Cả 3 provider dùng chung policy
+`on_demand` mặc định, trigger qua tool `lsp_refresh`. Go/no-go criteria ở trên (dòng 124-131) chưa
+được đo lại chính thức cho gopls/clangd sau khi ship — nếu cần con số match-rate/overhead thật,
+xem `docs/superskills/plans/2026-07-10-25-language-expansion.md` Phase D.3/D.4 hoặc chạy
+`lsp_refresh` trên một fixture thật.

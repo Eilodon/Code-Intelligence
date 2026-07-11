@@ -1,6 +1,6 @@
 # CALM — Kế hoạch mở rộng lên 25 ngôn ngữ (bản đã verify lại bằng code thật)
 
-> **Ngày:** 2026-07-10 · **Trạng thái:** **PHASE B (Kotlin + Swift) ĐÃ XONG.** Tiếp theo: Phase A (registry). Xem §4-DONE ngay dưới đây để biết chi tiết + đừng làm lại.
+> **Ngày:** 2026-07-10 (trạng thái cập nhật 2026-07-11) · **Trạng thái:** **Phase A (registry), Phase B (Kotlin+Swift), Phase C (9/9 ngôn ngữ), và Phase D (D.0–D.4) ĐỄU ĐÃ XONG** — xác nhận qua `git log` (Phase A `046879e`; Phase C `4b58716`..`bac3f33`; Phase D `faa80a6`/`e808d2e`/`438a890`/`7288fa2`). Phase E đang tiến hành: CI all-languages job + benchmark tier-distribution đã có (`68fb216`, `3cccd2b`). Xem §5 (kế hoạch triển khai) trong `docs/superskills/plans/2026-07-11-market-position-and-roadmap.md` cho việc còn lại.
 > **Nguồn gốc:** Báo cáo nghiên cứu "Đưa CALM lên 25 ngôn ngữ" của user (dựa trên [[calm-25-language-expansion-research]] + [[calm-language-support-audit-2026-07-10]] + [[calm-gortex-adaptation-roadmap]]) + một vòng verify độc lập bằng 3 Explore agent đọc trực tiếp code ngày 2026-07-10 (không tin lại memory/docs cũ).
 > **Việc đã làm trong phiên lập kế hoạch (an toàn, không cần chờ chốt):** `crates/calm-cli/Cargo.toml` thiếu feature `lang-csharp` (bug thật do agent verify tìm ra — calm-core và calm-server đều có, calm-cli thì không) → đã thêm dòng `lang-csharp = ["calm-core/lang-csharp", "calm-server/lang-csharp"]`, verify bằng `cargo check -p calm-cli --no-default-features --features lang-csharp` (xanh).
 

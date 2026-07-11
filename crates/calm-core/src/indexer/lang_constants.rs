@@ -282,6 +282,15 @@ fn ts_lang_ocaml() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-zig")]
+fn ts_lang_zig() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_zig::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-zig"))]
+fn ts_lang_zig() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -1298,6 +1307,75 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: &["(*"],
         modifier_keywords: &[],
         shallow_detect: Some(crate::indexer::parser::detect_ocaml),
+    },
+    // Zig (Phase C, 2026-07-11): like elixir/haskell/zig's own upstream cadence,
+    // the latest published version (1.1.2, unchanged since Dec 2024) is
+    // already ABI 14 — no cliff to pin below. Verified via a real AST dump
+    // on a fixture covering a top-level `const std = @import(...)`, a
+    // `const Greeter = struct { ... }` with two methods (one calling the
+    // other via chained field access AND via `self.`), a top-level `pub fn
+    // main`, and a local `const g = ...` inside main's body.
+    //
+    // `function_declaration` has a direct "name" field and `call_expression`
+    // a direct "function" field — both work uniformly (bare call, chained
+    // field access like `std.debug.print`, and `self.method()`), no
+    // sentinel needed; `split_receiver_callee`'s existing dot-splitting
+    // already handles the chained case correctly (receiver = last segment).
+    //
+    // `variable_declaration` (`const Foo = ...`) needed a dedicated
+    // `resolve_name_node` arm: it has NO "name" field at all (only "type"),
+    // the identifier is a bare positional child — AND the same node kind
+    // and shape is also used for a local `const`/`var` inside a function
+    // body. Same ambiguity class as Haskell's "bind"/OCaml's "let_binding",
+    // but shallower: only the IMMEDIATE parent disambiguates
+    // ("source_file" for real, typically "block" for local).
+    //
+    // Deliberate scope cut for this pass: a `variable_declaration` binding
+    // a struct/enum/union literal (`const Greeter = struct {...}`) is
+    // still extracted as `SymbolKind::Variable`, not upgraded to
+    // Class/Enum — `node_kind_to_symbol_kind` only ever sees this node's
+    // OWN kind string, never what its right-hand side actually is.
+    // Likewise `struct_declaration` is not a `class_node_types` entry (it
+    // has no "name" field of its own — the name lives on the wrapping
+    // variable_declaration, a different node), so struct methods get no
+    // class_context and are plain `SymbolKind::Function`, not Method —
+    // same category of cut as OCaml's module_binding/Elixir's defmodule.
+    LanguageSpec {
+        name: "zig",
+        aliases: &[],
+        extensions: &["zig"],
+        constants: LangConstants {
+            function_node_types: &["function_declaration", "variable_declaration"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["call_expression"],
+            call_function_field: "function",
+            call_function_field_by_kind: &[],
+            class_node_types: &[],
+            class_name_field: "name",
+            definition_macro_names: &[],
+        },
+        ts_language: ts_lang_zig,
+        branch_node_kinds: &[
+            "if_statement",
+            "while_statement",
+            "for_statement",
+            "switch_expression",
+        ],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        // "pub "/"export "/etc. so e.g. `pub fn main()` reduces to the plain
+        // `fn main()` the shallow detector's prefix check matches.
+        modifier_keywords: &[
+            "pub ",
+            "export ",
+            "extern ",
+            "inline ",
+            "noinline ",
+            "comptime ",
+        ],
+        shallow_detect: Some(crate::indexer::parser::detect_zig),
     },
 ];
 

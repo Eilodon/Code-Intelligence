@@ -120,6 +120,13 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         "method_declaration" | "method_definition" => SymbolKind::Method,
         // JS/TS `const foo = () => {}` — treated as a variable holding a function.
         "lexical_declaration" => SymbolKind::Variable,
+        // Zig top-level `const`/`var` (`const std = @import(...)`,
+        // `const Greeter = struct {...}`) — same "variable holding
+        // anything, including a type" treatment as JS/TS above; a
+        // struct/enum-holding const doesn't get upgraded to Class/Enum
+        // since node_kind_to_symbol_kind only ever sees this node's own
+        // kind, never its RHS's kind (documented imprecision, not a bug).
+        "variable_declaration" => SymbolKind::Variable,
         // R `foo <- function(x) {...}` — unlike JS's `const`, assignment is R's
         // *only* function-definition syntax (no separate `function foo() {}`
         // declaration form exists), so the bound name is treated as a real
@@ -411,6 +418,25 @@ fn resolve_name_node<'a>(
                 Some("structure") | Some("compilation_unit")
             ) {
                 Some(pattern)
+            } else {
+                None
+            }
+        }
+        // Zig: `variable_declaration` (`const Greeter = struct {...}`,
+        // `const std = @import(...)`) has NO "name" field at all (only
+        // "type") — the identifier is a bare positional child. Same
+        // ambiguity class as Haskell's "bind"/OCaml's "let_binding" once
+        // again: a LOCAL `const`/`var` inside a function body produces the
+        // identical node shape. This time only the IMMEDIATE parent
+        // disambiguates ("source_file" for a real top-level declaration,
+        // typically "block" for a local one) — one level shallower than
+        // OCaml needed, confirmed via a real AST dump, not assumed by
+        // analogy.
+        "variable_declaration" => {
+            if node.parent().is_some_and(|p| p.kind() == "source_file") {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|c| c.kind() == "identifier")
             } else {
                 None
             }
@@ -2281,6 +2307,22 @@ pub(crate) fn detect_ocaml(s: &str) -> Option<(String, SymbolKind)> {
     }
     None
 }
+
+pub(crate) fn detect_zig(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("fn ")
+        && let Some(name) = ident_at_start(rest)
+    {
+        return Some((name, SymbolKind::Function));
+    }
+    for kw in ["const ", "var "] {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, SymbolKind::Variable));
+        }
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3767,6 +3809,16 @@ public class FooTest {
         assert!(names.contains(&"greet"), "should detect let");
         assert!(names.contains(&"loop"), "should detect let rec");
     }
+
+    #[test]
+    fn test_shallow_zig() {
+        let code = "pub fn main() void {\nconst std = @import(\"std\");\nvar counter: i32 = 0;\n";
+        let syms = extract_symbols_shallow(code, "zig", "a.zig");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"main"), "should detect pub fn");
+        assert!(names.contains(&"std"), "should detect const");
+        assert!(names.contains(&"counter"), "should detect var");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -4432,6 +4484,85 @@ class Foo {
                 .iter()
                 .any(|c| c.enclosing_name == "greet" && c.callee == "format_greeting"),
             "second call inside greet should produce a call edge: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-zig")]
+    fn test_tier0_5_grammar_loads_zig() {
+        assert!(
+            parse_tree("pub fn main() void {}\n", "zig").is_some(),
+            "tree-sitter-zig grammar should load and parse — locks the pinned ABI \
+             (=1.1.2, ABI 14)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-zig")]
+    fn test_zig_real_grammar_symbols_and_calls_are_accurate() {
+        // Zig's `variable_declaration` (`const Greeter = struct {...}`,
+        // `const std = @import(...)`) is the SAME node kind for a real
+        // top-level declaration and a LOCAL `const`/`var` inside a function
+        // body (e.g. `const g = Greeter{...}` inside main) — same ambiguity
+        // class as Haskell's "bind"/OCaml's "let_binding", but only one
+        // level: distinguished by the immediate parent ("source_file" for
+        // real, anything else — typically "block" — for local). This
+        // fixture's local `const g = ...` inside `main` must NOT appear.
+        let code = "const std = @import(\"std\");\n\nconst Greeter = struct {\n    name: []const u8,\n\n    fn greet(self: Greeter) void {\n        std.debug.print(\"hello\", .{});\n        self.formatGreeting();\n    }\n\n    fn formatGreeting(self: Greeter) void {}\n};\n\npub fn main() void {\n    const g = Greeter{ .name = \"world\" };\n    g.greet();\n}\n";
+        let symbols = extract_symbols(code, "zig", "a.zig").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"std"),
+            "should detect top-level const import: {names:?}"
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "should detect top-level const struct: {names:?}"
+        );
+        assert!(names.contains(&"greet"), "should detect method: {names:?}");
+        assert!(
+            names.contains(&"formatGreeting"),
+            "should detect second method: {names:?}"
+        );
+        assert!(names.contains(&"main"), "should detect pub fn: {names:?}");
+        assert_eq!(
+            names.iter().filter(|&&n| n == "g").count(),
+            0,
+            "the local `const g = ...` inside main must NOT be extracted as a \
+             symbol — catches the exact bug a naive variable_declaration arm \
+             (no parent check) would produce: {names:?}"
+        );
+
+        let greet = symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("greet should be found");
+        // Function, not Method: `struct_declaration` has no "name" field of
+        // its own (its name only exists on the OUTER wrapping
+        // variable_declaration) — documented scope cut, no class_context
+        // for struct-nested methods this pass, same category as
+        // OCaml's module_binding / Elixir's defmodule skip.
+        assert_eq!(greet.kind, SymbolKind::Function);
+        assert!(greet.class_context.is_none());
+
+        let calls = extract_calls(code, "zig", "a.zig").unwrap();
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "greet"
+                && c.callee == "print"
+                && c.receiver.as_deref() == Some("debug")),
+            "chained field-access call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "greet"
+                && c.callee == "formatGreeting"
+                && c.receiver.as_deref() == Some("self")),
+            "method-style call should produce a call edge with receiver: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "main"
+                && c.callee == "greet"
+                && c.receiver.as_deref() == Some("g")),
+            "call on a local var should produce a call edge with receiver: {calls:?}"
         );
     }
 }

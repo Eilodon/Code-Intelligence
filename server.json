@@ -6,12 +6,12 @@
     "url": "https://github.com/Eilodon/CALM",
     "source": "github"
   },
-  "version": "0.1.3",
+  "version": "0.1.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@eilodon/calm-mcp",
-      "version": "0.1.3",
+      "version": "0.1.5",
       "transport": {
         "type": "stdio"
       }

@@ -47,4 +47,4 @@ jobs:
       - name: Verify
         run: |
           sleep 2
-          curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.eilodon/calm-mcp"
+          curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Eilodon/calm-mcp"

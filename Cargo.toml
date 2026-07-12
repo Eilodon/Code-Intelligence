@@ -7,7 +7,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+# NOTE: bump this at the same time as (or just before) cutting a new `vX.Y.Z`
+# git tag. `.github/workflows/release.yml` also `sed`-stamps this field from
+# the tag inside the CI runner before building release binaries — but that
+# stamp only affects the ephemeral build checkout, never gets committed back
+# here. If this drifts behind the latest tag (as it did, stuck at 0.1.1
+# through v0.1.2/v0.1.3/v0.1.4), `scripts/mcp-launcher.sh`'s Tier 2 falls
+# back to building from source on every single run: it compares this file's
+# version against the downloaded release binary's real `--version` output
+# and treats any mismatch as a corrupted/wrong download, so a stale value
+# here silently defeats the verified-download fast path for everyone.
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"

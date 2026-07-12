@@ -319,6 +319,19 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // left NULL for a non-hub symbol) — lets the edit gate treat a bridge-
     // only touch less strictly than a degree hub without a second query.
     migrate_add_column(conn, "symbols", "hub_kind", "TEXT")?;
+    // Tier-1 agent-experience upgrade: flags a symbol whose line_start or
+    // line_end shares a physical source line with an adjacent symbol —
+    // written by `graph::boundary::update_boundary_ambiguous_flags`,
+    // called from `rebuild_graph` right after `update_is_hub_flags` so it
+    // gets the exact same per-reindex invalidation guarantee already
+    // trusted for `hub_kind` (see docs/superskills/specs/2026-07-13-calm-
+    // agent-experience-upgrade.md Risk Assessment, Failure Mode 1).
+    migrate_add_column(
+        conn,
+        "symbols",
+        "boundary_ambiguous",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // Plan 3 §3.5(d): HMAC-SHA256(topic, content) over `memory::compute_mac`,
     // written by `remember`. Nullable, not backfilled — a pre-existing note
     // has no MAC to check, and `memory::verify_integrity` reports that case
@@ -452,6 +465,26 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migration_adds_boundary_ambiguous_column_defaulting_to_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, path, language, line_start, line_end, signature) \
+             VALUES ('x', 'x', 'function', 'a.rs', 'rust', 1, 2, 'fn x()')",
+            [],
+        )
+        .unwrap();
+        let val: i64 = conn
+            .query_row(
+                "SELECT boundary_ambiguous FROM symbols WHERE qualified_name = 'x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, 0, "new rows default to not-ambiguous");
     }
 
     #[test]

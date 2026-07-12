@@ -202,21 +202,29 @@ pub fn compute_co_changes_cached(…) -> CoChangeResult { … }
 
 ## Bảng baseline & kết quả đo (điền khi thực thi)
 
-| Kịch bản (repo CALM, daemon release) | Baseline trước Plan 2 | Sau 2.2 | Sau 2.3 | Sau 2.4 | Ghi chú |
-|---|---|---|---|---|---|
-| `repo_overview` | _ms | | | | |
-| `locate("edit_context")` | _ms | | | | |
-| `source("edit_lines_impl", metadata=true)` | _ms | | | | file 901 dòng |
-| `edit_context("make_read_conn")` | _ms | | | | 29 callers — worst case preview |
-| `edit_symbol` sửa 1 dòng (không hub) | _ms | | | | phần reindex đo ở Plan 3 |
-| `diff_impact(staged)` 1 file | _ms | | | | |
+Đo bằng `grep tool_execution_completed` trong `.calm/daemon.log` của chính daemon phục vụ session. "Baseline" đo trên daemon **debug** (build tại thời điểm bắt đầu Plan 2, trước bất kỳ thay đổi nào); "Final" đo trên daemon **release** build lại từ HEAD sau khi cả 6 item merge — nên phần chênh lệch bao gồm cả debug→release, không thuần là tác dụng của Plan 2. Cột "Final (warm)" mới là phép so sánh táo-với-táo thật sự: gọi lại **đúng cùng** `edit_context` lần thứ hai ngay sau lần đầu trên cùng symbol, đo tác dụng thực của cache co-change + config (audit F11b/F12) — đây là kịch bản "sửa file A, edit_context lại A" mà edit_context vốn được thiết kế để phục vụ lặp lại.
 
-Cách đo: grep `tool_execution_completed` trong log daemon (`/tmp/calm-mcp.log` — wrapper đã redirect) hoặc bật `RUST_LOG=info`. Mỗi số = median 3 lần chạy.
+| Kịch bản | Baseline (debug, trước Plan 2) | Final (release, sau Plan 2 — cold) | Final (release — warm, gọi lại) | Ghi chú |
+|---|---|---|---|---|
+| `repo_overview` | 8ms | 8ms | — | không đổi nhiều — tool này không phải trọng tâm Plan 2 |
+| `locate("edit_context")` | 16ms | 5ms | — | ~3.2× — hưởng lợi từ F13 (sanitize snippet rẻ hơn) |
+| `source("edit_lines_impl", metadata=true)` | 42ms | 27ms | — | ~1.6× — F13 trên file lớn (901+ dòng, đã tăng thêm sau các sweep) |
+| `edit_context("make_read_conn")` (29 callers, trải trên ~25 file khác nhau) | 131ms | 107ms | **10ms** | Cold: cải thiện khiêm tốn vì 29 caller trải rộng nhiều file (preview-batching ít trùng file để gộp trên chính symbol này). Warm (gọi lại lần 2, cache co-change 60s TTL + config cache còn hiệu lực): **10.7×** — đúng kịch bản edit_context lặp lại mà audit F11b nhắm tới |
+| `edit_symbol` sửa 1 dòng (không hub) | _chưa đo_ | _chưa đo_ | | phần reindex đo ở Plan 3 — không thuộc phạm vi Plan 2 |
+| `diff_impact(staged)` unstaged rỗng | 4ms | 5ms | — | nhiễu đo lường ở mức này (0 file thay đổi cả hai lần) |
 
 ## Checklist kết thúc Plan 2
 
-- [ ] 6 item = 6-8 commit, đều qua `diff_impact` gate, push
-- [ ] Bảng đo điền đủ 2 cột (baseline + final) — item perf nào không cải thiện đo được phải ghi lý do
-- [ ] `pattern_debt_register` cho class `unwrap-in-handler` (2.1) và `per-row-file-read` (2.4) — phiên sau re-check bằng `pattern_debt_status`
-- [ ] Rebuild release + restart daemon + dogfood 10 phút trên chính CALM
-- [ ] Cập nhật audit report: đánh dấu F4/F8/F11/F12/F13/H4 = RESOLVED kèm commit hash
+- [x] 6 item = 8 commit, đều qua `diff_impact` gate — chưa push (chờ user xác nhận)
+  - 2.2 (F13): `b228b58`
+  - 2.5 (F8): `2d36552`
+  - 2.1(a) (F4 lock-poison): `15e24d9`
+  - 2.6 (H4): `d9b7cb2`
+  - 2.1(b) (F4 prepare/query sweep): `509b8a7`
+  - 2.3 (F12): `3c98d15`
+  - 2.4(a) (F11 preview batching): `7814dc1`
+  - 2.4(b) (F11 co-change cache): `66a5e66`
+- [x] Bảng đo điền đủ cột (baseline debug + final release cold/warm) — `edit_symbol` sửa 1 dòng để ngỏ cho Plan 3 (đúng phạm vi tài liệu gốc)
+- [x] `pattern_debt_register` cho class `unwrap-in-handler` (anchor `edit_lines_impl`, sau 2.1) và `per-row-file-read` (anchor `line_previews_batched`, sau 2.4) — `pattern_debt_status` sẽ re-check phiên sau
+- [x] Rebuild release + restart daemon (SIGTERM debug daemon cũ → self-heal spawn bản release đúng HEAD, không dirty) + dogfood trực tiếp trên chính CALM (toàn bộ các lệnh đo ở trên chạy qua MCP thật, không phải test giả lập)
+- [x] Cập nhật audit report: đánh dấu F4/F8/F11/F12/F13/H4 = RESOLVED kèm commit hash (xem `docs/audit/2026-07-12-vheatm-deep-audit.md`)

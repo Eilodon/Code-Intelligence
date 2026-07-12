@@ -48,6 +48,8 @@ Trước khi vào findings — những thứ CALM làm **thật sự tốt**, đ
 **Fix:** chuyển sang boost **theo rank** thay vì theo score — coi proximity là một nguồn RRF thứ tư (nhất quán mọi kind), hoặc normalize score về [0,1] trước khi cộng. Test bắt buộc: "boost không bao giờ hoán vị top-1 khi chênh lệch điểm gốc > X%".
 
 ### F4 · [ROBUSTNESS] ~37 `.unwrap()` trong tool handler + 65 `lock()/read().unwrap()` — một panic **brick toàn bộ edit path**
+
+**RESOLVED** (2026-07-12) — poison-tolerant `LockExt`/`RwLockExt` traits + unwrap sweep across tools.rs/edit.rs/trace.rs/guardrails.rs/orient.rs/inspect.rs/locate.rs. Commits `15e24d9` (2.1a), `509b8a7` (2.1b).
 **Evidence:** `guardrails.rs:66,79,93,106,400,413` (`prepare().unwrap()` — DB corrupt/schema drift = panic thay vì `DB_ERROR` envelope); đếm non-test: guardrails 7, trace 12, orient 9, inspect 3, recover 3, locate 2, testgap 1. Nghiêm trọng nhất: `tools/edit.rs:122` `self.edit_lock.lock().unwrap()` — một panic trong lúc giữ lock (hoàn toàn khả thi vì các unwrap khác nằm trong cùng closure) → mutex poisoned → **mọi** `edit_lines`/`edit_symbol` sau đó panic vĩnh viễn tới khi restart server.
 **Fix:** (1) `edit_lock.lock().unwrap_or_else(|p| p.into_inner())` — trạng thái được bảo vệ là `()`, poison không có ý nghĩa; (2) quét toàn bộ `prepare().unwrap()`/`query_map().unwrap()` trong handler → trả `db_error(...)`; (3) cân nhắc `catch_unwind` quanh handler body trong `timed_tool` để mọi panic còn sót thành `INTERNAL` error envelope thay vì chết connection.
 
@@ -71,6 +73,8 @@ Trước khi vào findings — những thứ CALM làm **thật sự tốt**, đ
 **Fix:** chạy `injection_warning(content)` per-note trong recall, thêm trường `content_warning` — 5 dòng code, đồng nhất trust surface.
 
 ### F8 · [SAFETY] Decode-budget bypass: 40 decoy nuốt hết budget trước payload
+
+**RESOLVED** (2026-07-12) — two-budget `DecodeBudget` (tries vs successes) + collect-then-sort-by-length-descending before decoding. Commit `2d36552` (2.5).
 **Evidence:** `sanitize.rs:245` (`MAX_TOTAL_DECODE_ATTEMPTS = 40`), `sanitize.rs:277-286` — `find_iter` duyệt trái→phải, mỗi candidate trừ budget bất kể decode thành công hay không.
 **Failure scenario:** attacker đặt 40+ chuỗi base64-alphabet vô hại (git SHA, hash, lockfile noise — văn bản kỹ thuật có sẵn hàng trăm) phía trước payload encoded → payload không bao giờ được decode-scan. `scan_text` trên webpage/lockfile dài gần như chắc chắn cạn budget trước nội dung cuối.
 **Fix:** ưu tiên hoá thay vì FIFO — ví dụ: chỉ trừ budget khi decode **ra text hợp lệ** (decode fail rẻ, bound riêng cao hơn), và/hoặc scan candidates theo thứ tự độ dài giảm dần (payload thật thường dài). Ghi rõ giới hạn còn lại vào output (`decode_budget_exhausted: true`) để agent biết scan chưa phủ hết.
@@ -86,14 +90,20 @@ Trước khi vào findings — những thứ CALM làm **thật sự tốt**, đ
 **Fix:** (1) nâng default `min_callers_bridge` lên 4-5 hoặc `coreness_pct` lên 90; (2) tier hoá gate: bridge-hub yếu → chỉ cần `confirm`; degree-hub/high-caller → full 3 lớp; (3) log tỷ lệ denied-then-abandoned trong telemetry để calibrate bằng số liệu thật.
 
 ### F11 · [PERF] `edit_context` spawn `git log` + đọc lại nguyên file cho từng caller preview, mỗi call
+
+**RESOLVED** (2026-07-12) — `line_previews_batched` (read each distinct file at most once) + `co_changes_cached` (60s TTL, CalmServer-scoped). Commits `7814dc1` (2.4a), `66a5e66` (2.4b).
 **Evidence:** `guardrails.rs:129-140` (`compute_co_changes` → `git log` subprocess mỗi lần gọi), `common.rs:1561-1590` (`line_preview` = `fs::read_to_string` **nguyên file** cho **mỗi** caller/callee row — symbol 50 callers cùng 3 file = 50 lần đọc full file); cùng pattern tại 7 call-site (`trace.rs`, `guardrails.rs`).
 **Fix:** (1) cache co-change per (file, since) với TTL ~60s hoặc invalidate theo HEAD; (2) group previews theo path — đọc mỗi file một lần, lấy N dòng. Đây là tool "bắt buộc trước mọi edit" — latency của nó là latency của cả workflow.
 
 ### F12 · [PERF] `load_config` đọc disk 19 lần/… + `Connection::open` mỗi tool call
+
+**RESOLVED** (2026-07-12) — CalmServer-scoped `config()` with mtime-based cache invalidation, all 19 call sites swept. Commit `3c98d15` (2.3).
 **Evidence:** 19 call-site `load_config` trong `tools/*.rs` (mỗi search/locate/edit_context call đều parse lại config.json — `common.rs:326`); `make_read_conn` mở connection mới mỗi call (`common.rs:125-129`, 29 callers).
 **Fix:** config cache mtime-based trong `calm_core::config` (một `OnceLock<RwLock<(SystemTime, Config)>>`); connection thì WAL đã rẻ hoá nhưng một read-pool nhỏ (2-4 conn) vẫn cắt được overhead mở file + pragma mỗi call.
 
 ### F13 · [PERF] `sanitize_source_output` = 13 lần `replace_all` full-string trên **mọi** source/preview/signature/docstring
+
+**RESOLVED** (2026-07-12) — single-pass `RegexSet` prefilter (`CREDENTIAL_SET`/`INJECTION_SET`) before any `replace_all`; differential test against reference impl. Commit `b228b58` (2.2).
 **Evidence:** `sanitize.rs:79-88` — mỗi pattern một pass + một `String` allocation; chạy trên mọi `source()`, mọi preview của mọi caller row, mọi signature/docstring (`common.rs:918-921,1578`).
 **Fix:** dùng `regex::RegexSet` một pass `is_match` trước (case phổ biến: sạch → trả nguyên `code`), chỉ chạy replace cho pattern match. Giảm ~13× công việc trên hot path đọc code.
 
@@ -115,7 +125,7 @@ Trước khi vào findings — những thứ CALM làm **thật sự tốt**, đ
 | H1 | `RecallParams::query` doc nói "SQL LIKE" nhưng chạy FTS5 bm25 | `memory.rs:240-243` vs `106-111` |
 | H2 | AGENTS.md hứa `risk_assessment.level == "critical"` cho edit_context nhưng code chỉ sinh low/med/high | `common.rs:1545-1553`, AGENTS.md Stage 5 |
 | H3 | 3 doc refs chết trong README (chính fitness_report của CALM đang fail vì nó) | fitness_report phiên này: `.codeium/...`, `.gemini/...`, `docs/legacy/architecture-design.md` |
-| H4 | `diff_impact` build symbol qua `HashMap<String, serde_json::Value>` rồi serialize→deserialize về struct | `guardrails.rs:482-528` |
+| H4 | `diff_impact` build symbol qua `HashMap<String, serde_json::Value>` rồi serialize→deserialize về struct | `guardrails.rs:482-528` — **RESOLVED**, direct `Vec<AffectedSymbolOutput>` build + `AffectedSymbolFacts` trait, commit `d9b7cb2` (2.6) |
 | H5 | WAL nhưng chưa set `PRAGMA synchronous=NORMAL` (mặc định FULL — fsync nặng không cần thiết dưới WAL cho index-DB rebuild-able) | `schema.rs:220` |
 | H6 | `touch_active_session` lấy 2 lock lồng nhau (session_log rồi active_sessions) — hiện an toàn vì thứ tự nhất quán, đáng ghi chú invariant | `common.rs:247-262` |
 

@@ -337,10 +337,31 @@ fn extract_file_data(
             }
             s.qualified_name = candidate;
         }
+        // Defense-in-depth: same kind-gate as `walk_symbols`'s
+        // `detect_entry_point` call (`parser.rs`) — a struct/enum/const can
+        // never be a genuine entry point no matter what a user-configured
+        // `entry_points` pattern matches against. This branch is inert on
+        // CALM's own repo today (`Config::default().entry_points` is empty
+        // and no config.json overrides it), but stays correct the moment a
+        // project configures a non-empty pattern list.
         if !s.is_entry_point
+            && matches!(
+                s.kind,
+                crate::types::SymbolKind::Function | crate::types::SymbolKind::Method
+            )
+            // Exact match against either the bare NAME (for simple
+            // conventions like "main"/"serve") or the full `qualified_name`
+            // (the user-facing escape hatch for pinning one exact symbol,
+            // e.g. `"a.py::custom_entry"` — see
+            // test_entry_points_config_escape_hatch) — never `.contains()`
+            // substring match: that would let a bare-name pattern like
+            // "cli" hit every symbol under any `*cli*` path (e.g.
+            // `crates/calm-cli/`), or "run" hit every symbol in any
+            // `runner.rs`/`*_runner.rs` file, regardless of the symbol's own
+            // name.
             && entry_point_patterns
                 .iter()
-                .any(|p| s.qualified_name.contains(p.as_str()))
+                .any(|p| p == &s.name || p == &s.qualified_name)
         {
             s.is_entry_point = true;
         }

@@ -553,21 +553,35 @@ fn walk_symbols(
             enclosing_class.clone()
         };
 
-        let is_entry_point = detect_entry_point(
-            node,
-            source,
-            language,
-            &name,
-            &signature,
-            &enclosing_decorators,
-        );
+        let kind = node_kind_to_symbol_kind(node.kind(), enclosing_class.is_some());
+        // `detect_entry_point`'s heuristics (trait-dispatch names like
+        // `default`/`deserialize`, framework decorators/annotations) are
+        // designed for CALLABLE symbols — a struct/enum can never be "where
+        // execution starts" or "a handler invoked externally" in the sense
+        // repo_overview's entry_points list means. Without this gate, e.g. a
+        // plain `#[serde(default)]`/`#[serde(rename_all = ...)]` (not
+        // `#[derive(..)]`, which `rust_attr_is_dispatch_signal` already
+        // excludes) on a config struct/enum, or any method literally named
+        // `default`/`deserialize` (both in `TRAIT_DISPATCH_NAMES`), flags
+        // the struct/enum/method itself as an entry point — confirmed live
+        // on this repo's own `IndexingPhase`/`FitnessThresholds`/
+        // `HubThresholdConfig::default`.
+        let is_entry_point = matches!(kind, SymbolKind::Function | SymbolKind::Method)
+            && detect_entry_point(
+                node,
+                source,
+                language,
+                &name,
+                &signature,
+                &enclosing_decorators,
+            );
         let is_test = detect_is_test(node, source, language, &name, &signature, path);
         let complexity = compute_cyclomatic_complexity(node, language);
 
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
             name,
-            kind: node_kind_to_symbol_kind(node.kind(), enclosing_class.is_some()),
+            kind,
             language: language.to_string(),
             path: path.to_string(),
             line_start: node.start_position().row + 1,
@@ -760,6 +774,17 @@ fn rust_attr_is_dispatch_signal(d: &str) -> bool {
         "test",
         "derive",
         "automatically_derived",
+        // Pure (de)serialization config (`#[serde(default)]`,
+        // `#[serde(rename_all = "...")]`, `#[serde(skip)]`, ...) — like
+        // `derive` above, this describes how a value is (de)serialized, not
+        // something that invokes it externally. Without this, any struct or
+        // enum carrying a non-derive serde attribute (extremely common on
+        // config/API types) was misread as an entry point — confirmed live
+        // on this repo's own `IndexingPhase`/`FitnessThresholds` before this
+        // fix (also covered by the kind-gate added in `walk_symbols`, but
+        // fixed here too so this function's own contract stays correct for
+        // any future member-level use).
+        "serde",
     ];
     let inner = d.trim_start_matches("#[").trim_end_matches(']');
     let path = inner.split('(').next().unwrap_or(inner).trim();
@@ -3073,6 +3098,34 @@ def run():
         let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
         assert!(!find(&symbols, "helper").is_entry_point);
         assert!(!find(&symbols, "also_helper").is_entry_point);
+    }
+
+    // F15 (2026-07-12 audit): a struct/enum carrying a plain `#[serde(..)]`
+    // attribute (not `#[derive(..)]`, which `rust_attr_is_dispatch_signal`
+    // already excludes) was misread as an entry point by
+    // `rust_attr_is_dispatch_signal`'s opt-out-list design, applied
+    // uniformly to every symbol kind with no `kind` check at all —
+    // confirmed live on this repo's own `IndexingPhase`/`FitnessThresholds`.
+    // The kind-gate in `walk_symbols` (only `Function`/`Method` can be
+    // `is_entry_point`) is the fix; this test locks in the struct/enum side
+    // of it directly against the exact real-world attribute shapes found.
+    #[test]
+    fn test_rust_serde_attr_struct_and_enum_are_never_entry_points() {
+        let code = "#[derive(Debug, Clone, Deserialize)]\n#[serde(default)]\npub struct Config {\n    pub x: i32,\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum Phase {\n    Scanning,\n    Ready,\n}\n\nfn main() {}\n\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(
+            !find(&symbols, "Config").is_entry_point,
+            "a struct with #[serde(default)] must never be an entry point, regardless of its own attributes"
+        );
+        assert!(
+            !find(&symbols, "Phase").is_entry_point,
+            "an enum with #[serde(rename_all = ..)] must never be an entry point, regardless of its own attributes"
+        );
+        assert!(
+            find(&symbols, "main").is_entry_point,
+            "a real fn main in the same file must still be flagged"
+        );
+        assert!(!find(&symbols, "helper").is_entry_point);
     }
 
     /// Regression: common std/core trait methods (`from`, `clone`, `fmt`,

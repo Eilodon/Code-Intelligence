@@ -38,11 +38,19 @@ impl CalmServer {
                 Err(e) => return db_error(e),
             };
 
-            const ENTRY_POINTS_LIMIT: usize = 20;
+            const ENTRY_POINTS_LIMIT: usize = 10;
             let entry_points: Vec<EntryPointItem> = {
+                // `main`-named functions first (the conventional place to
+                // start reading), then by caller_count desc — previously
+                // unordered (arbitrary rowid order) with a cap of 20; now
+                // ranked and capped tighter now that is_entry_point false
+                // positives (struct/enum via detect_entry_point's own-
+                // attribute check) are fixed at the source (parser.rs).
                 let mut stmt = match conn.prepare(
                     "SELECT qualified_name, path FROM symbols \
-                     WHERE is_entry_point = 1 LIMIT ?1",
+                     WHERE is_entry_point = 1 \
+                     ORDER BY CASE WHEN name = 'main' THEN 0 ELSE 1 END, caller_count DESC \
+                     LIMIT ?1",
                 ) {
                     Ok(s) => s,
                     Err(e) => return db_error(e),

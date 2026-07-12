@@ -50,7 +50,23 @@ impl Default for Config {
                 "build".into(),
                 ".venv".into(),
             ],
-            entry_points: Vec::new(),
+            // Bare-name conventions for common language entry points
+            // (matched by exact symbol name in `extract_file_data`, kind-
+            // gated to function/method only — see pipeline.rs). Previously
+            // empty, so a fresh install never flagged any entry point via
+            // this path at all (per-language `detect_entry_point` in
+            // parser.rs still covers `fn main`/`func main`/`public static
+            // void main` etc. directly; this list is the user-configurable
+            // supplement for framework entry conventions like `serve`/
+            // `handler`/`cli` that vary too much per project to hardcode).
+            entry_points: vec![
+                "main".into(),
+                "__main__".into(),
+                "serve".into(),
+                "run".into(),
+                "handler".into(),
+                "cli".into(),
+            ],
             hub_threshold: HubThresholdConfig::default(),
             semantic_search: SemanticSearchConfig::default(),
             search: SearchConfig::default(),

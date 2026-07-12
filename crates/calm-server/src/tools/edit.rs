@@ -1,6 +1,18 @@
 use super::common::*;
 use super::*;
 
+/// Serializes background embedding jobs spawned after an edit's reindex
+/// commits (Plan 3 §3.1 Phase C) — a second `edit_lines`/`edit_symbol` call
+/// on the same or a different file, arriving while a prior edit's
+/// background embed thread is still running, would otherwise open a
+/// second concurrent writer connection racing the first's `embed_pending`/
+/// `embed_pending_chunks` passes. Unconditional rather than relying on
+/// `embed_pending*` being provably idempotent under concurrent callers —
+/// cheaper to serialize outright than to bet on that assumption holding as
+/// Phase B raises how often the same file gets reindexed in quick
+/// succession. Guards `()` only — poison-tolerant via `LockExt`.
+static EMBED_BG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[rmcp::tool_router(router = "edit_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
@@ -435,6 +447,7 @@ impl CalmServer {
         // fact succeeded. Collect the failure and report it as a stale-index
         // warning on a success response instead.
         let mut index_stale: Option<String> = None;
+        let mut should_embed_bg = false;
         match calm_core::db::conn::open_writer(&self.db_path) {
             Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
             Ok(mut write_conn) => {
@@ -444,21 +457,16 @@ impl CalmServer {
                     &[path.to_string()],
                 ) {
                     Ok(summary) if !summary.is_noop() => {
-                        if let Some(model) = self.embedder() {
-                            if let Err(e) =
-                                calm_core::embedding::embed_pending(&write_conn, model.as_ref())
-                            {
-                                tracing::error!("edit_lines: incremental embedding failed: {e}");
-                            }
-                            if let Err(e) = calm_core::embedding::embed_pending_chunks(
-                                &write_conn,
-                                model.as_ref(),
-                            ) {
-                                tracing::error!(
-                                    "edit_lines: incremental chunk embedding failed: {e}"
-                                );
-                            }
-                        }
+                        // Embedding moved out of this lock-held section (Plan 3
+                        // §3.1 Phase C) — the reindex above already committed the
+                        // DB write, so correctness doesn't depend on embedding
+                        // finishing before the response returns; only semantic-
+                        // search freshness does, and that's an eventual-
+                        // consistency concern, not worth holding _guard/
+                        // _cross_guard (and therefore every OTHER edit_lines/
+                        // edit_symbol call in this and other processes) for.
+                        // Spawned after both guards drop below.
+                        should_embed_bg = self.embedder().is_some();
                         // This reindex just ran rebuild_graph, which DELETEs every
                         // call_edges row — including all `formal` upgrades from the
                         // SCIP/LSP overlays — and re-resolves syntactically. The
@@ -489,6 +497,41 @@ impl CalmServer {
         }
         drop(_cross_guard);
         drop(_guard);
+
+        // Plan 3 §3.1 Phase C: background embed, now outside both guards. Own
+        // writer connection (this thread doesn't hold write_conn, which is
+        // already out of scope) — busy_timeout in open_writer handles any
+        // contention with a concurrent edit's reindex. EMBED_BG (module-level
+        // static above) serializes concurrent background embed jobs against
+        // each other, not against reindex_paths itself.
+        if should_embed_bg {
+            if let Some(model) = self.embedder() {
+                let db_path = self.db_path.clone();
+                std::thread::spawn(move || {
+                    let _bg_guard = EMBED_BG.lock_ok();
+                    match calm_core::db::conn::open_writer(&db_path) {
+                        Ok(bg_conn) => {
+                            if let Err(e) =
+                                calm_core::embedding::embed_pending(&bg_conn, model.as_ref())
+                            {
+                                tracing::error!("edit_lines: background embedding failed: {e}");
+                            }
+                            if let Err(e) = calm_core::embedding::embed_pending_chunks(
+                                &bg_conn,
+                                model.as_ref(),
+                            ) {
+                                tracing::error!(
+                                    "edit_lines: background chunk embedding failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            "edit_lines: could not open DB for background embedding: {e}"
+                        ),
+                    }
+                });
+            }
+        }
 
         // Session tracking must reflect what hit the disk even when the
         // index refresh didn't: skipping these on the stale path exempted

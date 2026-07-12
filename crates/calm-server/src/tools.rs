@@ -5776,6 +5776,130 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
+    // Plan 3 §3.3 (F10): bridge-only hub tier — lighter gate than degree/both.
+    #[test]
+    fn edit_lines_bridge_only_hub_needs_only_confirm_when_callers_are_confident() {
+        let (dir, server) = test_server("edit_bridge_gate_light");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 3, 1, 'bridge', 0)",
+                [],
+            )
+            .unwrap();
+            // Two callers, both high-confidence — makes all_caller_edges_confident true.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.a', 'a.py::helper', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.b', 'a.py::helper', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // confirm still required even for the lighter tier.
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
+
+        // confirm:true, NO edit_context call this session, NO reason — the
+        // bridge-only lighter tier skips both EDIT_CONTEXT_REQUIRED and
+        // REASON_NOT_GROUNDED entirely.
+        let with_confirm_only = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: None,
+            },
+        ));
+        let v = jv(with_confirm_only);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_bridge_hub_with_a_low_confidence_caller_still_needs_the_full_gate() {
+        let (dir, server) = test_server("edit_bridge_gate_low_confidence");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 3, 1, 'bridge', 0)",
+                [],
+            )
+            .unwrap();
+            // One resolved caller, one textual (heuristic, unproven) caller
+            // — the true blast radius may exceed caller_count, so this must
+            // NOT be treated as confidence-safe even though hub_kind is
+            // 'bridge' and caller_count is well under the "high" threshold.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.a', 'a.py::helper', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.b', 'a.py::helper', 'textual')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: None,
+            },
+        )));
+        assert_eq!(
+            v["error"]["code"], "EDIT_CONTEXT_REQUIRED",
+            "a textual/ambiguous caller must force the full 3-layer gate \
+             regardless of hub_kind — response: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn edit_lines_multi_hunk_batch_applies_bottom_up() {
         let (dir, server) = test_server("edit_multi_hunk");

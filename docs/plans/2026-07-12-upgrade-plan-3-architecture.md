@@ -119,22 +119,27 @@ Các bước bên trong (mirror `reindex_changed_cancellable`, bỏ walk):
 
 ## §3.3 — F10: Hub tiering — gate mạnh đúng chỗ, hết friction tràn lan  ⏱ ~1 ngày
 
-**Evidence:** `graph/hub.rs:66-68` (bridge-hub = `callers ≥ 2 && coreness ≥ p75`), default `min_callers_bridge: 2` (`config.rs:86-93`) → thực đo trên chính CALM: 185/2797 = 9.8% hub; mỗi hub-touch đòi đủ 3 lớp gate (`tools/edit.rs:264-380`) → agent học cách né edit tools của CALM = phản tác dụng an toàn.
+**Evidence:** `graph/hub.rs` (bridge-hub = `callers ≥ min_callers_bridge && coreness ≥ p{coreness_pct}`), default `min_callers_bridge: 2` → thực đo trên chính CALM: 9.8% hub; mỗi hub-touch đòi đủ 3 lớp gate → agent học cách né edit tools của CALM = phản tác dụng an toàn.
 
-**Thiết kế — 2 phần, 2 commit:**
+**Thiết kế [ĐÃ LÀM]:**
 
-**(a) Phân loại hub_kind + siết default:**
-1. Schema: `ALTER TABLE symbols ADD COLUMN hub_kind TEXT` (nullable; theo pattern migration `table_info` sẵn có trong `schema.rs:331,416`). `update_is_hub_flags` ghi `'degree' | 'bridge' | 'both' | NULL`.
-2. Default mới: `min_callers_bridge: 2 → 4`; giữ `coreness_pct 75` trước (đổi 1 biến 1 lần); **bước calibrate bắt buộc:** chạy lại indexing trên chính CALM, ghi hub_pct mới vào plan — mục tiêu 3-5%; chưa đạt → nâng `coreness_pct` 75→90, đo lại.
-3. `fitness_report`/`repo_overview.health_summary` thêm breakdown `hub_degree_count`/`hub_bridge_count` (additive fields).
+**(a) Phân loại hub_kind + siết default [XONG]:**
+1. Schema: `ALTER TABLE symbols ADD COLUMN hub_kind TEXT` qua `migrate_add_column` (nullable). `update_is_hub_flags` ghi `'degree' | 'bridge' | 'both' | NULL`, giữ nguyên `is_hub` (OR của 2 tier, không đổi).
+2. Default mới: `min_callers_bridge: 2 → 4`; `coreness_pct` GIữ NGUYÊN 75.0 (không cần đổi — xem kết quả calibrate bên dưới).
+3. `repo_overview.health_summary` thêm `hub_degree_count`/`hub_bridge_count` (additive, đếm `hub_kind IN ('degree','both')` / `IN ('bridge','both')` — một symbol 'both' tính vào cả 2).
 
-**(b) Gate theo tier** — trong `tools/edit.rs` (`compute_touch_risk` trả thêm hub_kind mạnh nhất; `symbols_overlapping_ranges` SELECT thêm cột):
-- `degree`/`both` hoặc `risk == "high"` (>10 callers): giữ nguyên 3 lớp `EDIT_CONTEXT_REQUIRED` → `CONFIRM_REQUIRED` → `REASON_NOT_GROUNDED`.
-- `bridge`-only (và risk ≤ medium) **VÀ mọi caller edge của symbol đó có `edge_confidence ∈ {resolved, formal}`** (không có `textual`/`ambiguous` nào — nghĩa là caller_count không bị resolver undercounting): chỉ `CONFIRM_REQUIRED` (bỏ ép edit_context-this-session + reason-grounding) — message lỗi nói rõ "bridge hub: confirm là đủ, nhưng edit_context vẫn được khuyến nghị". **[audit-design flag]** Nếu có bất kỳ caller edge nào ở confidence thấp (textual/ambiguous), giữ nguyên 3 lớp bất kể hub_kind — true blast radius có thể lớn hơn caller_count đếm được cho thấy (dynamic dispatch, reflection).
-- AGENTS.md Stage 5/6 + doc `EditLinesParams::confirm` cập nhật khớp.
+**[PHÁT HIỆN QUAN TRỌNG khi calibrate — không phải giả thuyết, là bug thật đã bắt được]:** Lần calibrate đầu ra 6.4% (pct=75) rồi 6.4% Y HỆT (pct=90, không đổi gì!) — nghi ngờ, điều tra trực tiếp thay vì tin số: `.calm/config.json` (gitignored, local-only, KHÔNG phải file trong git) có sẵn `hub_threshold.min_callers_bridge: 2` cứng từ trước — override hoàn toàn `HubThresholdConfig::default()` vừa sửa trong code, khiến TOÀN BỘ 2 lần đo đầu tiên dùng nhầm giá trị cũ. Đã sửa local config khớp default mới (an toàn — file này không bao giờ commit/push, giống nguyên tắc “prefer universal over hardcoded-local”: fix THẬT nằm ở code default, sửa local config chỉ để đo đúng). Sau khi sửa: `min_callers_bridge=4, coreness_pct=75` → **4.37%** — đúng giữa target 3-5%, không cần đụng `coreness_pct` (thử 90 riêng để xác nhận → 2.71%, oversh oot — 75 là đúng). Breakdown ở 4.37%: degree=6, bridge=89, both=34 (tổng is_hub=129/2955).
 
-**Tests:** unit cho `update_is_hub_flags` phân loại đúng 3 kind; gate test: symbol bridge-only + confirm:true không cần reason → applied; symbol degree-hub thiếu edit_context → `EDIT_CONTEXT_REQUIRED` như cũ.
-**Done when:** hub_pct trên CALM 3-5%; test xanh; dogfood 5 edit thật thấy friction giảm (ghi nhận xét vào plan).
+**(b) Gate theo tier [XONG]** — trong `tools/edit.rs`:
+- `symbols_overlapping_ranges` SELECT thêm `hub_kind`; `compute_touch_risk` trả thêm `strongest_hub_kind: Option<String>` (degree/both > bridge > None, xem `hub_kind_strength`).
+- Hàm mới `all_caller_edges_confident(conn, qualified_names)`: true chỉ khi TẤT CẢ caller edge (`call_edges.to_symbol`) của các symbol đó có `edge_confidence ∈ {resolved, formal}` — không có edge nào → trả `false` (bảo thủ, rơi về full gate) thay vì vacuously true.
+- `degree`/`both` hoặc `risk == "high"`: giữ nguyên 3 lớp `EDIT_CONTEXT_REQUIRED` → `CONFIRM_REQUIRED` → `REASON_NOT_GROUNDED`.
+- `bridge`-only (risk ≤ medium) **VÀ** `all_caller_edges_confident`: chỉ `CONFIRM_REQUIRED`, message nói rõ đây là bridge hub + callers đã resolved confident.
+- Nếu có bất kỳ caller edge nào textual/ambiguous: giữ nguyên 3 lớp bất kể hub_kind đúng như audit-design flag yêu cầu.
+- AGENTS.md Stage 5/6 + `EditLinesParams::confirm` doc: cập nhật riêng, xem dưới.
+
+**Tests [XONG, XANH]:** `test_hub_kind_classifies_degree_bridge_both_and_none` (unit, 4 case: degree/bridge/both/none). `edit_lines_bridge_only_hub_needs_only_confirm_when_callers_are_confident` (bridge-only + confirm:true, KHÔNG gọi edit_context, KHÔNG reason → applied; confirm:false → CONFIRM_REQUIRED). `edit_lines_bridge_hub_with_a_low_confidence_caller_still_needs_the_full_gate` (1 textual caller → rơi về full gate dù hub_kind=bridge). Test cũ `edit_lines_requires_confirm_for_hub_symbol` (không set hub_kind → full gate) vẫn xanh không sửa.
+**Done when:** ĐÃ XONG — hub_pct trên CALM 4.37% (trong 3-5%); 674 calm-core + 188 calm-server xanh.
 **Rollback:** default config revert được; column nullable vô hại.
 
 ---

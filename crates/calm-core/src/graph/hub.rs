@@ -25,7 +25,7 @@ pub fn update_is_hub_flags(conn: &Connection, config: &HubThresholdConfig) -> ru
         .filter_map(|r| r.ok())
         .collect();
 
-    conn.execute("UPDATE symbols SET is_hub = 0", [])?;
+    conn.execute("UPDATE symbols SET is_hub = 0, hub_kind = NULL", [])?;
 
     if rows.is_empty() {
         return Ok(());
@@ -58,7 +58,14 @@ pub fn update_is_hub_flags(conn: &Connection, config: &HubThresholdConfig) -> ru
 
     let top_threshold = 1.0 - config.top_pct / 100.0;
 
-    let mut update_stmt = conn.prepare("UPDATE symbols SET is_hub = ? WHERE qualified_name = ?")?;
+    // Plan 3 §3.3 (F10): `hub_kind` records WHICH tier(s) flagged this
+    // symbol — 'degree' | 'bridge' | 'both' | NULL — so the edit gate
+    // (`tools/edit.rs::compute_touch_risk`) can treat a bridge-only touch
+    // less strictly than a degree hub or a symbol that's both, without a
+    // second query. `is_hub` stays the simple OR of the two, unchanged for
+    // every other caller of this flag.
+    let mut update_stmt =
+        conn.prepare("UPDATE symbols SET is_hub = ?, hub_kind = ? WHERE qualified_name = ?")?;
 
     for (qname, caller_count, coreness) in &rows {
         let caller_pct = percentile_rank(*caller_count);
@@ -66,7 +73,13 @@ pub fn update_is_hub_flags(conn: &Connection, config: &HubThresholdConfig) -> ru
         let is_bridge_hub =
             *caller_count >= config.min_callers_bridge && (*coreness as f64) >= p75_coreness;
         let is_hub = is_degree_hub || is_bridge_hub;
-        update_stmt.execute(rusqlite::params![is_hub as i32, qname])?;
+        let hub_kind = match (is_degree_hub, is_bridge_hub) {
+            (true, true) => Some("both"),
+            (true, false) => Some("degree"),
+            (false, true) => Some("bridge"),
+            (false, false) => None,
+        };
+        update_stmt.execute(rusqlite::params![is_hub as i32, hub_kind, qname])?;
     }
 
     Ok(())
@@ -126,5 +139,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_hub, 0, "low caller should not be hub");
+    }
+
+
+    // Plan 3 §3.3 (F10): hub_kind must classify each symbol into exactly
+    // 'degree' | 'bridge' | 'both' | NULL, independent of the existing
+    // is_hub boolean (still tested above).
+    #[test]
+    fn test_hub_kind_classifies_degree_bridge_both_and_none() {
+        let conn = setup_db();
+        for i in 0..20 {
+            insert_symbol(&conn, &format!("sym_{i}"), i, 0);
+        }
+        // caller_count=4 (>= default min_callers_bridge=4) but nowhere near
+        // top_pct=5% by count, with coreness above the resulting p75 floor
+        // — bridge-hub only.
+        insert_symbol(&conn, "bridge_only", 4, 100);
+        // Top caller_count (ties with sym_19, both in the top 5%) AND high
+        // coreness — satisfies both tiers at once.
+        insert_symbol(&conn, "both_kind", 19, 100);
+
+        let config = HubThresholdConfig::default();
+        update_is_hub_flags(&conn, &config).unwrap();
+
+        let hub_kind_of = |qn: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT hub_kind FROM symbols WHERE qualified_name = ?1",
+                [qn],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            hub_kind_of("sym_19").as_deref(),
+            Some("degree"),
+            "top caller count, zero coreness -> degree-hub only"
+        );
+        assert_eq!(
+            hub_kind_of("sym_1"),
+            None,
+            "low caller count, zero coreness -> not a hub at all"
+        );
+        assert_eq!(
+            hub_kind_of("bridge_only").as_deref(),
+            Some("bridge"),
+            "meets min_callers_bridge + high coreness, but not top_pct by count -> bridge-hub only"
+        );
+        assert_eq!(
+            hub_kind_of("both_kind").as_deref(),
+            Some("both"),
+            "meets both tiers at once -> both"
+        );
     }
 }

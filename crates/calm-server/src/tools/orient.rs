@@ -110,8 +110,28 @@ impl CalmServer {
                     r.get(0)
                 })
                 .unwrap_or(0);
+            // Plan 3 §3.3 (F10) breakdown — hub_kind is NULL for a non-hub
+            // symbol, so these two counts alone (not summed with hub_count)
+            // tell the degree-vs-bridge split; a 'both' row counts toward
+            // both.
+            let hub_degree_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE hub_kind IN ('degree','both')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let hub_bridge_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE hub_kind IN ('bridge','both')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             let health_summary = HealthSummary {
                 hub_count,
+                hub_degree_count,
+                hub_bridge_count,
                 edges_ready: self.edges_ready(),
             };
 
@@ -462,6 +482,12 @@ pub(crate) struct ModuleEntry {
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct HealthSummary {
     pub(crate) hub_count: i64,
+    /// Plan 3 §3.3 (F10) breakdown of `hub_count` by `hub_kind` — a
+    /// symbol counted in both is one that's simultaneously a degree-hub
+    /// and a bridge-hub, so `hub_degree_count + hub_bridge_count` can
+    /// exceed `hub_count`.
+    pub(crate) hub_degree_count: i64,
+    pub(crate) hub_bridge_count: i64,
     pub(crate) edges_ready: bool,
 }
 

@@ -104,8 +104,8 @@ impl Default for HubThresholdConfig {
         Self {
             top_pct: 5.0,
             min_callers: 5,
-            min_callers_bridge: 2,
-            coreness_pct: 75.0,
+            min_callers_bridge: 4, // Plan 3 §3.3 (F10): was 2, measured 9.8% hub_pct on CALM itself
+            coreness_pct: 75.0, // Plan 3 §3.3 (F10): unchanged — min_callers_bridge=4 alone reached 4.37% on CALM (target 3-5%); an earlier calibration run showing 6.4%/2.71% at pct=75/90 was invalidated by a stale local .calm/config.json hub_threshold override (min_callers_bridge:2) that had nothing to do with this value — see plan doc
         }
     }
 }

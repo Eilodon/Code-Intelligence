@@ -314,6 +314,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "edge_kind",
         "TEXT NOT NULL DEFAULT 'call'",
     )?;
+    // Plan 3 §3.3 (F10): degree-hub vs bridge-hub classification, written by
+    // `graph::hub::update_is_hub_flags` as `'degree' | 'bridge' | 'both'` (or
+    // left NULL for a non-hub symbol) — lets the edit gate treat a bridge-
+    // only touch less strictly than a degree hub without a second query.
+    migrate_add_column(conn, "symbols", "hub_kind", "TEXT")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())

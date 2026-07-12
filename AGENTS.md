@@ -161,11 +161,15 @@ edit_context("getUserByEmail")
 
 ```
 edit_symbol("getUserByEmail", expected_hash=<range_checksum from edit_context>, new_text="...")
-  # for a hub/high-risk symbol, this alone still fails: edit_context("getUserByEmail") must have
-  # run THIS session first (EDIT_CONTEXT_REQUIRED otherwise), then confirm:true (CONFIRM_REQUIRED
-  # otherwise), then reason must cite a real caller name edit_context returned — not a generic
-  # phrase (REASON_NOT_GROUNDED otherwise). A symbol with 0 confirmed callers only needs a
-  # non-empty reason, since there's nothing real to cite.
+  # for a degree-hub/both-hub/high-risk symbol, this alone still fails: edit_context("getUserByEmail")
+  # must have run THIS session first (EDIT_CONTEXT_REQUIRED otherwise), then confirm:true
+  # (CONFIRM_REQUIRED otherwise), then reason must cite a real caller name edit_context returned —
+  # not a generic phrase (REASON_NOT_GROUNDED otherwise). A symbol with 0 confirmed callers only
+  # needs a non-empty reason, since there's nothing real to cite. A BRIDGE-only hub (structurally
+  # central via coreness, not a high-caller symbol) at risk <= medium with every known caller at
+  # edge_confidence resolved/formal needs only confirm:true — edit_context is still recommended,
+  # but EDIT_CONTEXT_REQUIRED/REASON_NOT_GROUNDED don't apply to it (Plan 3 F10). A single textual/
+  # ambiguous caller on that same symbol still forces the full 3-layer gate regardless.
 edit_symbol("getUserByEmail", confirm=true, reason="checked getUserByToken, still returns the same shape", new_text="...")
 edit_symbol("getUserByEmail", position="after", new_text="...")
   # INSERT relative to a symbol instead of replacing it: "before" / "after" (new sibling) /

@@ -266,7 +266,7 @@ impl CalmServer {
             None => "skipped_unrecognized_language",
         };
 
-        let (risk, hub_hit, pre_touched) = {
+        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, pre_touched) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
@@ -275,7 +275,25 @@ impl CalmServer {
                 .iter()
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
-            compute_touch_risk(&conn, path, &ranges)
+            let (risk, hub_hit, hub_kind, touched) = compute_touch_risk(&conn, path, &ranges);
+            // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
+            // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
+            // below — but ONLY if every touched hub's caller edges are all
+            // resolved/formal confidence (see all_caller_edges_confident's
+            // doc comment for why textual/ambiguous callers disqualify it
+            // regardless of hub_kind: the true blast radius can exceed the
+            // counted caller_count).
+            let eligible = hub_kind.as_deref() == Some("bridge")
+                && risk.as_deref() != Some("high")
+                && all_caller_edges_confident(
+                    &conn,
+                    &touched
+                        .iter()
+                        .filter(|t| t.hub_kind.is_some())
+                        .map(|t| t.qualified_name.clone())
+                        .collect::<Vec<_>>(),
+                );
+            (risk, hub_hit, hub_kind, eligible, touched)
         };
         if hub_hit || risk.as_deref() == Some("high") {
             let why = if hub_hit {
@@ -284,128 +302,154 @@ impl CalmServer {
                 "a high-risk symbol (>10 callers)".to_string()
             };
 
-            // Structural half (docs/superskills/specs/2026-07-11-superskills-
-            // inspired-features.md #5 v2): edit_context must have run for
-            // EVERY touched symbol this session, and not have gone stale.
-            // Checked before `confirm` so the error names the real blocker
-            // instead of a generic "pass confirm:true" that wouldn't help.
-            const FRESHNESS_WINDOW_CALLS: u64 = 200;
-            let now = self.session_tool_calls();
-            let mut missing: Vec<&str> = Vec::new();
-            let mut known_caller_qns: Vec<String> = Vec::new();
-            let mut reviewed_risk_levels: Vec<String> = Vec::new();
-            for t in &pre_touched {
-                match self.edit_context_review(&t.qualified_name) {
-                    Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS => {
-                        known_caller_qns.extend(r.caller_qns);
-                        reviewed_risk_levels.push(r.risk_level);
-                    }
-                    _ => missing.push(t.qualified_name.as_str()),
+            if bridge_downgrade_eligible {
+                // Lighter tier: bridge-only hub, risk ≤ medium, every caller
+                // edge resolved/formal confidence — skip EDIT_CONTEXT_REQUIRED
+                // and REASON_NOT_GROUNDED entirely, confirm:true is enough.
+                if !confirm {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "CONFIRM_REQUIRED",
+                        path,
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                        hub_kind = hub_kind.as_deref().unwrap_or("none"),
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "CONFIRM_REQUIRED",
+                        "this edit touches a bridge hub (structurally central, but not a \
+                         high-caller symbol, and every known caller is confidently \
+                         resolved) — confirm:true is enough here; edit_context is still \
+                         recommended, but not required",
+                        true,
+                    ));
                 }
-            }
-            if !missing.is_empty() {
-                tracing::info!(
-                    target: crate::telemetry::AUDIT_TARGET,
-                    session_id = self.session_id,
-                    decision = "denied",
-                    reason_code = "EDIT_CONTEXT_REQUIRED",
-                    path,
-                    symbol = missing[0],
-                    risk = risk.as_deref().unwrap_or("none"),
-                    hub_hit,
-                );
-                return ToolOutcome::error(error_detail(
-                    "EDIT_CONTEXT_REQUIRED",
-                    &format!(
-                        "this edit touches {why} — call edit_context(\"{}\") first THIS \
-                         session before editing (a prior session's review, or one older \
-                         than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count)",
-                        missing[0]
-                    ),
-                    true,
-                ));
-            }
-            // Observability only — the gate itself never re-derives risk from
-            // this; it just makes "what was reviewed, and at what tier"
-            // greppable in server logs when investigating a disputed edit.
-            tracing::debug!(
-                "edit gate: {} touched symbol(s) reviewed this session at risk level(s) {:?}",
-                pre_touched.len(),
-                reviewed_risk_levels
-            );
-            if !confirm {
-                tracing::info!(
-                    target: crate::telemetry::AUDIT_TARGET,
-                    session_id = self.session_id,
-                    decision = "denied",
-                    reason_code = "CONFIRM_REQUIRED",
-                    path,
-                    risk = risk.as_deref().unwrap_or("none"),
-                    hub_hit,
-                );
-                return ToolOutcome::error(error_detail(
-                    "CONFIRM_REQUIRED",
-                    &format!("this edit touches {why} — pass confirm:true to proceed"),
-                    true,
-                ));
-            }
-
-            // Content-grounded half: `reason` must cite a real caller
-            // edit_context returned, not a generic phrase — closes the gap a
-            // purely structural gate leaves open (calling edit_context and
-            // never reading the response is as cheap as never calling it).
-            let reason = reason.unwrap_or("").trim();
-            let cites_real_signal = if known_caller_qns.is_empty() {
-                !reason.is_empty()
             } else {
-                known_caller_qns.iter().any(|qn| {
-                    let short = qn.rsplit("::").next().unwrap_or(qn);
-                    let last_two = last_two_segments(qn);
-                    (short.len() >= MIN_BARE_NAME_LEN && cites_token(reason, short))
-                        || cites_token(reason, &last_two)
-                        || cites_token(reason, qn)
-                })
-            };
-            if !cites_real_signal {
-                tracing::info!(
-                    target: crate::telemetry::AUDIT_TARGET,
-                    session_id = self.session_id,
-                    decision = "denied",
-                    reason_code = "REASON_NOT_GROUNDED",
-                    path,
-                    reason,
-                    risk = risk.as_deref().unwrap_or("none"),
-                    hub_hit,
+                // Structural half (docs/superskills/specs/2026-07-11-superskills-
+                // inspired-features.md #5 v2): edit_context must have run for
+                // EVERY touched symbol this session, and not have gone stale.
+                // Checked before `confirm` so the error names the real blocker
+                // instead of a generic "pass confirm:true" that wouldn't help.
+                const FRESHNESS_WINDOW_CALLS: u64 = 200;
+                let now = self.session_tool_calls();
+                let mut missing: Vec<&str> = Vec::new();
+                let mut known_caller_qns: Vec<String> = Vec::new();
+                let mut reviewed_risk_levels: Vec<String> = Vec::new();
+                for t in &pre_touched {
+                    match self.edit_context_review(&t.qualified_name) {
+                        Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS => {
+                            known_caller_qns.extend(r.caller_qns);
+                            reviewed_risk_levels.push(r.risk_level);
+                        }
+                        _ => missing.push(t.qualified_name.as_str()),
+                    }
+                }
+                if !missing.is_empty() {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "EDIT_CONTEXT_REQUIRED",
+                        path,
+                        symbol = missing[0],
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "EDIT_CONTEXT_REQUIRED",
+                        &format!(
+                            "this edit touches {why} — call edit_context(\"{}\") first THIS \
+                             session before editing (a prior session's review, or one older \
+                             than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count)",
+                            missing[0]
+                        ),
+                        true,
+                    ));
+                }
+                // Observability only — the gate itself never re-derives risk from
+                // this; it just makes "what was reviewed, and at what tier"
+                // greppable in server logs when investigating a disputed edit.
+                tracing::debug!(
+                    "edit gate: {} touched symbol(s) reviewed this session at risk level(s) {:?}",
+                    pre_touched.len(),
+                    reviewed_risk_levels
                 );
-                let examples: Vec<String> = known_caller_qns
-                    .iter()
-                    .map(|qn| {
-                        let short = qn.rsplit("::").next().unwrap_or(qn.as_str());
-                        // Show the longer Type::name form for a short bare
-                        // name so the agent knows which form actually needs
-                        // citing (a bare name under MIN_BARE_NAME_LEN never
-                        // counts on its own — see cites_real_signal above).
-                        if short.len() < MIN_BARE_NAME_LEN {
-                            last_two_segments(qn)
-                        } else {
-                            short.to_string()
-                        }
+                if !confirm {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "CONFIRM_REQUIRED",
+                        path,
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "CONFIRM_REQUIRED",
+                        &format!("this edit touches {why} — pass confirm:true to proceed"),
+                        true,
+                    ));
+                }
+
+                // Content-grounded half: `reason` must cite a real caller
+                // edit_context returned, not a generic phrase — closes the gap a
+                // purely structural gate leaves open (calling edit_context and
+                // never reading the response is as cheap as never calling it).
+                let reason = reason.unwrap_or("").trim();
+                let cites_real_signal = if known_caller_qns.is_empty() {
+                    !reason.is_empty()
+                } else {
+                    known_caller_qns.iter().any(|qn| {
+                        let short = qn.rsplit("::").next().unwrap_or(qn);
+                        let last_two = last_two_segments(qn);
+                        (short.len() >= MIN_BARE_NAME_LEN && cites_token(reason, short))
+                            || cites_token(reason, &last_two)
+                            || cites_token(reason, qn)
                     })
-                    .take(3)
-                    .collect();
-                return ToolOutcome::error(error_detail(
-                    "REASON_NOT_GROUNDED",
-                    &format!(
-                        "reason must reference at least one real caller edit_context \
-                         returned ({}), or explicitly state why none apply",
-                        if examples.is_empty() {
-                            "this symbol has no confirmed callers".to_string()
-                        } else {
-                            examples.join(", ")
-                        }
-                    ),
-                    true,
-                ));
+                };
+                if !cites_real_signal {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "REASON_NOT_GROUNDED",
+                        path,
+                        reason,
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    let examples: Vec<String> = known_caller_qns
+                        .iter()
+                        .map(|qn| {
+                            let short = qn.rsplit("::").next().unwrap_or(qn.as_str());
+                            // Show the longer Type::name form for a short bare
+                            // name so the agent knows which form actually needs
+                            // citing (a bare name under MIN_BARE_NAME_LEN never
+                            // counts on its own — see cites_real_signal above).
+                            if short.len() < MIN_BARE_NAME_LEN {
+                                last_two_segments(qn)
+                            } else {
+                                short.to_string()
+                            }
+                        })
+                        .take(3)
+                        .collect();
+                    return ToolOutcome::error(error_detail(
+                        "REASON_NOT_GROUNDED",
+                        &format!(
+                            "reason must reference at least one real caller edit_context \
+                             returned ({}), or explicitly state why none apply",
+                            if examples.is_empty() {
+                                "this symbol has no confirmed callers".to_string()
+                            } else {
+                                examples.join(", ")
+                            }
+                        ),
+                        true,
+                    ));
+                }
             }
         }
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
@@ -587,7 +631,7 @@ impl CalmServer {
                 .iter()
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
-            let (_, _, touched) = compute_touch_risk(&conn, path, &new_ranges);
+            let (_, _, _, touched) = compute_touch_risk(&conn, path, &new_ranges);
             touched
         };
 
@@ -615,9 +659,9 @@ fn symbols_overlapping_ranges(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
-) -> Vec<(String, i64, bool)> {
+) -> Vec<(String, i64, bool, Option<String>)> {
     let mut stmt = match conn.prepare(
-        "SELECT qualified_name, caller_count, is_hub, line_start, line_end FROM symbols WHERE path = ?1",
+        "SELECT qualified_name, caller_count, is_hub, hub_kind, line_start, line_end FROM symbols WHERE path = ?1",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -627,18 +671,19 @@ fn symbols_overlapping_ranges(
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)? != 0,
-            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(3)?,
             row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     })
     .map(|it| {
         it.filter_map(|r| r.ok())
-            .filter(|(_, _, _, line_start, line_end)| {
+            .filter(|(_, _, _, _, line_start, line_end)| {
                 ranges
                     .iter()
                     .any(|&(rs, re)| !(*line_end < rs || *line_start > re))
             })
-            .map(|(qn, callers, is_hub, _, _)| (qn, callers, is_hub))
+            .map(|(qn, callers, is_hub, hub_kind, _, _)| (qn, callers, is_hub, hub_kind))
             .collect()
     })
     .unwrap_or_default()
@@ -648,26 +693,92 @@ fn symbols_overlapping_ranges(
 /// overlap `ranges`. `risk_level` is `None` when nothing overlaps (editing
 /// dead space between symbols, or a file with no parsed symbols at all —
 /// Cargo.toml, docs) — that's not an error, just nothing to gate on.
+/// Strength ordering for picking the single strongest `hub_kind` among
+/// several touched symbols: a `degree`/`both` touch always outranks a
+/// `bridge`-only one, since Plan 3 §3.3 (F10) only ever downgrades the
+/// gate when EVERY touched hub is bridge-only.
+fn hub_kind_strength(kind: &str) -> u8 {
+    match kind {
+        "degree" | "both" => 2,
+        "bridge" => 1,
+        _ => 0,
+    }
+}
+
+/// `(risk_level, hub_hit, strongest_hub_kind, touched_symbols)` for
+/// whatever symbols in `path` overlap `ranges`. `risk_level` is `None` when
+/// nothing overlaps (editing dead space between symbols, or a file with no
+/// parsed symbols at all — Cargo.toml, docs) — that's not an error, just
+/// nothing to gate on. `strongest_hub_kind` is `None` when nothing touched
+/// is a hub, `Some("bridge")` only when every touched hub is bridge-only,
+/// and `Some("degree")`/`Some("both")` if any touched hub is stronger than
+/// bridge-only (see `hub_kind_strength`).
 fn compute_touch_risk(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
-) -> (Option<String>, bool, Vec<TouchedSymbolOutput>) {
+) -> (Option<String>, bool, Option<String>, Vec<TouchedSymbolOutput>) {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
+    let mut strongest_hub_kind: Option<String> = None;
     let mut touched = Vec::with_capacity(rows.len());
-    for (qualified_name, caller_count, is_hub) in rows {
+    for (qualified_name, caller_count, is_hub, hub_kind) in rows {
         max_callers = max_callers.max(caller_count);
         hub_hit |= is_hub;
+        if let Some(k) = &hub_kind {
+            let stronger = strongest_hub_kind
+                .as_deref()
+                .is_none_or(|cur| hub_kind_strength(k) > hub_kind_strength(cur));
+            if stronger {
+                strongest_hub_kind = Some(k.clone());
+            }
+        }
         touched.push(TouchedSymbolOutput {
             qualified_name,
             caller_count,
             is_hub,
+            hub_kind,
         });
     }
     let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
-    (risk, hub_hit, touched)
+    (risk, hub_hit, strongest_hub_kind, touched)
+}
+
+/// Plan 3 §3.3 (F10): true iff every caller edge (`call_edges.to_symbol`)
+/// pointing at any of `qualified_names` has `edge_confidence` in
+/// `{'resolved', 'formal'}` — gates whether a bridge-only hub touch may use
+/// the lighter (`CONFIRM_REQUIRED`-only) tier. A symbol's TRUE blast radius
+/// can exceed its counted `caller_count` when some incoming edges are only
+/// `'textual'`/`'ambiguous'` (dynamic dispatch, reflection, a resolver gap)
+/// — those callers were found by name/heuristic, not proven, so undercounting
+/// is possible and the full 3-layer gate must still apply regardless of
+/// `hub_kind`. A symbol with zero caller edges is treated as NOT confident
+/// (conservative — falls through to the full gate) rather than vacuously
+/// true; `qualified_names` empty also returns `false` for the same reason.
+fn all_caller_edges_confident(conn: &rusqlite::Connection, qualified_names: &[String]) -> bool {
+    if qualified_names.is_empty() {
+        return false;
+    }
+    let placeholders = qualified_names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT COUNT(*), SUM(CASE WHEN edge_confidence IN ('resolved','formal') THEN 1 ELSE 0 END) \
+         FROM call_edges WHERE to_symbol IN ({placeholders})"
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let params: Vec<&dyn rusqlite::ToSql> = qualified_names
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    match stmt.query_row(params.as_slice(), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+    }) {
+        Ok((total, confident)) if total > 0 => confident.unwrap_or(0) == total,
+        _ => false,
+    }
 }
 
 /// Builds the insertion hunk for `edit_symbol`'s `position` modes. The
@@ -867,14 +978,21 @@ pub(crate) struct EditLinesParams {
     /// `risk_assessment: "high"` symbol or one with `is_hub: true` (see
     /// `edit_context`). Omitted/`false` rejects such an edit with an
     /// explanation instead of proceeding. Two further requirements gate on
-    /// top of `confirm` for such a touch (docs/superskills/specs/
-    /// 2026-07-11-superskills-inspired-features.md #5 v2): `edit_context`
-    /// must have been called for the touched symbol(s) THIS session
-    /// (`EDIT_CONTEXT_REQUIRED` otherwise — merely having called it in a
-    /// prior session, or a stale review past the freshness window, doesn't
-    /// count), and `reason` must cite a real caller name from that exact
-    /// `edit_context` response (`REASON_NOT_GROUNDED` otherwise) —
-    /// `confirm: true` alone is never sufficient for a hub/high-risk touch.
+    /// top of `confirm` for a DEGREE-hub/both-hub/high-risk touch
+    /// (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+    /// #5 v2): `edit_context` must have been called for the touched
+    /// symbol(s) THIS session (`EDIT_CONTEXT_REQUIRED` otherwise — merely
+    /// having called it in a prior session, or a stale review past the
+    /// freshness window, doesn't count), and `reason` must cite a real
+    /// caller name from that exact `edit_context` response
+    /// (`REASON_NOT_GROUNDED` otherwise) — `confirm: true` alone is never
+    /// sufficient for those. Plan 3 §3.3 (F10): a BRIDGE-only hub touch
+    /// (structurally central via coreness, not a high-caller symbol) at
+    /// risk ≤ medium, where every known caller edge is `resolved`/`formal`
+    /// confidence (no `textual`/`ambiguous` undercounting risk), skips
+    /// both of those extra requirements — `confirm: true` alone is enough.
+    /// A single low-confidence caller on that same symbol still forces the
+    /// full requirements regardless of `hub_kind`.
     #[serde(default)]
     pub(crate) confirm: bool,
     /// Required (non-empty, and referencing a real caller — see `confirm`)
@@ -979,6 +1097,10 @@ pub(crate) struct TouchedSymbolOutput {
     pub(crate) qualified_name: String,
     pub(crate) caller_count: i64,
     pub(crate) is_hub: bool,
+    /// Plan 3 §3.3 (F10): `'degree' | 'bridge' | 'both'`, or `None` when
+    /// `is_hub` is `false` — see `graph::hub::update_is_hub_flags`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hub_kind: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

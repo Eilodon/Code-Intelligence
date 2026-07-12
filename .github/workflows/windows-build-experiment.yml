@@ -1,0 +1,65 @@
+name: Windows build experiment (probe, not release)
+
+# Manual-only feasibility probe for native Windows support — NOT wired into
+# release.yml's matrix yet. Every dependency that could plausibly break a
+# Windows build compiles C/C++ via the `cc` crate (rusqlite `bundled`, the
+# `onig` regex engine, ~24 tree-sitter grammar crates) — all of that is
+# `#[cfg(unix)]`-free in calm's own code (verified: only the shared-daemon
+# `calm connect`/`--listen` path is Unix-gated, and callers already skip it
+# on non-Unix — see crates/calm-server/src/daemon.rs and
+# scripts/mcp-launcher.sh), so the only real unknown is whether every C
+# dependency's build script is happy under MSVC. This workflow exists to
+# answer that empirically instead of guessing. Run with:
+#   gh workflow run windows-build-experiment.yml
+# If this goes green, promote x86_64-pc-windows-msvc into release.yml's
+# matrix and add an @eilodon/calm-mcp-win32-x64 npm platform package
+# (see docs/mcp-client-setup.md and npm/README.md for the existing pattern
+# the 3 shipped platforms follow).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      # Default features on purpose (embeddings, tier0-5, scip-overlay) —
+      # same reasoning as scripts/mcp-launcher.sh's Tier 3 build: this is
+      # the actual shape a release binary would ship, not a stripped-down
+      # build that could pass while the real target fails.
+      - name: Build (release, default features)
+        run: cargo build --release --bin calm --target x86_64-pc-windows-msvc
+
+      - name: Smoke test — binary runs and reports the right version
+        run: |
+          $bin = "target\x86_64-pc-windows-msvc\release\calm.exe"
+          & $bin --version
+          if ($LASTEXITCODE -ne 0) { throw "calm --version exited $LASTEXITCODE" }
+
+      # `calm serve` without `--listen` never touches the Unix-only daemon
+      # path — this is the code path every non-daemon MCP client actually
+      # uses, and the one that matters for Windows support.
+      - name: Smoke test — plain `calm serve` starts and exits cleanly on Ctrl+C equivalent
+        run: |
+          $proc = Start-Process -FilePath "target\x86_64-pc-windows-msvc\release\calm.exe" `
+            -ArgumentList "serve","--project-root",".","--db-path","$env:TEMP\calm-win-probe.db" `
+            -PassThru -RedirectStandardOutput "$env:TEMP\calm-win-probe.out" `
+            -RedirectStandardError "$env:TEMP\calm-win-probe.err"
+          Start-Sleep -Seconds 8
+          if ($proc.HasExited) {
+            Write-Host "--- stdout ---"; Get-Content "$env:TEMP\calm-win-probe.out" -ErrorAction SilentlyContinue
+            Write-Host "--- stderr ---"; Get-Content "$env:TEMP\calm-win-probe.err" -ErrorAction SilentlyContinue
+            throw "calm serve exited early (code $($proc.ExitCode)) instead of staying up"
+          }
+          Stop-Process -Id $proc.Id -Force

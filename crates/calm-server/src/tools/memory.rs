@@ -59,10 +59,15 @@ impl CalmServer {
                 tracing::error!("remember: failed to store refs for topic {topic}: {e}");
             }
 
+            // audit F7: detection-only (sanitize.rs's philosophy) — the note
+            // is saved regardless, this just warns whoever wrote it.
+            let content_warning = calm_core::sanitize::injection_warning(content);
+
             ToolOutcome::success(RememberOutput {
                 topic: topic.to_string(),
                 updated_at: now,
                 refs_captured,
+                content_warning,
                 suggested_next: self.filter_sn(suggested("recall", "Verify the note was saved")),
             })
         }))
@@ -148,6 +153,12 @@ impl CalmServer {
             // `remember` time) stays the `memory_note_row` default; otherwise
             // diff captured refs against the live files.
             for note in &mut notes {
+                // audit F7: scanned for every note, including ones with no
+                // refs (before the staleness `continue` below) — a note's
+                // content is untrusted storage text regardless of whether it
+                // happens to reference a file.
+                note.content_warning = calm_core::sanitize::injection_warning(&note.content);
+
                 let has_refs = calm_core::memory::ref_count(&conn, &note.topic).unwrap_or(0) > 0;
                 if !has_refs {
                     continue;
@@ -224,6 +235,12 @@ pub(crate) struct RememberOutput {
     /// `MemoryNote::staleness`) — 0 just means the note didn't mention any
     /// file, not that anything went wrong.
     pub(crate) refs_captured: usize,
+    /// audit F7: detection-only, same as `recall`'s per-note warning — the
+    /// note is still saved either way (sanitize.rs's philosophy: flag, don't
+    /// block), this only tells the person writing it that the content looks
+    /// prompt-injection-shaped before it's stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content_warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -272,6 +289,13 @@ pub(crate) struct MemoryNote {
     pub(crate) staleness: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) stale_refs: Vec<StaleRefOutput>,
+    /// audit F7: same trust-surface treatment `source()` already gives file
+    /// content — a note's `content` came from a prior `remember` call (this
+    /// session or a past one) and is untrusted text, same as any other
+    /// storage-backed channel. Set by `recall` via `injection_warning`;
+    /// `None`/omitted when the content looks clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content_warning: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -289,5 +313,6 @@ pub(crate) fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNot
         updated_at: row.get(2)?,
         staleness: "unchecked",
         stale_refs: Vec::new(),
+        content_warning: None,
     })
 }

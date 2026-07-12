@@ -1054,7 +1054,10 @@ pub(crate) fn resolve_symbol(
 /// themselves. (3) content-safety: a note whose text trips
 /// `injection_warning` is dropped from this *automatic* surface — it
 /// remains fully visible via an explicit `recall()` call, where the
-/// existing Stage-3 "source is untrusted" wariness already applies.
+/// existing Stage-3 "source is untrusted" wariness already applies —
+/// and (audit F7) `recall` now carries an explicit per-note
+/// `content_warning` field alongside that wariness, not just the reader's
+/// own judgment.
 impl CalmServer {
     /// Ambient "related notes" surfaced automatically on `edit_context`/
     /// `locate` (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
@@ -1069,7 +1072,10 @@ impl CalmServer {
     /// themselves. (3) content-safety: a note whose text trips
     /// `injection_warning` is dropped from this *automatic* surface — it
     /// remains fully visible via an explicit `recall()` call, where the
-    /// existing Stage-3 "source is untrusted" wariness already applies.
+    /// existing Stage-3 "source is untrusted" wariness already applies —
+    /// and (audit F7) `recall` now carries an explicit per-note
+    /// `content_warning` field alongside that wariness, not just the
+    /// reader's own judgment.
     pub(crate) fn related_notes(
         &self,
         conn: &rusqlite::Connection,

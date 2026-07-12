@@ -1237,7 +1237,11 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("ci_diff_impact_unindexed_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // Must actually exist on disk to test the intended "scanned, not
+        // indexed yet" case — a diff for a file that was never created
+        // correctly reports "deleted" now (audit F2), not "pending_scan".
+        std::fs::write(dir.join("src/new.rs"), "fn new_fn() {}\n").unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
         let diff = "diff --git a/src/new.rs b/src/new.rs\n\
@@ -1397,6 +1401,84 @@ mod tests {
         assert_eq!(
             v["aggregate_risk"], "low",
             "a scanned-but-empty file must not be treated as unindexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit F2: a file referenced in the diff that no longer exists on disk
+    /// (deleted or renamed away) and has no `file_index` row must be reported
+    /// as "deleted", never "pending_scan" — a deleted file is never going to
+    /// be scanned no matter how long you wait, so reporting it as a
+    /// self-resolving state used to send an agent into an infinite
+    /// diff_impact <-> indexing_status loop.
+    #[test]
+    fn diff_impact_deleted_file_reports_deleted_not_pending_scan() {
+        let dir = std::env::temp_dir().join(format!("ci_diff_impact_deleted_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let diff = "diff --git a/ghost.md b/ghost.md\n\
+                     deleted file mode 100644\n\
+                     --- a/ghost.md\n\
+                     +++ /dev/null\n\
+                     @@ -1,1 +0,0 @@\n\
+                     -# Ghost\n";
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "ghost.md", "reason": "deleted"}])
+        );
+        assert_ne!(v["aggregate_risk"], "unknown", "a deleted file must not gate aggregate_risk as if it were an unresolved pending_scan");
+        assert_ne!(
+            v["suggested_next"]["tool"], "indexing_status",
+            "a deleted file resolves nothing by waiting — suggested_next must not point at indexing_status for it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Control for the above: a file that genuinely exists on disk but hasn't
+    /// been scanned yet must keep reporting "pending_scan" (it really will
+    /// resolve itself once indexing catches up) — the F2 fix must not turn
+    /// every not-yet-indexed file into "deleted".
+    #[test]
+    fn diff_impact_existing_unindexed_file_still_reports_pending_scan() {
+        let dir = std::env::temp_dir().join(format!("ci_diff_impact_pending_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("newfile.rs"), "fn x() {}\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let diff = "diff --git a/newfile.rs b/newfile.rs\n\
+                     new file mode 100644\n\
+                     --- /dev/null\n\
+                     +++ b/newfile.rs\n\
+                     @@ -0,0 +1,1 @@\n\
+                     +fn x() {}\n";
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "newfile.rs", "reason": "pending_scan"}])
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -376,7 +376,23 @@ impl CalmServer {
                                         ext,
                                     ))
                             {
-                                Some("pending_scan")
+                                // This branch would otherwise say "pending_scan" —
+                                // but a file that no longer exists on disk will
+                                // never actually get scanned no matter how long
+                                // you wait, so it must not be reported as a state
+                                // that "resolves itself" (audit F2: caused an
+                                // agent to loop diff_impact <-> indexing_status
+                                // forever waiting on a file that was deleted).
+                                // Checked here, not before the ignored-dir/
+                                // extension check above, so a deleted file that
+                                // was ALSO never going to be scanned (dotdir, or
+                                // unrecognized extension) still correctly reports
+                                // "out_of_scope", not "deleted".
+                                if !self.project_root.join(path).exists() {
+                                    Some("deleted")
+                                } else {
+                                    Some("pending_scan")
+                                }
                             } else {
                                 Some("out_of_scope")
                             }
@@ -775,6 +791,10 @@ pub(crate) struct UnindexedFileOutput {
     /// only. Like "out_of_scope", this never resolves on its own — there is
     /// no symbol extraction to wait for — but unlike "out_of_scope" the file
     /// genuinely is indexed (has a row), just never for symbols.
+    /// "deleted" — the file appears in the diff but no longer exists on
+    /// disk (deleted or renamed away); like "out_of_scope" this is a
+    /// permanent state — it will never be scanned no matter how long you
+    /// wait — so it must never gate `aggregate_risk` on `indexing_status`.
     pub(crate) reason: String,
 }
 

@@ -5,11 +5,11 @@
 # of `calm serve` — a thin forwarder that connects to (or spawns) one shared
 # daemon per project instead of a fresh full `calm serve` process per MCP
 # client session. Fixes the measured N-process problem this repo hit
-# directly (up to 4 concurrent `calm serve --project-root /home/ybao/B.1/CALM`
+# directly (up to 4 concurrent `calm serve --project-root /home/user/CALM`
 # processes seen live). Does NOT retroactively affect any already-running
 # `calm serve` process from before this change — the collapse to one shared
 # daemon happens progressively as new MCP client sessions connect through
 # this script. `scripts/mcp-launcher.sh` (the external-consumer-facing
 # launcher) and the npm package's default args are deliberately untouched
 # until this dogfood run proves the daemon out on real usage.
-exec /home/ybao/B.1/CALM/target/release/calm connect --project-root /home/ybao/B.1/CALM 2>/tmp/calm-mcp.log
+exec /home/user/CALM/target/release/calm connect --project-root /home/user/CALM 2>/tmp/calm-mcp.log

@@ -19,6 +19,7 @@ use std::path::Path;
 use crate::indexer::lang_constants::{LangConstants, get_lang_constants};
 use crate::indexer::parser::parse_tree;
 
+#[derive(Clone)]
 pub struct NamespaceMap {
     /// namespace (dotted, exactly as written in a `namespace X.Y { }` /
     /// `namespace X.Y;` declaration) -> every project-root-relative,

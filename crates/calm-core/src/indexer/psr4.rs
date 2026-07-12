@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct Psr4Map {
     /// (namespace prefix incl. trailing `\`, source directory relative to
     /// project root, without a trailing `/`) pairs, sorted longest-prefix-

@@ -1430,9 +1430,7 @@ pub fn run_indexing_pipeline_cancellable(
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
-    let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-    let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-    let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+    let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
     rebuild_graph(
         &tx,
         &config.hub_threshold,
@@ -1503,6 +1501,97 @@ fn cached_formal_resolver() -> &'static crate::resolver::formal::FormalResolver 
         let _ = formal.load_java();
         formal
     })
+}
+
+/// Cache entry for `cached_resolution_maps` — one per `project_root` (a
+/// single-slot cache would return the wrong project's maps whenever more
+/// than one `project_root` is used within the same process, which the test
+/// suite does constantly via per-test temp dirs).
+struct CachedResolutionMaps {
+    built_at: std::time::Instant,
+    cargo_toml_mtime: Option<std::time::SystemTime>,
+    cargo_lock_mtime: Option<std::time::SystemTime>,
+    composer_json_mtime: Option<std::time::SystemTime>,
+    crate_map: crate::indexer::crate_map::CrateMap,
+    psr4: crate::indexer::psr4::Psr4Map,
+    namespace_map: crate::indexer::csharp_namespace::NamespaceMap,
+}
+
+static RESOLUTION_MAPS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, CachedResolutionMaps>>,
+> = std::sync::OnceLock::new();
+
+/// Fallback for the part `CrateMap`/`Psr4Map` genuinely can't cover by
+/// mtime alone: `NamespaceMap::build` isn't manifest-driven at all — it
+/// walks every `.cs` file in the repo and reads each one's content (see its
+/// own doc comment) — so there is no single file whose mtime tracks "did
+/// the namespace map change". A pure TTL is the honest answer here, not a
+/// gap: any edit to a `.cs` file is already at most this old before the
+/// next reindex sees a corrected map.
+const RESOLUTION_MAPS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Plan 3 §3.1 Phase D: `CrateMap`/`Psr4Map`/`NamespaceMap` were each
+/// rebuilt from scratch on every single reindex call (3 call sites) —
+/// `CrateMap::build` alone spawns a `cargo metadata` subprocess when
+/// `cargo` is available. Cached per-`project_root`, invalidated on either
+/// `Cargo.toml`/`Cargo.lock`/`composer.json`'s mtime changing (covers
+/// `CrateMap`/`Psr4Map`, whose real inputs — verified by reading
+/// `from_cargo_metadata`/`from_toml_scan`/`from_composer_json` — are
+/// exactly these files, not the `*.csproj` the plan doc originally
+/// guessed) or `RESOLUTION_MAPS_TTL` elapsing (the only correct answer for
+/// `NamespaceMap`, see its doc comment above). All three maps are cheap to
+/// `Clone` (small `HashMap`/`Vec` of strings) — cloned out of the lock
+/// rather than holding it for the caller's `rebuild_graph` pass.
+fn cached_resolution_maps(
+    project_root: &Path,
+) -> (
+    crate::indexer::crate_map::CrateMap,
+    crate::indexer::psr4::Psr4Map,
+    crate::indexer::csharp_namespace::NamespaceMap,
+) {
+    let file_mtime = |name: &str| {
+        std::fs::metadata(project_root.join(name))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let cargo_toml_mtime = file_mtime("Cargo.toml");
+    let cargo_lock_mtime = file_mtime("Cargo.lock");
+    let composer_json_mtime = file_mtime("composer.json");
+
+    let cache_lock = RESOLUTION_MAPS_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(c) = cache.get(project_root) {
+        let fresh_enough = c.built_at.elapsed() < RESOLUTION_MAPS_TTL;
+        let manifests_unchanged = c.cargo_toml_mtime == cargo_toml_mtime
+            && c.cargo_lock_mtime == cargo_lock_mtime
+            && c.composer_json_mtime == composer_json_mtime;
+        if fresh_enough && manifests_unchanged {
+            return (
+                c.crate_map.clone(),
+                c.psr4.clone(),
+                c.namespace_map.clone(),
+            );
+        }
+    }
+
+    let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
+    let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
+    let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+    cache.insert(
+        project_root.to_path_buf(),
+        CachedResolutionMaps {
+            built_at: std::time::Instant::now(),
+            cargo_toml_mtime,
+            cargo_lock_mtime,
+            composer_json_mtime,
+            crate_map: crate_map.clone(),
+            psr4: psr4.clone(),
+            namespace_map: namespace_map.clone(),
+        },
+    );
+    (crate_map, psr4, namespace_map)
 }
 
 pub fn reindex_changed_cancellable(
@@ -1622,9 +1711,7 @@ pub fn reindex_changed_cancellable(
     }
 
     if !summary.is_noop() {
-        let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-        let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-        let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+        let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
         rebuild_graph(
             &tx,
             &config.hub_threshold,
@@ -1731,9 +1818,7 @@ pub fn reindex_paths(
     }
 
     if !summary.is_noop() {
-        let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-        let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-        let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+        let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
         rebuild_graph(
             &tx,
             &config.hub_threshold,
@@ -1982,6 +2067,52 @@ mod tests {
         // A path that's neither on disk nor ever indexed — no-op, no error.
         let summary = reindex_paths(&mut conn, &dir, &["never_existed.py".to_string()]).unwrap();
         assert!(summary.is_noop());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Plan 3 §3.1 Phase D: cached_resolution_maps must (a) actually cache
+    // (return the same content without rebuilding within TTL) and (b)
+    // correctly invalidate the moment the manifest it read changes — using
+    // an isolated temp dir rather than the shared `tests/fixtures/
+    // rust_workspace` fixture so this doesn't mutate state other
+    // (possibly parallel) tests read.
+    #[test]
+    fn test_cached_resolution_maps_hits_cache_then_invalidates_on_manifest_change() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_resmaps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"resmaps_foo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+
+        let (crate_map, _, _) = cached_resolution_maps(&dir);
+        assert_eq!(crate_map.root_of("resmaps_foo"), Some("src"));
+
+        // Rewrite Cargo.toml's package name WITHOUT touching mtime granularity
+        // — sleep past a coarse (1s) filesystem mtime resolution so this is a
+        // real, observable change, not a same-tick no-op.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"resmaps_bar\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let (crate_map2, _, _) = cached_resolution_maps(&dir);
+        assert_eq!(
+            crate_map2.root_of("resmaps_bar"),
+            Some("src"),
+            "Cargo.toml mtime changed — cache must rebuild, not serve the stale mapping"
+        );
+        assert_eq!(
+            crate_map2.root_of("resmaps_foo"),
+            None,
+            "old crate name must be gone after rebuild"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

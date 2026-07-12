@@ -84,9 +84,10 @@ Các bước bên trong (mirror `reindex_changed_cancellable`, bỏ walk):
 
 ### Phase D — Cache resolution maps  ⏱ ~half day
 
-**Evidence:** `pipeline.rs:1585-1594` — `CrateMap::build`/`Psr4Map::build`/`NamespaceMap::build` walk disk mỗi reindex.
-**Thiết kế:** cache theo project_root, invalidate bằng mtime của manifest nguồn (bước 0: đọc 3 hàm build xác định input thật — dự kiến `Cargo.toml` set, `composer.json`, `*.csproj`); TTL fallback 60s cho trường hợp manifest mới xuất hiện. Áp cho cả `reindex_paths` lẫn full pipeline.
-**Done when:** log debug xác nhận cache hit trên edit thứ 2 liên tiếp.
+**Evidence:** `pipeline.rs` — `CrateMap::build`/`Psr4Map::build`/`NamespaceMap::build` walk disk (hoặc spawn `cargo metadata`) mỗi reindex, ngay cả 3 lần gọi liên tiếp cho cùng `project_root`.
+**Thiết kế [ĐÃ LÀM]:** cache theo `project_root` (KHÔNG phải single-slot — test suite dùng nhiều temp dir khác nhau trong cùng process, single-slot sẽ trả sai map cho project khác). **Bước 0 [đã xác nhận, sai giả thuyết ban đầu của plan]:** đọc trực tiếp `from_cargo_metadata`/`from_toml_scan` (CrateMap) + `from_composer_json` (Psr4Map) — input thật là `Cargo.toml`/`Cargo.lock`/`composer.json`, khớp giả thuyết. NHƯNG `NamespaceMap::build` **KHÔNG phải manifest-driven** — nó walk **toàn bộ** file `.cs` trong repo và đọc content từng file để tìm `namespace X.Y {}` — không có `*.csproj` nào được đọc cả, giả thuyết `*.csproj` của plan gốc SAI. Invalidate: `Cargo.toml`+`Cargo.lock`+`composer.json` mtime (bao phủ CrateMap/Psr4Map) HOẶC `RESOLUTION_MAPS_TTL` (60s) hết hạn — TTL là cách đúng duy nhất cho NamespaceMap (không có manifest để theo dõi), không phải thiếu sót. Cả 3 struct thêm `#[derive(Clone)]` để clone ra khỏi Mutex thay vì giữ lock suốt `rebuild_graph`. Áp dụng cho cả 3 call site (`run_indexing_pipeline_cancellable`, `reindex_changed_cancellable`, `reindex_paths`).
+**Tests:** `test_cached_resolution_maps_hits_cache_then_invalidates_on_manifest_change` — xây một crate synthetic trong temp dir (không dùng `tests/fixtures/rust_workspace` dùng chung — tránh mutate state test khác đọc dưới cache global mới); gọi 2 lần liên tiếp → map giống nhau; đổi tên package trong `Cargo.toml` (sleep 1.1s tránh trung mtime-tick) → gọi lại → map phải cập nhật (không phục vụ map cũ). **XANH.**
+**Done when:** ĐÃ XONG — cả 3 call site dùng `cached_resolution_maps`; full test suite xanh (673 calm-core + 183 calm-server).
 
 ---
 

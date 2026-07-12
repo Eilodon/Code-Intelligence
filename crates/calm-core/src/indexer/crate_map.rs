@@ -5,7 +5,7 @@ use std::process::Command;
 /// Maps a workspace's crate names to their source-root directories, so Rust
 /// `use other_crate::Item` and `use crate::mod::Item` imports resolve to real
 /// indexed files. Built once per index pass.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CrateMap {
     /// normalized crate name (`-` → `_`) → src-root dir, project-root-relative,
     /// forward-slashed, no trailing slash (e.g. `"crates/calm-core/src"`).

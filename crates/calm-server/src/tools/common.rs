@@ -952,7 +952,7 @@ pub(crate) fn resolve_symbol_candidates(
     conn: &rusqlite::Connection,
     name: &str,
     path: Option<&str>,
-) -> Vec<CandidateRow> {
+) -> rusqlite::Result<Vec<CandidateRow>> {
     let sql = if path.is_some() {
         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
          FROM symbols WHERE name = ?1 AND path = ?2 ORDER BY path, line_start"
@@ -961,10 +961,13 @@ pub(crate) fn resolve_symbol_candidates(
          FROM symbols WHERE name = ?1 ORDER BY path, line_start"
     };
 
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    // audit F9: `?` on both statement-level failures below (a genuine DB/
+    // schema problem) — a single malformed *row* still doesn't kill the
+    // whole result set (see the `filter_map` further down, deliberately
+    // unchanged), only a failure to even prepare/execute the query does.
+    let mut stmt = conn.prepare(sql).inspect_err(|e| {
+        tracing::warn!("resolve_symbol_candidates: prepare failed for {name:?}: {e}");
+    })?;
 
     let map_row = |row: &rusqlite::Row| -> rusqlite::Result<CandidateRow> {
         Ok(CandidateRow {
@@ -993,8 +996,11 @@ pub(crate) fn resolve_symbol_candidates(
     };
 
     match rows {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(_) => vec![],
+        Ok(iter) => Ok(iter.filter_map(|r| r.ok()).collect()),
+        Err(e) => {
+            tracing::warn!("resolve_symbol_candidates: query_map failed for {name:?}: {e}");
+            Err(e)
+        }
     }
 }
 
@@ -1024,21 +1030,21 @@ pub(crate) fn resolve_symbol(
     name: &str,
     path: Option<&str>,
     line: Option<i64>,
-) -> SymbolResolution {
-    let mut candidates = resolve_symbol_candidates(conn, name, path);
+) -> rusqlite::Result<SymbolResolution> {
+    let mut candidates = resolve_symbol_candidates(conn, name, path)?;
     if let Some(line) = line {
         let in_range = |c: &CandidateRow| c.line_start <= line && line <= c.line_end;
         if candidates.iter().any(in_range) {
             candidates.retain(in_range);
         }
     }
-    if candidates.is_empty() {
+    Ok(if candidates.is_empty() {
         SymbolResolution::NotFound
     } else if candidates.len() == 1 {
         SymbolResolution::Found(Box::new(candidates.remove(0)))
     } else {
         SymbolResolution::Ambiguous(candidates)
-    }
+    })
 }
 
 /// Ambient "related notes" surfaced automatically on `edit_context`/

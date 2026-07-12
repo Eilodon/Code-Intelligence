@@ -49,7 +49,10 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = resolve_symbol(&read_conn, &p.symbol, p.path.as_deref(), p.line);
+            let resolution = match resolve_symbol(&read_conn, &p.symbol, p.path.as_deref(), p.line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => {

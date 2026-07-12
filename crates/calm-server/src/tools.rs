@@ -939,6 +939,29 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// audit F9: a genuine DB/schema failure (not "the symbol doesn't
+    /// exist") must surface as DB_ERROR, not silently read as NotFound with
+    /// a "likely a typo" caveat — resolve_symbol_candidates/resolve_symbol
+    /// used to swallow the prepare()/query_map() error into an empty
+    /// candidate list.
+    #[test]
+    fn resolve_reports_db_error_not_not_found() {
+        let (dir, server) = test_server("resolve_symbol_db_error");
+        server.db().execute("DROP TABLE symbols", []).unwrap();
+
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "anything".into(),
+                path: None,
+                line: None,
+            },
+        )));
+        assert_eq!(v["error"]["code"], "DB_ERROR", "response: {v}");
+        assert_eq!(v["error"]["recoverable"], true, "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn diff_impact_raw_diff_maps_to_affected_symbols_and_reviewers() {

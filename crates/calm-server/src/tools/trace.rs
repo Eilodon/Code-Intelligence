@@ -23,7 +23,10 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
+            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => {
@@ -197,7 +200,10 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
+            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => {
@@ -505,7 +511,10 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let from = { resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref(), p.from_line) };
+            let from = match resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref(), p.from_line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
             let from = match from {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.from_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
@@ -514,7 +523,10 @@ impl CalmServer {
             self.track_symbol(&from.qualified_name);
             self.track_file(&from.path);
 
-            let to = { resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref(), p.to_line) };
+            let to = match resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref(), p.to_line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
             let to = match to {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.to_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),

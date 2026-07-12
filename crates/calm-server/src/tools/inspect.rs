@@ -396,7 +396,7 @@ impl CalmServer {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
+                    "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous
                      FROM symbols WHERE qualified_name IN ({placeholders})"
                 );
                 if let Ok(mut stmt) = conn.prepare(&sql)
@@ -417,6 +417,7 @@ impl CalmServer {
                             is_entry_point: row.get::<_, i64>(12)? != 0,
                             is_test: row.get::<_, i64>(13)? != 0,
                             coreness: row.get(14)?,
+                            boundary_ambiguous: row.get::<_, i64>(15)? != 0,
                         })
                     })
                 {

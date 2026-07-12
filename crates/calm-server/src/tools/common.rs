@@ -181,10 +181,26 @@ impl CalmServer {
             return cfg.clone();
         }
         let cfg = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+        // Root-cause fix for the F10 calibration bug: a local config.json/
+        // .calm/config.json override previously shadowed Config::default()
+        // with zero visibility, so a stale forgotten override file could
+        // silently mask a code-level default change indefinitely (see
+        // calm_core::config::diff_from_default's doc comment). Logged once
+        // per cache miss -- rare, gated by config_mtime -- not every call.
+        if let Some(override_path) = calm_core::config::resolve_config_path(&self.project_root) {
+            let diff = calm_core::config::diff_from_default(&cfg);
+            if !diff.is_empty() {
+                tracing::info!(
+                    "config: local override active at {} — {} field(s) differ from built-in defaults: {}",
+                    override_path.display(),
+                    diff.len(),
+                    diff.join(", ")
+                );
+            }
+        }
         *self.config_cache.write_ok() = Some((current_mtime, cfg.clone()));
         cfg
     }
-
     /// Cached `compute_co_changes` (audit F11b): `edit_context` is the
     /// mandatory-before-every-edit tool, and used to spawn a `git log`
     /// subprocess on every single call regardless of whether the same file
@@ -1012,6 +1028,7 @@ pub(crate) struct CandidateRow {
     pub(crate) is_entry_point: bool,
     pub(crate) is_test: bool,
     pub(crate) coreness: Option<i64>, // from symbols.coreness column
+    pub(crate) boundary_ambiguous: bool,
 }
 
 impl CandidateRow {
@@ -1062,10 +1079,10 @@ pub(crate) fn resolve_symbol_candidates(
     path: Option<&str>,
 ) -> rusqlite::Result<Vec<CandidateRow>> {
     let sql = if path.is_some() {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous
          FROM symbols WHERE name = ?1 AND path = ?2 ORDER BY path, line_start"
     } else {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous
          FROM symbols WHERE name = ?1 ORDER BY path, line_start"
     };
 
@@ -1094,6 +1111,7 @@ pub(crate) fn resolve_symbol_candidates(
             is_entry_point: row.get::<_, i64>(12)? != 0,
             is_test: row.get::<_, i64>(13)? != 0,
             coreness: row.get(14)?,
+            boundary_ambiguous: row.get::<_, i64>(15)? != 0,
         })
     };
 
@@ -1111,7 +1129,6 @@ pub(crate) fn resolve_symbol_candidates(
         }
     }
 }
-
 pub(crate) enum SymbolResolution {
     NotFound,
     Ambiguous(Vec<CandidateRow>),

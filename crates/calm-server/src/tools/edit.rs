@@ -76,6 +76,19 @@ impl CalmServer {
                     SymbolResolution::Found(c) => *c,
                 }
             };
+            if c.boundary_ambiguous {
+                return ResolvedOutcome::error(error_detail(
+                    "BOUNDARY_AMBIGUOUS",
+                    &format!(
+                        "'{}' shares a physical source line with an adjacent symbol in {} \
+                         (see fitness_report's boundary_ambiguous_count) — a line-range replace \
+                         here could silently delete part of the neighboring symbol. Fix the \
+                         shared line by hand first (insert the missing newline), then retry.",
+                        p.symbol, c.path
+                    ),
+                    true,
+                ));
+            }
             let hunk = match p.position.as_deref().unwrap_or("replace") {
                 "replace" => calm_core::edit::HunkRequest {
                     start_line: c.line_start as usize,
@@ -255,10 +268,38 @@ impl CalmServer {
         let parse_status = match calm_core::edit::validate_syntax(&new_content, ext) {
             Some(true) => "clean",
             Some(false) => {
+                // Show the ORIGINAL boundary line(s) so a pre-existing
+                // corrupted shared line (two symbols fused onto one
+                // physical line by a missing trailing newline in an
+                // earlier edit -- see apply_hunks' newline normalization)
+                // is visible immediately instead of costing a multi-call
+                // investigation. Purely factual (just echoes disk content),
+                // no heuristic guess about fault.
+                let orig_lines: Vec<&str> = original.lines().collect();
+                let boundary_hint: Vec<String> = hunks
+                    .iter()
+                    .filter_map(|h| {
+                        orig_lines
+                            .get(h.end_line.saturating_sub(1))
+                            .map(|line| format!("line {}: {line:?}", h.end_line))
+                    })
+                    .collect();
+                let hint = if boundary_hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " — original boundary line(s) for reference: {}; if one visibly \
+                         holds content from more than one symbol (e.g. a closing brace \
+                         immediately followed by unrelated code with no newline between \
+                         them), that line was already corrupted before this edit and needs \
+                         a manual fix first",
+                        boundary_hint.join(", ")
+                    )
+                };
                 return ToolOutcome::error(error_detail(
                     "PARSE_ERROR",
                     &format!(
-                        "this edit would introduce a syntax error in {path} — nothing written"
+                        "this edit would introduce a syntax error in {path} — nothing written{hint}"
                     ),
                     true,
                 ));

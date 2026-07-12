@@ -47,7 +47,7 @@ impl CalmServer {
             }
 
             let mut stmt = match conn.prepare(
-                "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness \
+                "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous \
                  FROM symbols \
                  WHERE kind IN ('function','method') AND is_test = 0 AND coreness IS NOT NULL AND coreness > 0 \
                  ORDER BY coreness DESC, caller_count DESC, qualified_name ASC \
@@ -74,6 +74,7 @@ impl CalmServer {
                         is_entry_point: r.get::<_, i64>(12)? != 0,
                         is_test: r.get::<_, i64>(13)? != 0,
                         coreness: r.get(14)?,
+                        boundary_ambiguous: r.get::<_, i64>(15)? != 0,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())

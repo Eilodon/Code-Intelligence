@@ -7,16 +7,20 @@
 #
 # Two of AGENTS.md's rules are HARD-enforced here (permissionDecision: deny),
 # not just nudged, tracked via a per-session state file:
-#   - Stage 5: `edit_context` must be called at least once this session
-#     before the first native `Edit` of a source-code file (never re-blocked
-#     after that — correlating each individual edit to a specific prior
+#   - Stage 5: `edit_context` must be called at least once THIS SESSION FOR
+#     EACH FILE before the first native `Edit` of that file (re-armed per
+#     file, not once for the whole session — a session-wide unlock let an
+#     agent review file A's blast radius then silently native-Edit file B,
+#     never reviewed at all; see docs/superskills/specs/2026-07-13-calm-
+#     agent-experience-upgrade.md). Still per-FILE, not per-symbol:
+#     correlating each individual edit to a specific prior
 #     edit_context(symbol) call isn't reliable from a shell hook, so this
-#     enforces "checked blast radius before starting to edit", not "checked
-#     it for every single edit"). `edit_symbol`/`edit_lines` are NOT gated
-#     this way — they carry their own per-call risk gate (refuse a
-#     hub/high-caller touch without confirm:true), which is stricter than
-#     this session-level heuristic, so gating them identically would be
-#     redundant, not safer.
+#     enforces "checked blast radius before starting to edit this file",
+#     not "checked it for every single edit". `edit_symbol`/`edit_lines`
+#     are NOT gated this way — they carry their own per-call risk gate
+#     (refuse a hub/high-caller touch without confirm:true), which is
+#     stricter than this per-file heuristic, so gating them identically
+#     would be redundant, not safer.
 #   - Stage 7: `diff_impact` must be called after the most recent write
 #     (native Edit/Write OR mcp__calm__edit_lines/edit_symbol) before a
 #     `git commit`/`git push` — reset every time any of those four tools
@@ -47,7 +51,7 @@ state='{}'
 if [ -f "$state_file" ]; then
   state=$(cat "$state_file" 2>/dev/null || echo '{}')
 fi
-edit_context_called=$(jq -r '.edit_context_called // false' <<<"$state" 2>/dev/null || echo false)
+edit_context_files=$(jq -c '.edit_context_files // []' <<<"$state" 2>/dev/null || echo '[]')
 needs_diff_impact=$(jq -r '.needs_diff_impact // false' <<<"$state" 2>/dev/null || echo false)
 nudge_counts=$(jq -c '.nudge_counts // {}' <<<"$state" 2>/dev/null || echo '{}')
 
@@ -89,9 +93,20 @@ log_decision() {
 trap log_decision EXIT
 
 save_state() {
-  jq -n --argjson ec "$1" --argjson nd "$2" --argjson nc "$3" \
-    '{edit_context_called: $ec, needs_diff_impact: $nd, nudge_counts: $nc}' \
+  jq -n --argjson ecf "$1" --argjson nd "$2" --argjson nc "$3" \
+    '{edit_context_files: $ecf, needs_diff_impact: $nd, nudge_counts: $nc}' \
     >"$state_file" 2>/dev/null || true
+}
+
+# True if `path` has had edit_context called for it THIS session — per-FILE
+# state (not per-symbol: correlating each individual edit to a specific
+# prior edit_context(symbol) call still isn't reliable from a shell hook,
+# see this file's header comment; per-file *is* reliably trackable, since
+# both mcp__calm__edit_context and native Edit/Write receive repo-relative
+# or absolute paths consistently within one Claude Code session's
+# tool_input shape). Exact string match against the recorded path set.
+file_has_edit_context() {
+  jq -e --arg p "$1" 'index($p) != null' <<<"$edit_context_files" >/dev/null 2>&1
 }
 
 deny() {
@@ -284,8 +299,16 @@ resolve_git_target_root() {
 # PreToolUse (before the call runs) since attempting the check is what
 # matters here, and PreToolUse is all that's needed to observe it.
 if [ "$tool_name" = "mcp__calm__edit_context" ]; then
-  decision_detail="state:edit_context_called=true"
-  save_state true "$needs_diff_impact" "$nudge_counts"
+  ec_path=$(jq -r '.tool_input.path // ""' <<<"$input")
+  decision_detail="state:edit_context_files+=${ec_path:-<any>}"
+  if [ -n "$ec_path" ]; then
+    edit_context_files=$(jq -c --arg p "$ec_path" '. + [$p] | unique' <<<"$edit_context_files")
+  fi
+  # No `path` given (symbol-name-only lookup, ambiguous across files) --
+  # can't attribute to one file, so this call alone doesn't unlock any
+  # file. Fails toward stricter (still enforcing the gate), not toward
+  # silently trusting a guess.
+  save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
@@ -301,16 +324,16 @@ if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
   # real residual gap this leaves (a failing diff_impact call still
   # satisfies this hook's gate) and why it's accepted for Plan 1's scope.
   decision_detail="state:needs_diff_impact=false"
-  save_state "$edit_context_called" false "$nudge_counts"
+  save_state "$edit_context_files" false "$nudge_counts"
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__edit_lines" ] || [ "$tool_name" = "mcp__calm__edit_symbol" ]; then
   # These are calm's own write path (AGENTS.md Stage 6) — a real file write
   # just like native Edit/Write, so the Stage 7 diff_impact gate below must
-  # still apply. Not treated as satisfying edit_context_called: they carry
+  # still apply. Not treated as satisfying edit_context_files: they carry
   # their own stricter per-call risk gate instead (see header comment).
   decision_detail="state:needs_diff_impact=true"
-  save_state "$edit_context_called" true "$nudge_counts"
+  save_state "$edit_context_files" true "$nudge_counts"
   exit 0
 fi
 
@@ -332,13 +355,13 @@ case "$tool_name" in
     ;;
   Edit)
     decision_detail="state:needs_diff_impact=true"
-    save_state "$edit_context_called" true "$nudge_counts"
-    if is_code_file "$file_path" && [ "$edit_context_called" != "true" ]; then
-      deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before editing $file_path, never skip (especially if is_hub). Call it once for the symbol you are about to change, then retry this edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
+    save_state "$edit_context_files" true "$nudge_counts"
+    if is_code_file "$file_path" && ! file_has_edit_context "$file_path"; then
+      deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
     fi
     ;;
   Write)
-    save_state "$edit_context_called" true "$nudge_counts"
+    save_state "$edit_context_files" true "$nudge_counts"
     nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
     ;;
   Bash)

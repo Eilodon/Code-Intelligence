@@ -1,0 +1,22 @@
+{
+  "calm-guard-probe": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": ".agents/hooks/calm-guard-probe.sh", "timeout": 5 }
+        ]
+      }
+    ]
+  },
+  "calm-guard": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": ".agents/hooks/calm-guard.sh", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

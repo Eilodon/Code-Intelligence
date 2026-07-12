@@ -11,8 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          lfs: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -48,8 +46,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          lfs: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -58,10 +54,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The `embeddings` feature (model2vec-rs). The default model's weights
-      # are vendored via Git LFS (crates/calm-core/assets/potion-code-16m/) and
-      # loaded with zero network — `lfs: true` above is required so checkout
-      # fetches the real blob instead of a pointer file (include_bytes! would
-      # otherwise embed the pointer text and fail to parse at runtime).
+      # are fetched from HuggingFace Hub and checksum-verified by
+      # crates/calm-core/build.rs::ensure_embedding_weights at compile time
+      # (2026-07-12 — used to be vendored via Git LFS, which exhausted the
+      # GitHub account's LFS bandwidth budget; see
+      # docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md).
+      # No special checkout step needed here any more — build.rs handles it,
+      # and degrades to a placeholder (never fails the build) if the fetch
+      # doesn't succeed, same as before.
       - name: Clippy (embeddings)
         run: cargo clippy -p calm-core --all-targets --features embeddings -- -D warnings
 

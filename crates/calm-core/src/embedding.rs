@@ -94,10 +94,15 @@ mod imp {
     static DEFAULT_TOKENIZER: &[u8] = include_bytes!("../assets/potion-code-16m/tokenizer.json");
     static DEFAULT_WEIGHTS: &[u8] = include_bytes!("../assets/potion-code-16m/model.safetensors");
 
-    /// True if `bytes` is an unresolved Git LFS pointer stub rather than real
-    /// file content — happens when `git lfs pull`/the smudge filter never ran
-    /// during checkout (e.g. git-lfs not installed in the environment). Real
-    /// model weights are tens of MB; a pointer stub is ~130 bytes starting
+    /// True if `bytes` is byte-shaped like an unresolved Git LFS pointer
+    /// stub rather than real file content. Historically meant `git lfs
+    /// pull`/the smudge filter never ran during checkout; as of 2026-07-12
+    /// the vendored asset is no longer git-tracked at all, so this now also
+    /// (and more commonly) catches `build.rs::ensure_embedding_weights`
+    /// deliberately writing this exact shape as its own placeholder when a
+    /// build-time HuggingFace Hub fetch fails — same detection, same
+    /// downstream runtime fallback either way. Real model weights are tens
+    /// of MB; a pointer stub is ~130 bytes starting
     /// with this exact line (mirrors `is_lfs_pointer` in
     /// `scripts/mcp-launcher.sh`, which checks the same thing for the
     /// prebuilt `ci` binary — kept as a separate copy here since that's a
@@ -599,21 +604,23 @@ mod tests {
         assert_eq!(symbol_doc("run", "", ""), "run");
     }
 
-    /// Regression for the exact incident this function was added for: a
-    /// checkout without git-lfs installed (or one that skipped the smudge
-    /// filter) leaves `assets/potion-code-16m/model.safetensors` as a ~130-
-    /// byte Git LFS pointer stub instead of real weights — `include_bytes!`
+    /// Regression for the exact incident this function was added for: an
+    /// unresolved vendored asset — historically a checkout without git-lfs
+    /// installed (or one that skipped the smudge filter); as of 2026-07-12,
+    /// a `build.rs::ensure_embedding_weights` fetch failure — leaves
+    /// `assets/potion-code-16m/model.safetensors` as a ~130-byte Git-LFS-
+    /// pointer-*shaped* stub instead of real weights. `include_bytes!`
     /// happily bakes that stub into the binary, and `Embedder::load` used to
     /// fail permanently (`embeddings_status: "failed"`) with no clear signal
-    /// why. If this test ever fails, `git lfs pull` didn't run before this
-    /// crate was built.
+    /// why. If this test ever fails, the vendored weights weren't fetched
+    /// before this crate was built — see `build.rs`'s own warning output.
     #[cfg(feature = "embeddings")]
     #[test]
     fn default_vendored_asset_is_not_an_lfs_pointer() {
         assert!(
             !imp::default_vendored_asset_unusable(),
-            "DEFAULT_WEIGHTS looks like an unresolved Git LFS pointer, not real model weights \
-             — run `git lfs pull`"
+            "DEFAULT_WEIGHTS looks like an unresolved/placeholder stub, not real model weights \
+             — check build.rs's cargo:warning output for why the fetch didn't happen"
         );
     }
 

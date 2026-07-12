@@ -54,17 +54,15 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     steps:
-      # lfs: true is still required here — crates/calm-core/assets/potion-code-16m/
-      # (the vendored embedding model) is separately LFS-tracked and gets
-      # include_bytes!'d into the binary at compile time, so an unresolved
-      # pointer stub would silently bake broken embeddings into the
-      # published edge binary. This does still consume some LFS bandwidth
-      # per triggered run (now much rarer thanks to the paths: filter above)
-      # — migrating that asset off LFS too is a separate, not-yet-done
-      # follow-up (see the spec doc's "Alternatives considered" section).
+      # No lfs: true needed — this repo has zero Git LFS-tracked content as
+      # of 2026-07-12 (both .calm-bin and the vendored embedding model were
+      # migrated off LFS the same day; see
+      # docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md).
+      # crates/calm-core/build.rs fetches+verifies the embedding model from
+      # HuggingFace Hub at compile time instead, so the `cross build` step
+      # below gets a real, working binary the same as any other build.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          lfs: true
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

@@ -65,10 +65,14 @@ tempfile = "3"
 # extension (previously sqlite-vec, which failed to compile on musl libc),
 # so this is on by default for every target, release or native. The default
 # model's weights are vendored into the binary via `include_bytes!` (see
-# `embedding::DEFAULT_MODEL_ID` and `assets/potion-code-16m/`, tracked with
-# Git LFS) — loading it needs no network. A custom `semantic_search.model`
-# still resolves through model2vec-rs's `hf-hub` fallback (local path or
-# HuggingFace Hub download).
+# `embedding::DEFAULT_MODEL_ID` and `assets/potion-code-16m/`) — loading it
+# needs no network at runtime. The weights file itself is fetched from
+# HuggingFace Hub and checksum-verified by `build.rs::ensure_embedding_weights`
+# at compile time instead of being git-tracked (used to be Git LFS, which
+# exhausted the GitHub account's LFS bandwidth budget — see
+# docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md). A
+# custom `semantic_search.model` still resolves through model2vec-rs's
+# `hf-hub` fallback (local path or HuggingFace Hub download).
 default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["dep:model2vec-rs"]
 # Tier-0.5 upgrade: optional per-language tree-sitter grammars for accurate

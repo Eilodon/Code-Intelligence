@@ -121,25 +121,15 @@ backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
 # so ~/.cargo/env is not sourced automatically.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
-# Resolve Git LFS assets BEFORE building — a checkout without git-lfs
-# installed leaves a ~130-byte pointer stub in place of the vendored
-# embedding model (crates/calm-core/assets/potion-code-16m/). The build
-# still "succeeds" either way (include_bytes!
-# just bakes whatever is on disk into the binary) — this is a real incident,
-# not a hypothetical: it silently degrades semantic search to
-# embeddings_status: "failed" at runtime instead of failing the build
-# where it'd be noticed. Best-effort, same || true fallback as the build
-# below — Embedder::load's own network-fallback and
-# embeddings_status: "offline_unavailable" messaging are the safety net
-# if this doesn't fully resolve it.
-if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
-  if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y git-lfs >/dev/null 2>&1 || true
-  fi
-  if git lfs version >/dev/null 2>&1; then
-    git lfs pull >/dev/null 2>&1 || true
-  fi
-fi
+# No Git LFS resolution step needed (2026-07-12 update): this repo has
+# zero LFS-tracked content any more. The vendored embedding model's
+# weights are fetched from HuggingFace Hub and checksum-verified by
+# crates/calm-core/build.rs::ensure_embedding_weights as part of the
+# `cargo build` below — same || true-style non-fatal degrade (a fetch
+# failure there writes a placeholder instead of failing the build;
+# Embedder::load's own runtime fallback and
+# embeddings_status: "offline_unavailable" messaging are still the
+# ultimate safety net if that doesn't fully resolve it).
 
 # Build the calm-cli binary. The || true is CRITICAL: setup scripts that
 # exit non-zero prevent the session from starting entirely (confirmed in
@@ -212,14 +202,20 @@ margin on top of it.
   is already warm), but it's what keeps the binary from going *stale*
   (e.g. after editing `calm`'s own source), and it's the only mechanism at
   all for local/non-cloud Claude Code, which has no Setup Script concept.
-  Also runs the same `git lfs pull` best-effort step as the Setup Script
-  snippet above, before building — see the runtime safety net below for
-  what happens when this doesn't fully resolve it.
+- `crates/calm-core/build.rs::ensure_embedding_weights` — fetches and
+  checksum-verifies the vendored embedding model from HuggingFace Hub at
+  compile time (2026-07-12; used to be a Git LFS asset resolved by a
+  best-effort `git lfs pull` step here and in the Setup Script snippet
+  above — see
+  [`docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md`](superskills/specs/2026-07-12-edge-release-binary-distribution.md)).
+  Never fails the build: on any fetch failure it writes a placeholder
+  shaped exactly like an unresolved LFS pointer stub, so the runtime
+  safety net below still applies unchanged.
 - `Embedder::load`'s network fallback + `embeddings_status:
   "offline_unavailable"` (`crates/calm-core/src/embedding.rs`,
   `crates/calm-server/src/lib.rs::bootstrap_embeddings`) — the last line of
-  defense if the LFS pull above still leaves the vendored embedding model
-  asset as a pointer stub (offline environment, apt blocked, etc.):
+  defense if `build.rs` above still leaves the vendored embedding model
+  asset as a placeholder (offline environment, no `curl`, etc.):
   `Embedder::load` detects the stub and falls back to a one-time
   HuggingFace Hub download of the same default model instead of failing
   permanently, unless `semantic_search.allow_network_fallback` is

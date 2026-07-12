@@ -20,20 +20,12 @@
 # docs/cloud-environment-setup.md — but is no longer the only thing
 # standing between a fresh Background Agent and a failed first connection.
 #
-# Same defensive LFS-pull-before-build as the Claude Code Setup Script and
-# `.claude/hooks/session-start-build-calm.sh` — a checkout without git-lfs
-# leaves a ~130-byte pointer stub in place of the vendored embedding model
-# (crates/calm-core/assets/potion-code-16m/); the build still "succeeds"
-# either way (include_bytes! just bakes whatever is on disk in), so this is
-# worth getting right before building, not after.
-if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
-  if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y git-lfs >/dev/null 2>&1 || true
-  fi
-  if git lfs version >/dev/null 2>&1; then
-    git lfs pull >/dev/null 2>&1 || true
-  fi
-fi
+# No LFS-pull step needed any more (2026-07-12): this repo has zero Git
+# LFS-tracked content — the vendored embedding model weights are fetched
+# and checksum-verified by crates/calm-core/build.rs::ensure_embedding_weights
+# at compile time instead, degrading to a placeholder (never failing the
+# build) if that fetch doesn't succeed. See
+# docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md.
 
 # Release, not debug: unlike the Claude Code hook (which targets
 # target/debug/calm to match a fast SessionStart-hook rebuild every

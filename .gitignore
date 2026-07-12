@@ -2,6 +2,15 @@
 /target/
 crates/calm-core/tests/fixtures/rust_workspace/target/
 
+# Vendored embedding model weights (crates/calm-core/build.rs, 2026-07-12) —
+# fetched from HuggingFace Hub (minishlab/potion-code-16M) and checksum-
+# verified at build time instead of being git-tracked via LFS (that used to
+# exhaust the GitHub account's LFS bandwidth budget — see
+# docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md).
+# config.json/tokenizer.json in the same directory are small enough to stay
+# normal tracked git blobs — only the ~64MB weights file needed this.
+crates/calm-core/assets/potion-code-16m/model.safetensors
+
 # Gradle build/cache output — left behind by scip-java's real Gradle
 # invocation when the D.2 kotlin_overlay_upgrades_ambiguous_smart_cast_calls_*
 # ignored test runs against multi_lang_workspace/kotlin. `scip-java index`'s

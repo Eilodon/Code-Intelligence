@@ -90,11 +90,67 @@ impl CalmServer {
                 ));
             }
             let hunk = match p.position.as_deref().unwrap_or("replace") {
-                "replace" => calm_core::edit::HunkRequest {
-                    start_line: c.line_start as usize,
-                    end_line: c.line_end as usize,
-                    expected_hash: p.expected_hash,
-                    new_text: p.new_text,
+                "replace" => match &p.old_text {
+                    None => calm_core::edit::HunkRequest {
+                        start_line: c.line_start as usize,
+                        end_line: c.line_end as usize,
+                        expected_hash: p.expected_hash,
+                        new_text: p.new_text,
+                    },
+                    Some(old_text) => {
+                        let full_path = match resolve_repo_path(&self.project_root, &c.path) {
+                            Ok(p) => p,
+                            Err(e) => return ResolvedOutcome::error(e),
+                        };
+                        let live = match std::fs::read_to_string(&full_path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return ResolvedOutcome::error(error_detail(
+                                    "READ_FAILED",
+                                    &format!("could not read {}: {e}", c.path),
+                                    false,
+                                ));
+                            }
+                        };
+                        match calm_core::edit::find_and_replace_hunk(
+                            &live,
+                            c.line_start as usize,
+                            c.line_end as usize,
+                            old_text,
+                            &p.new_text,
+                        ) {
+                            Ok(h) => h,
+                            Err(calm_core::edit::MatchOutcome::NotFound) => {
+                                return ResolvedOutcome::error(error_detail(
+                                    "MATCH_NOT_FOUND",
+                                    &format!(
+                                        "old_text {old_text:?} was not found within '{}' \
+                                         ({}..{}) on disk",
+                                        p.symbol, c.line_start, c.line_end
+                                    ),
+                                    true,
+                                ));
+                            }
+                            Err(calm_core::edit::MatchOutcome::Ambiguous(lines)) => {
+                                let where_str = lines
+                                    .iter()
+                                    .map(|l| format!("line {l}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return ResolvedOutcome::error(error_detail(
+                                    "AMBIGUOUS_MATCH",
+                                    &format!(
+                                        "old_text {old_text:?} occurs {} times within '{}' \
+                                         ({where_str}) — narrow it with more surrounding \
+                                         context so it matches exactly once",
+                                        lines.len(),
+                                        p.symbol
+                                    ),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
                 },
                 pos @ ("before" | "after" | "append_inside") => {
                     let position = match pos {

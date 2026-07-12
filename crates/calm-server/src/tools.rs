@@ -6180,6 +6180,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn edit_symbol_old_text_mode_replaces_the_unique_match() {
+        let (dir, server) = test_server("edit_symbol_old_text_unique");
+        std::fs::write(dir.join("f.rs"), "pub fn a() {\n    let x = 1;\n}\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, boundary_ambiguous)
+                 VALUES ('f.rs::a', 'a', 'function', 'rust', 'f.rs', 1, 3, '', '', 'a', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "a".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "let x = 99;".into(),
+                position: None,
+                confirm: true,
+                reason: None,
+                old_text: Some("let x = 1;".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "pub fn a() {\n    let x = 99;\n}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_old_text_mode_ambiguous_match_reports_locations_not_error() {
+        let (dir, server) = test_server("edit_symbol_old_text_ambiguous");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n    let x = 1;\n    let x = 2;\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, boundary_ambiguous)
+                 VALUES ('f.rs::a', 'a', 'function', 'rust', 'f.rs', 1, 4, '', '', 'a', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "a".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "let x = 99;".into(),
+                position: None,
+                confirm: true,
+                reason: None,
+                old_text: Some("let x".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "AMBIGUOUS_MATCH");
+        assert_eq!(
+            v["error"]["message"].as_str().unwrap().matches("line").count(),
+            2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_old_text_mode_refuses_on_boundary_ambiguous_symbol() {
+        let (dir, server) = test_server("edit_symbol_old_text_boundary_ambiguous");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n    1\n}    pub fn b() {\n    2\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, boundary_ambiguous)
+                 VALUES ('f.rs::a', 'a', 'function', 'rust', 'f.rs', 1, 3, '', '', 'a', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "a".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "99".into(),
+                position: None,
+                confirm: true,
+                reason: None,
+                old_text: Some("1".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "BOUNDARY_AMBIGUOUS");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The stale-index failure mode insertion modes exist for: the indexed
     /// row remembers wrong line numbers, but the anchor comes from a fresh
     /// parse of the file on disk, so the insertion lands where the symbol

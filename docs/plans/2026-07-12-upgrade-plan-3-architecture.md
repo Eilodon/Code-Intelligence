@@ -47,6 +47,8 @@ Các bước bên trong (mirror `reindex_changed_cancellable`, bỏ walk):
 
 ### Phase B — Incremental graph update  ⏱ ~2-3 ngày · giá trị lớn nhất
 
+> **HOÃN LẠI 2026-07-12 — quyết định có chủ đích, không phải bỏ sót.** Sau khi A/C/D xong (shipped+tested+dogfooded, commit `f567314`/`d341fbb`/`3bd9820`), đã hỏi user có muốn làm full Phase B ngay không — đây là hạng mục DUY NHẤT trong toàn Plan 3 thay đổi thuật toán resolve call-graph lõi (khác hẳn A/C/D — những cái chỉ thêm cache/reorder, luôn có full-rebuild làm fallback đúng). Sai sót ở đây = call edge sai **lặng lẽ** (không crash, không test nào bắt được trừ khi golden-equivalence infra đủ mạnh) — rủi ro cao nhất toàn plan theo cả audit gốc lẫn audit-design pass ở đầu file này. User chọn **bỏ qua hoàn toàn** cho phiên này, chuyển sang F3/F10/§3.5 — thuật toán incremental graph dưới đây **chưa code**, `rebuild_graph` (full rebuild) vẫn là con đường duy nhất thật (không có config flag `indexing.incremental_graph` nào đang bật một nhánh code không tồn tại). Dành cho 1 phiên riêng, đủ context budget, không phải mảnh cuối của 1 phiên đã rất dài.
+
 **Mục tiêu:** edit 1 file chỉ đụng các edge liên quan tới file đó; edge của phần repo không đổi — kể cả `formal` upgrade từ SCIP/LSP — **sống nguyên**.
 
 **Bước 0 (bắt buộc):** đọc trọn `rebuild_graph` (`pipeline.rs:557-~880`) + `refresh_caller_counts` + phần coreness/hub trước khi code — audit mới đọc phần đầu; xác nhận danh sách bước global hiện tại (dự kiến: resolve edges → insert → caller_count → coreness k-core → `update_is_hub_flags` → import_edges rebuild `pipeline.rs:1363`).

@@ -6273,6 +6273,242 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// audit F14: the old `reason.contains(short)` check let a short caller
+    /// name pass by pure accident (e.g. "new" inside "renewed") and, for a
+    /// method, never told the agent it could cite the longer "Type::name"
+    /// form instead. `CalmServer::new`-shaped caller: bare name "new" is
+    /// under MIN_BARE_NAME_LEN, so only a real word-boundary citation of
+    /// "CalmServer::new" (or the full qualified_name) grounds the reason.
+    #[test]
+    fn edit_symbol_short_caller_name_requires_qualified_form_not_substring() {
+        let (dir, server) = test_server("edit_reason_short_name");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::CalmServer::new', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // "renewed" contains "new" as a substring but not as a whole token —
+        // must be denied now (the pre-F14 bug: contains("new") passed this).
+        let false_positive = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("renewed the flow, still correct".into()),
+                },
+            )),
+        );
+        assert_eq!(
+            false_positive["error"]["code"], "REASON_NOT_GROUNDED",
+            "response: {false_positive}"
+        );
+
+        // The Type::name form is a real, word-boundary citation -- must pass.
+        let grounded = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("checked CalmServer::new — return shape unchanged".into()),
+                },
+            )),
+        );
+        assert_eq!(grounded["applied"], true, "response: {grounded}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit F14: a long-enough bare caller name (>= MIN_BARE_NAME_LEN)
+    /// still grounds a reason on its own, but only as a whole token -- a
+    /// citation embedded inside a longer word (before *and* after) must
+    /// not count as citing it.
+    #[test]
+    fn edit_symbol_long_bare_caller_name_requires_word_boundary() {
+        let (dir, server) = test_server("edit_reason_boundary");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::refresh_caller_counts', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // Substring but not a whole token (prefix "x" and suffix "y" both
+        // extend it into a different word) -- must be denied.
+        let boundary = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("xrefresh_caller_countsy still fine".into()),
+                },
+            )),
+        );
+        assert_eq!(
+            boundary["error"]["code"], "REASON_NOT_GROUNDED",
+            "response: {boundary}"
+        );
+
+        // A real whole-token citation of the >=4-char bare name passes on
+        // its own, no Type:: prefix needed.
+        let grounded = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("cites refresh_caller_counts directly, unaffected".into()),
+                },
+            )),
+        );
+        assert_eq!(grounded["applied"], true, "response: {grounded}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit F14 add-on (Risk Assessment Abductive 2): a short (<4 char)
+    /// caller name that has NO Type:: prefix at all (a bare module-level
+    /// free function, not a method) degrades to needing the full, ugly
+    /// path-qualified name to ground a reason -- citing just the short bare
+    /// name the way a human naturally would is NOT enough. Documents this
+    /// real, verified residual gap rather than asserting it doesn't exist.
+    #[test]
+    fn edit_symbol_short_free_function_name_needs_full_qualified_path_not_bare_name() {
+        let (dir, server) = test_server("edit_reason_short_free_fn");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            // Bare module-level free function, 3-char name, no Type:: segment.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::run', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // Citing the bare short name the way a human naturally would --
+        // denied, because "run" is under MIN_BARE_NAME_LEN and there is no
+        // Type:: segment to fall back to (last_two_segments("a.py::run")
+        // degrades to the full "a.py::run", not a clean "Type::name").
+        let bare_denied = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("checked run(), looks fine".into()),
+                },
+            )),
+        );
+        assert_eq!(
+            bare_denied["error"]["code"], "REASON_NOT_GROUNDED",
+            "response: {bare_denied} -- documents a known residual gap, see docs/plans/2026-07-12-upgrade-plan-1-correctness-safety.md Abductive 2"
+        );
+
+        // Citing the full qualified_name verbatim is the only way through.
+        let full_qn_passes = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("checked a.py::run, unaffected".into()),
+                },
+            )),
+        );
+        assert_eq!(full_qn_passes["applied"], true, "response: {full_qn_passes}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     /// Mirrors `for_connection_isolates_session_log_but_shares_indexer_state`
     /// for the new `edit_context_reviewed` map specifically: agent B must

@@ -348,7 +348,10 @@ impl CalmServer {
             } else {
                 known_caller_qns.iter().any(|qn| {
                     let short = qn.rsplit("::").next().unwrap_or(qn);
-                    reason.contains(short)
+                    let last_two = last_two_segments(qn);
+                    (short.len() >= MIN_BARE_NAME_LEN && cites_token(reason, short))
+                        || cites_token(reason, &last_two)
+                        || cites_token(reason, qn)
                 })
             };
             if !cites_real_signal {
@@ -362,9 +365,20 @@ impl CalmServer {
                     risk = risk.as_deref().unwrap_or("none"),
                     hub_hit,
                 );
-                let examples: Vec<&str> = known_caller_qns
+                let examples: Vec<String> = known_caller_qns
                     .iter()
-                    .map(|qn| qn.rsplit("::").next().unwrap_or(qn.as_str()))
+                    .map(|qn| {
+                        let short = qn.rsplit("::").next().unwrap_or(qn.as_str());
+                        // Show the longer Type::name form for a short bare
+                        // name so the agent knows which form actually needs
+                        // citing (a bare name under MIN_BARE_NAME_LEN never
+                        // counts on its own — see cites_real_signal above).
+                        if short.len() < MIN_BARE_NAME_LEN {
+                            last_two_segments(qn)
+                        } else {
+                            short.to_string()
+                        }
+                    })
                     .take(3)
                     .collect();
                 return ToolOutcome::error(error_detail(
@@ -715,6 +729,53 @@ fn insertion_hunk_for(
 /// Picks the live-parse occurrence of `name` whose start is nearest the
 /// indexed one — same-named symbols (overloads, `#[cfg]` twins) tie-break
 /// to the least-shifted candidate.
+/// audit F14: true when `reason` contains `needle` as a whole token — the
+/// byte immediately before/after each match is not `[A-Za-z0-9_]` (or the
+/// match sits at the start/end of the string). Checks every occurrence,
+/// not just the first, since a needle can appear once mid-word (no match)
+/// and again as a real standalone token later in the same reason. `needle`
+/// is always an identifier segment (ASCII-only qualified-name piece), so
+/// byte indexing is safe here: none of its bytes can ever land mid-way
+/// through a multi-byte UTF-8 character in `reason` (continuation bytes
+/// are always >= 0x80, never equal to an ASCII needle byte).
+fn cites_token(reason: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = reason.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = reason[start..].find(needle) {
+        let idx = start + rel;
+        let before_ok = idx == 0 || !is_word_byte(bytes[idx - 1]);
+        let after = idx + needle.len();
+        let after_ok = after >= bytes.len() || !is_word_byte(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+        if start >= reason.len() {
+            break;
+        }
+    }
+    false
+}
+
+const MIN_BARE_NAME_LEN: usize = 4;
+
+/// Joins the last two `::`-separated segments of `qn` ("Type::name") when
+/// there are at least two, otherwise returns the whole thing unchanged —
+/// gives a short bare name (e.g. "new") a longer, still-real form to cite
+/// that can't collide with an unrelated word in `reason`.
+fn last_two_segments(qn: &str) -> String {
+    let mut rev = qn.rsplit("::");
+    let last = rev.next().unwrap_or(qn);
+    match rev.next() {
+        Some(second) => format!("{second}::{last}"),
+        None => last.to_string(),
+    }
+}
+
 fn best_live_range(
     symbols: &[calm_core::indexer::parser::ParsedSymbol],
     name: &str,

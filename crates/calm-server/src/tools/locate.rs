@@ -38,9 +38,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
-            let rrf_k = calm_core::config::load_config(&self.project_root)
-                .map(|c| c.search.rrf_k as f64)
-                .unwrap_or(calm_core::search::DEFAULT_RRF_K);
+            let rrf_k = self.config().search.rrf_k as f64;
             let kind_str = p.kind.as_str();
             match calm_core::search::search(
                 &conn,
@@ -128,9 +126,7 @@ impl CalmServer {
             Ok(c) => c,
             Err(e) => return db_error(e),
         };
-        let ignore_patterns = calm_core::config::load_config(&self.project_root)
-            .map(|c| c.ignore)
-            .unwrap_or_default();
+        let ignore_patterns = self.config().ignore;
         match calm_core::search::search_grep(
             &conn,
             &self.project_root,
@@ -281,9 +277,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
-            let rrf_k = calm_core::config::load_config(&self.project_root)
-                .map(|c| c.search.rrf_k as f64)
-                .unwrap_or(calm_core::search::DEFAULT_RRF_K);
+            let rrf_k = self.config().search.rrf_k as f64;
             let mut search_output = match calm_core::search::search(
                 &conn,
                 &p.query,

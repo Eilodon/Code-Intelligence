@@ -78,6 +78,7 @@ impl CalmServer {
             last_embed_error: Arc::new(RwLock::new(None)),
             owns_indexer_lock: Arc::new(RwLock::new(false)),
             coverage: Arc::new(RwLock::new(coverage)),
+            config_cache: Arc::new(RwLock::new(None)),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             // `0` is never a real `for_connection`-allocated id (that
             // counter starts at 1 — see `next_session_id` below), so this
@@ -91,7 +92,6 @@ impl CalmServer {
             tool_router,
         })
     }
-
     /// Builds a fresh per-connection `CalmServer` from a daemon-shared
     /// instance — every field is cloned (cheap: everything but
     /// `session_log`/`session_id`/`preset`/`project_root`/`db_path`/
@@ -161,6 +161,28 @@ impl CalmServer {
         let conn = rusqlite::Connection::open(&self.db_path)?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
         Ok(conn)
+    }
+
+    /// Cached `load_config` (audit F12): checks `config.json`'s current
+    /// mtime against what's cached; a match serves the cached `Config`
+    /// clone without touching disk beyond the one `stat()` inside
+    /// `calm_core::config::config_mtime`. A miss (including a config file
+    /// appearing/disappearing since the last call) reloads and replaces the
+    /// whole `(mtime, Config)` pair in one atomic `write_ok()` — never
+    /// mutates the cached `Config` in place, so a concurrent `read_ok()`
+    /// can never observe a torn pair. Behavior is otherwise identical to
+    /// `calm_core::config::load_config(&self.project_root).unwrap_or_default()`
+    /// (same file, same defaulting), just cached.
+    pub(crate) fn config(&self) -> calm_core::config::Config {
+        let current_mtime = calm_core::config::config_mtime(&self.project_root);
+        if let Some((cached_mtime, cfg)) = self.config_cache.read_ok().as_ref()
+            && *cached_mtime == current_mtime
+        {
+            return cfg.clone();
+        }
+        let cfg = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+        *self.config_cache.write_ok() = Some((current_mtime, cfg.clone()));
+        cfg
     }
 
     /// Test-only write connection for seeding fixture data.
@@ -366,9 +388,7 @@ impl CalmServer {
         if results.is_empty() {
             return false;
         }
-        let weight = calm_core::config::load_config(&self.project_root)
-            .map(|c| c.search.personalization_weight)
-            .unwrap_or(0.15);
+        let weight = self.config().search.personalization_weight;
         if weight <= 0.0 {
             return false;
         }
@@ -461,9 +481,7 @@ impl CalmServer {
             }
             *status = EmbedStatus::Downloading;
         }
-        let semantic = calm_core::config::load_config(&self.project_root)
-            .unwrap_or_default()
-            .semantic_search;
+        let semantic = self.config().semantic_search;
         let db_path = self.db_path.clone();
         let embedder = Arc::clone(&self.embedder);
         let status = Arc::clone(&self.embed_status);

@@ -42,7 +42,7 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+            let config = self.config();
 
             // For edit_lines/edit_symbol's expected_hash — computed the same
             // way apply_hunks hashes a range, so this checksum is directly

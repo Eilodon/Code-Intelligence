@@ -237,6 +237,14 @@ pub struct CalmServer {
     /// reload it in place when the coverage file itself changes, instead of
     /// staying frozen at whatever existed at server startup.
     coverage: Arc<RwLock<calm_core::analysis::coverage::CoverageData>>,
+    /// mtime-based cache for `config.json`/`.calm/config.json` (audit F12)
+    /// — one process always serves exactly one `project_root`, so this is a
+    /// plain instance field rather than a global static keyed by path (no
+    /// path-identity/canonicalization edge cases, and it can't accumulate
+    /// entries across a long test suite spinning up many short-lived
+    /// `CalmServer`s at different tempdirs). Shared across `for_connection`
+    /// clones like `phase`/`coverage`/etc. See `CalmServer::config`.
+    config_cache: Arc<RwLock<Option<(Option<std::time::SystemTime>, calm_core::config::Config)>>>,
     session_log: Arc<Mutex<SessionLog>>,
     /// This connection's own key into `active_sessions` below — `0` for a
     /// bare (non-daemon) `calm serve`/test-constructed instance, where
@@ -268,7 +276,6 @@ pub struct CalmServer {
     /// scoping — no separate availability check needed at dispatch time.
     tool_router: rmcp::handler::server::router::tool::ToolRouter<CalmServer>,
 }
-
 impl CalmServer {
     /// Merges every module's `#[tool_router]`-generated router into one —
     /// the unfiltered source of truth for "every tool this server
@@ -4677,6 +4684,45 @@ mod tests {
         // query_only pragma should be ON — attempting a write must fail
         let result = conn.execute("CREATE TABLE IF NOT EXISTS _test_write (id INTEGER)", []);
         assert!(result.is_err(), "read-only connection must reject writes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_cache_reflects_file_created_after_first_miss() {
+        // audit F12: CalmServer::config() must notice a config.json that
+        // didn't exist at server startup but was created later, not stay
+        // pinned to the Config::default() it cached on the first read.
+        let (dir, server) = test_server("config_cache_created");
+        let first = server.config();
+        assert_eq!(first.preset, "full", "no config.json yet -> Config::default()");
+
+        std::fs::write(dir.join("config.json"), r#"{"preset": "orient"}"#).unwrap();
+        let second = server.config();
+        assert_eq!(second.preset, "orient");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_cache_reflects_touched_file_after_edit() {
+        // audit F12: a cache hit must not serve a stale Config forever --
+        // once config.json's mtime moves, the next config() call reloads.
+        let (dir, server) = test_server("config_cache_touch");
+        std::fs::write(dir.join("config.json"), r#"{"preset": "orient"}"#).unwrap();
+        let first = server.config();
+        assert_eq!(first.preset, "orient");
+
+        std::fs::write(dir.join("config.json"), r#"{"preset": "trace"}"#).unwrap();
+        // Force a visibly later mtime regardless of filesystem timestamp
+        // resolution (some filesystems only track whole seconds).
+        let mtime = calm_core::config::config_mtime(&dir).unwrap();
+        let later = mtime + std::time::Duration::from_secs(2);
+        let f = std::fs::File::open(dir.join("config.json")).unwrap();
+        f.set_modified(later).unwrap();
+
+        let second = server.config();
+        assert_eq!(second.preset, "trace");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

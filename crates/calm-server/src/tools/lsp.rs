@@ -27,7 +27,7 @@ impl CalmServer {
                     Ok(c) => c,
                     Err(e) => return db_error(e),
                 };
-                let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+                let config = self.config();
                 match calm_core::lsp::refresh_language(
                     &conn,
                     &self.project_root,

@@ -215,7 +215,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         Parameters(p): Parameters<HotspotsParams>,
     ) -> Json<ToolOutcome<HotspotsOutput>> {
         Json(self.timed_tool("hotspots", || {
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+            let config = self.config();
             let hc = &config.hotspots;
             let top_n = p.top_n.unwrap_or(hc.default_top_n);
             let since = p.since.unwrap_or_else(|| hc.default_since.clone());

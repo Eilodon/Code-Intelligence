@@ -41,7 +41,7 @@ impl CalmServer {
                 self.retry_embeddings_if_failed();
             }
 
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+            let config = self.config();
             let files_total: i64 = {
                 let mut discovered = Vec::new();
                 calm_core::indexer::pipeline::collect_source_files(
@@ -71,9 +71,7 @@ impl CalmServer {
 
             #[cfg(feature = "scip-overlay")]
             let scip_overlay = {
-                let rust_cfg = calm_core::config::load_config(&self.project_root)
-                    .map(|c| c.rust)
-                    .unwrap_or_default();
+                let rust_cfg = self.config().rust;
                 calm_core::scip::overlay_status(&conn, &self.project_root, &rust_cfg)
                     .map(ScipOverlayStatusOutput::from)
             };
@@ -113,7 +111,7 @@ impl CalmServer {
         &self,
         conn: &rusqlite::Connection,
     ) -> Vec<PerLanguageOverlayStatus> {
-        let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+        let config = self.config();
         let mut out = Vec::new();
         if let Some(s) = calm_core::scip::overlay_status_for(
             &calm_core::scip::provider::RUST,
@@ -279,9 +277,7 @@ impl CalmServer {
                 ))
             };
 
-            let max_fetched = calm_core::config::load_config(&self.project_root)
-                .map(|c| c.session.max_fetched)
-                .unwrap_or_default();
+            let max_fetched = self.config().session.max_fetched;
             let unique_files_explored = explored_files.len();
             let truncated =
                 explored_symbols.len() > max_fetched || explored_files.len() > max_fetched;

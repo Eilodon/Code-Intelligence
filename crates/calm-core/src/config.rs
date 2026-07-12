@@ -661,11 +661,8 @@ impl Default for CoChangeConfig {
 pub const VALID_PRESETS: &[&str] = &["full", "orient", "trace", "edit", "compound"];
 
 pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
-    for candidate in [
-        project_root.join("config.json"),
-        project_root.join(".calm").join("config.json"),
-    ] {
-        if candidate.exists() {
+    match resolve_config_path(project_root) {
+        Some(candidate) => {
             let text = std::fs::read_to_string(&candidate)?;
             let config: Config = serde_json::from_str(&text)?;
             if !config.preset.is_empty() && !VALID_PRESETS.contains(&config.preset.as_str()) {
@@ -676,12 +673,36 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
                     VALID_PRESETS.join(", ")
                 );
             }
-            return Ok(config);
+            Ok(config)
         }
+        None => Ok(Config::default()),
     }
-    Ok(Config::default())
 }
 
+/// The `config.json`/`.calm/config.json` candidate `load_config` would
+/// currently read (first existing one wins), or `None` when neither
+/// exists — single source of truth for that resolution order so
+/// `config_mtime` (audit F12's cache-key helper) can never drift from
+/// what `load_config` itself would actually load.
+fn resolve_config_path(project_root: &Path) -> Option<std::path::PathBuf> {
+    [
+        project_root.join("config.json"),
+        project_root.join(".calm").join("config.json"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+/// mtime of whichever config file `load_config` would currently read
+/// (`None` when neither exists) — a cache-invalidation key: unchanged
+/// mtime means the previously-loaded `Config` is still current, without
+/// re-reading or re-parsing the file (audit F12). Note: filesystem mtime
+/// resolution (commonly ~1s) means two writes to config.json within the
+/// same tick could be missed; acceptable for a file edited by a human at
+/// human timescale, not by an automated rewrite loop.
+pub fn config_mtime(project_root: &Path) -> Option<std::time::SystemTime> {
+    resolve_config_path(project_root).and_then(|p| std::fs::metadata(p).ok()?.modified().ok())
+}
 pub fn default_config_json() -> String {
     serde_json::to_string_pretty(&Config::default()).unwrap_or_default()
 }
@@ -768,6 +789,57 @@ mod tests {
             result.is_ok(),
             "empty preset means 'full', should be valid: {result:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_mtime_none_when_no_config_file() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_mtime_absent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        assert_eq!(crate::config::config_mtime(&tmp), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_mtime_matches_config_json_over_dotcalm_variant() {
+        // Same candidate order as load_config: bare config.json wins over
+        // .calm/config.json when both exist (audit F12 -- config_mtime must
+        // never pick a different file than load_config would).
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_mtime_precedence_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".calm")).unwrap();
+        std::fs::write(tmp.join(".calm").join("config.json"), "{}").unwrap();
+        std::fs::write(tmp.join("config.json"), "{}").unwrap();
+
+        let expected = std::fs::metadata(tmp.join("config.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(crate::config::config_mtime(&tmp), Some(expected));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_mtime_changes_when_file_is_touched() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_mtime_touch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), "{}").unwrap();
+        let first = crate::config::config_mtime(&tmp);
+        assert!(first.is_some());
+
+        // Force a visibly later mtime regardless of filesystem timestamp
+        // resolution (some filesystems only track whole seconds).
+        let later = first.unwrap() + std::time::Duration::from_secs(2);
+        let f = std::fs::File::open(tmp.join("config.json")).unwrap();
+        f.set_modified(later).unwrap();
+
+        assert_eq!(crate::config::config_mtime(&tmp), Some(later));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -50,9 +50,7 @@ impl CalmServer {
             // Best-effort: capture which real files this note references, so
             // a later `recall` can tell if they've changed since — a failure
             // here shouldn't fail the note itself, which is already saved.
-            let ignore_patterns = calm_core::config::load_config(&self.project_root)
-                .map(|c| c.ignore)
-                .unwrap_or_default();
+            let ignore_patterns = self.config().ignore;
             let refs = calm_core::memory::capture_refs(&self.project_root, &ignore_patterns, content);
             let refs_captured = refs.len();
             if let Err(e) = calm_core::memory::store_refs(&conn, topic, &refs) {

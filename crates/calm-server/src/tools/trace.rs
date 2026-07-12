@@ -37,7 +37,7 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+            let config = self.config();
 
             let all: Vec<CallerEntry> = {
                 let mut stmt = match conn.prepare(
@@ -216,7 +216,7 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+            let config = self.config();
 
             let all: Vec<CalleeEntry> = {
                 let mut stmt = match conn.prepare(
@@ -352,9 +352,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
-            let dep_config = calm_core::config::load_config(&self.project_root)
-                .map(|c| c.dependencies)
-                .unwrap_or_default();
+            let dep_config = self.config().dependencies;
 
             let mut stmt_imports = match conn.prepare(
                 "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
@@ -548,9 +546,7 @@ impl CalmServer {
             self.track_symbol(&to.qualified_name);
             self.track_file(&to.path);
 
-            let path_config = calm_core::config::load_config(&self.project_root)
-                .unwrap_or_default()
-                .path;
+            let path_config = self.config().path;
 
             let requested_hops = p.max_hops.unwrap_or(path_config.default_max_hops as i64);
             let hops_clamped = !(0..=path_config.max_allowed_hops as i64).contains(&requested_hops);

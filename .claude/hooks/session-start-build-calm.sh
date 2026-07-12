@@ -34,7 +34,9 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 # Resolve any unresolved Git LFS pointer stubs (assets/potion-code-16m/* —
-# the vendored embedding model — and .calm-bin/**/calm) BEFORE building. Real
+# the vendored embedding model; this used to also cover .calm-bin/**/calm,
+# retired 2026-07-12 in favor of a GitHub Release download — see
+# mcp-launcher.sh's tier 1.5) BEFORE building. Real
 # incident this guards against: a checkout without git-lfs installed leaves
 # ~130-byte pointer text in place of real file content; `cargo build` still
 # succeeds (it just bakes that pointer text into the binary via

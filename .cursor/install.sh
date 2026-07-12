@@ -10,16 +10,22 @@
 # dial attempt can lose, marking the "calm" server failed for that session.
 # Prebuilding here means the launcher's fast path (already-built
 # target/release/calm) wins instead.
-set -uo pipefail
-
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-
+#
+# UPDATE (2026-07-12): `mcp-launcher.sh`'s tier 1.5 now fetches a
+# checksum-and-SHA-verified prebuilt binary from the rolling `edge` GitHub
+# Release by default — no compile needed even on a completely fresh
+# checkout with nothing cached yet. This script is kept as defense-in-depth
+# (guarantees a warm `target/release/calm` before the very first dial, no
+# network dependency at all), same as the Claude Code Setup Script — see
+# docs/cloud-environment-setup.md — but is no longer the only thing
+# standing between a fresh Background Agent and a failed first connection.
+#
 # Same defensive LFS-pull-before-build as the Claude Code Setup Script and
 # `.claude/hooks/session-start-build-calm.sh` — a checkout without git-lfs
-# leaves ~130-byte pointer stubs in place of the vendored embedding model
-# and the prebuilt .calm-bin/ binary; the build still "succeeds" either way
-# (include_bytes! just bakes whatever is on disk in), so this is worth
-# getting right before building, not after.
+# leaves a ~130-byte pointer stub in place of the vendored embedding model
+# (crates/calm-core/assets/potion-code-16m/); the build still "succeeds"
+# either way (include_bytes! just bakes whatever is on disk in), so this is
+# worth getting right before building, not after.
 if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/null; then
   if ! git lfs version >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     apt-get install -y git-lfs >/dev/null 2>&1 || true

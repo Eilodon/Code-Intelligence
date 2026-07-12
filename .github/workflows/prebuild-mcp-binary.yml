@@ -1,28 +1,39 @@
 name: Prebuild MCP binary
 
-# Keeps a ready-to-run `calm` binary committed at .calm-bin/x86_64-unknown-linux-musl/calm
-# (via Git LFS) so scripts/mcp-launcher.sh has it the instant a fresh clone
-# happens — no compile, no download, no tagged-release requirement. This is
-# what closes the Claude-Code-on-the-web cold-start race that a Setup
-# Script/SessionStart hook can only race, never structurally win — see
-# docs/cloud-environment-setup.md.
+# Publishes a ready-to-run `calm` binary to the rolling `edge` GitHub
+# Release so scripts/mcp-launcher.sh has it the instant a fresh clone
+# happens — no compile, no download-quota risk, no tagged-release
+# requirement. This is what closes the Claude-Code-on-the-web cold-start
+# race that a Setup Script/SessionStart hook can only race, never
+# structurally win — see docs/cloud-environment-setup.md.
+#
+# CORRECTION (2026-07-12): this used to commit the binary to
+# .calm-bin/x86_64-unknown-linux-musl/calm via Git LFS on every push. That
+# exhausted the GitHub account's Git LFS bandwidth budget (10 GiB/month
+# free, metered billing beyond that) — confirmed via job logs: `git lfs
+# fetch` failing repo-wide with "This repository exceeded its LFS budget"
+# across this workflow, CI, and the nightly SCIP overlay simultaneously,
+# same day. GitHub Release assets have no such limit (docs.github.com/en/
+# repositories/releasing-projects-on-github/about-releases: "no limit on
+# the total size of a release, nor bandwidth usage", only a 2GiB-per-file
+# cap) — moving off LFS onto a rolling `edge` Release removes this failure
+# mode entirely instead of just narrowing it. Audited via audit-design,
+# see docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md.
 #
 # `paths:` is an allow-list, so this only fires when something that can
 # actually change the built binary changed — Rust source, workspace deps,
-# or the workflow itself. That's also what keeps it from retriggering on
-# its own commit back to main (.calm-bin/** was never in the list, so no
-# separate paths-ignore is needed for that).
+# or the workflow itself.
 #
-# CORRECTION (2026-07-12): this used to be an unrestricted `push` trigger
-# with only `paths-ignore: ['.calm-bin/**']`, so *every* push to main —
-# docs, config, unrelated crates outside this workspace, anything — ran a
-# full `cross build --release` and re-committed/re-fetched a ~103MB LFS
-# blob. Combined with CI and the nightly SCIP overlay workflow also doing
-# `lfs: true` checkouts on every push/PR, this repo burned through its
-# GitHub account's Git LFS bandwidth budget (see the LFS-budget-exceeded
-# outage this same day: `git lfs fetch` failing repo-wide with "This
-# repository exceeded its LFS budget" across three separate workflows).
-# Narrowing the trigger doesn't undo that, but stops it recurring.
+# `concurrency:` serializes/cancels runs on this same rolling tag —
+# without it, two rapid successive pushes could race publishing to the
+# same `edge` release and leave its assets (tarball / SHA256SUMS /
+# EDGE_SHA) an inconsistent mix from two different commits mid-upload.
+# scripts/mcp-launcher.sh's own SHA + checksum verification already fails
+# safe (falls back to build-from-source) rather than exec'ing a mismatched
+# download if that ever happens, but serializing avoids hitting that path
+# unnecessarily and avoids wasted duplicate builds — cancel-in-progress is
+# safe here specifically because a superseded run's output would itself be
+# stale the moment the newer push lands.
 on:
   push:
     branches: [main]
@@ -32,16 +43,29 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/prebuild-mcp-binary.yml'
 
+concurrency:
+  group: prebuild-edge-release
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
-  build-and-commit:
+  build-and-publish:
     runs-on: ubuntu-latest
     steps:
+      # lfs: true is still required here — crates/calm-core/assets/potion-code-16m/
+      # (the vendored embedding model) is separately LFS-tracked and gets
+      # include_bytes!'d into the binary at compile time, so an unresolved
+      # pointer stub would silently bake broken embeddings into the
+      # published edge binary. This does still consume some LFS bandwidth
+      # per triggered run (now much rarer thanks to the paths: filter above)
+      # — migrating that asset off LFS too is a separate, not-yet-done
+      # follow-up (see the spec doc's "Alternatives considered" section).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           lfs: true
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -57,16 +81,34 @@ jobs:
       - name: Build
         run: cross build --release --bin calm --target x86_64-unknown-linux-musl
 
-      - name: Commit prebuilt binary
+      - name: Package, checksum, and stamp the source commit
         run: |
-          mkdir -p .calm-bin/x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/calm .calm-bin/x86_64-unknown-linux-musl/calm
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .calm-bin/x86_64-unknown-linux-musl/calm
-          if git diff --cached --quiet; then
-            echo "Binary unchanged, nothing to commit"
-            exit 0
-          fi
-          git commit -m "chore(calm-bin): update prebuilt calm binary for $(git rev-parse --short HEAD)"
-          git push
+          asset_name="calm-x86_64-unknown-linux-musl.tar.gz"
+          tar -czf "$asset_name" -C target/x86_64-unknown-linux-musl/release calm
+          sha256sum "$asset_name" > SHA256SUMS
+          # The commit this binary was built from. Deliberately just HEAD,
+          # not a path-filtered "last commit touching crates/" lookup — the
+          # paths: trigger above already guarantees HEAD is build-relevant
+          # for every run of this workflow, so no extra filtering is needed
+          # here. mcp-launcher.sh does the path-aware comparison on the
+          # client side instead (via `git diff --quiet EDGE_SHA..HEAD --
+          # crates Cargo.toml Cargo.lock`), which is what correctly treats
+          # a docs/config-only commit stacked on top of EDGE_SHA as still
+          # fresh, without this side needing to duplicate that logic.
+          git rev-parse HEAD > EDGE_SHA
+
+      - name: Publish edge release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: edge
+          name: "edge (rolling — mcp-launcher.sh cold-start cache, not for direct use)"
+          body: >
+            Rolling prebuilt binary consumed by scripts/mcp-launcher.sh's
+            cold-start fast path. Republished on every push to main that
+            touches crates/, Cargo.toml, or Cargo.lock. Not a stable
+            release — see the versioned releases for anything else.
+          prerelease: true
+          files: |
+            calm-x86_64-unknown-linux-musl.tar.gz
+            SHA256SUMS
+            EDGE_SHA

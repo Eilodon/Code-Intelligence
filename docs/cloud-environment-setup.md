@@ -31,38 +31,62 @@ of this repo's setup relied on that hook alone and believed it had fixed
 the problem; it hadn't — it had just usually won the race, until a session
 where it didn't.
 
-## A stronger layer: a binary already sitting in the checkout
+## The primary fix: a binary already fetchable the instant a checkout happens
 
-Everything below this point (Setup Script, `MCP_TIMEOUT`) works by trying
-to *win* a race against the MCP client's dial attempt. There's a way to
-avoid the race entirely: `.calm-bin/x86_64-unknown-linux-musl/calm`, a
-prebuilt binary committed to the repo via Git LFS and kept current by
-[`.github/workflows/prebuild-mcp-binary.yml`](../.github/workflows/prebuild-mcp-binary.yml)
-on every push to `main`. `scripts/mcp-launcher.sh` execs it directly
-(subject to the same `is_binary_fresh` staleness check as a local
-`target/debug/calm`) — if it's there, there is no compile step for the MCP
-dial to race against, because the checkout itself (which necessarily
-completes before Claude Code can even read `.mcp.json`) already contains a
-working binary.
+**UPDATE (2026-07-12):** this section used to describe `.calm-bin/`, a
+binary committed straight into the repo via Git LFS. That approach
+exhausted the GitHub account's Git LFS bandwidth budget (confirmed via
+GitHub Actions job logs: `git lfs fetch` failing repo-wide with "This
+repository exceeded its LFS budget", breaking CI, this binary's own
+prebuild workflow, and the nightly SCIP overlay simultaneously on the same
+day), and indirectly caused a prior AI session to mistake an unresolved LFS
+pointer stub for a stale artifact and delete the safety net from `main`
+entirely. See
+[`docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md`](superskills/specs/2026-07-12-edge-release-binary-distribution.md)
+for the full incident writeup and design audit.
 
-**This is not a certainty, only a strong improvement**, for two concrete
-reasons:
+The binary now lives on a rolling `edge` GitHub Release instead — published
+by [`.github/workflows/prebuild-mcp-binary.yml`](../.github/workflows/prebuild-mcp-binary.yml)
+on every push to `main` that touches `crates/**`, `Cargo.toml`, or
+`Cargo.lock`. `scripts/mcp-launcher.sh`'s tier 1.5 fetches it, verifies it
+against the current source tree by exact commit match (`git diff --quiet`
+against the published `EDGE_SHA` for the build-relevant paths — not an
+approximate version string), and execs it — all with **no manual
+configuration in any environment**, unlike everything below this point,
+which requires a per-environment UI step. GitHub Release assets have no
+bandwidth/storage quota (confirmed against docs.github.com: "no limit on
+the total size of a release, nor bandwidth usage"), so this is a permanent
+removal of the original failure mode, not a bigger version of the same
+constraint. Cached locally after first verification, so steady-state
+sessions in an already-used environment need no network call at all.
 
-- It depends on the cloud checkout mechanism actually resolving the Git
-  LFS pointer to real content (running the smudge filter) rather than
-  leaving a ~130-byte text stub in place. `scripts/mcp-launcher.sh` detects
-  an unresolved pointer and falls through safely instead of crashing (see
-  `is_lfs_pointer`'s comment for why that needed an explicit check — a
-  plain `exec` on a pointer stub does *not* fail gracefully), but a
-  fallthrough here still means you're back to racing the Setup Script
-  against a cold build.
+**This closes the race for every MCP client (Claude Code local or on the
+web, Cursor, VS Code, anything else pointed at `mcp-launcher.sh`) without
+anyone needing to know a Setup Script UI exists** — directly unlike a
+Setup Script, which is cloud-environment-specific, manually configured,
+and undiscoverable unless someone already knows to look for it. This is
+why the Setup Script below is now optional defense-in-depth rather than
+the primary fix.
+
+**Two residual gaps, both fail safe (fall through to compiling, not to a
+broken binary):**
+
+- A commit newer than the last published `edge` release (build still in
+  flight, or the triggering push didn't touch `crates/**`) has no matching
+  edge asset yet — falls through to tiers below, same as before.
 - It only covers `x86_64-unknown-linux-musl` today. A different sandbox
   architecture falls through to the tiers below, unaffected either way.
 
-Keep the Setup Script below as defense-in-depth regardless — it's the only
-one of the two that's a guaranteed fix rather than a "very likely" one.
+## Optional extra defense-in-depth: a Cloud environment Setup Script
 
-## The actual fix: a Cloud environment Setup Script
+With the `edge` release tier above, this is **no longer required** for the
+common case — kept here for environments that want a zero-network-dependency
+guarantee (the Setup Script runs before Claude Code launches at all, so it
+never has to race anything, network included) or as a second layer in case
+the `edge` tier's assumptions don't hold for a given sandbox (e.g. outbound
+HTTPS to `objects.githubusercontent.com` specifically — the actual redirect
+target for release asset downloads, not `github.com` itself — is blocked by
+a restrictive network policy).
 
 Setup Scripts and `SessionStart` hooks look similar but solve different
 problems:
@@ -98,9 +122,9 @@ backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 # Resolve Git LFS assets BEFORE building — a checkout without git-lfs
-# installed leaves ~130-byte pointer stubs in place of the vendored
-# embedding model (crates/calm-core/assets/potion-code-16m/) and the prebuilt
-# .calm-bin/ binary. The build still "succeeds" either way (include_bytes!
+# installed leaves a ~130-byte pointer stub in place of the vendored
+# embedding model (crates/calm-core/assets/potion-code-16m/). The build
+# still "succeeds" either way (include_bytes!
 # just bakes whatever is on disk into the binary) — this is a real incident,
 # not a hypothetical: it silently degrades semantic search to
 # embeddings_status: "failed" at runtime instead of failing the build
@@ -166,14 +190,17 @@ MCP_TIMEOUT=120000
 ```
 
 This is optional defense-in-depth (matters mainly for the very first
-session before any cache exists, or right after the ~7-day cache expiry)
-— the Setup Script is what actually fixes the steady state.
+session before any cache exists, or right after the ~7-day cache expiry) —
+the `edge` release tier above is what fixes the steady state without any
+manual configuration at all; this and the Setup Script are both extra
+margin on top of it.
 
 ## What's already handled in this repo (defense in depth, not a substitute)
 
-- `.calm-bin/x86_64-unknown-linux-musl/calm` — see the section above. The one
-  layer that can eliminate the race outright rather than just narrowing it,
-  when it applies.
+- The `edge` GitHub Release tier in `scripts/mcp-launcher.sh` — see the
+  section above. The layer that eliminates the race outright rather than
+  just narrowing it, when it applies, with zero manual configuration
+  required in any environment.
 - `scripts/mcp-launcher.sh` — `.mcp.json`'s actual entrypoint now (shared
   across every MCP client, not just Claude Code; see
   `docs/mcp-client-setup.md`). Execs an already-cached binary directly if

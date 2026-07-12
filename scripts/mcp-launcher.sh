@@ -6,38 +6,57 @@
 #
 # Resolution order (first usable binary wins, no exceptions):
 #   1. Fast path   — an already-usable binary: $CI_MCP_BIN override, a
-#                     cached verified download, a local dev build
-#                     (target/release/calm, target/debug/calm), or a prebuilt
-#                     binary committed to .calm-bin/ via Git LFS — the dev
-#                     build and .calm-bin candidates are only trusted if
-#                     `is_binary_fresh` says they're at least as new as
-#                     every source file (see that function's comment for
-#                     the incident this guards against: a stale
-#                     target/debug/calm silently served an entire MCP session
-#                     because nothing checked it against the checked-out
-#                     source before exec'ing it).
+#                     cached verified download, or a local dev build
+#                     (target/release/calm, target/debug/calm) — the dev
+#                     build is only trusted if `is_binary_fresh` says it's
+#                     at least as new as every source file (see that
+#                     function's comment for the incident this guards
+#                     against: a stale target/debug/calm silently served an
+#                     entire MCP session because nothing checked it against
+#                     the checked-out source before exec'ing it).
 #                     $CI_MCP_BIN and the cached download are NOT freshness-
 #                     checked here — one is an explicit override (the caller
 #                     is asserting "use exactly this"), the other is an
 #                     immutable, checksum-verified artifact for an exact
 #                     tagged commit (its own consistency check is the tag
 #                     match + `--version` check in download_and_verify).
-#                     .calm-bin/ closes the exact cold-start race
+#   1.5. Rolling edge release — a prebuilt binary published to the `edge`
+#                     GitHub Release (not committed to the repo at all —
+#                     see the 2026-07-12 correction below) on every push to
+#                     main that touches crates/Cargo.toml/Cargo.lock.
+#                     Closes the exact cold-start race
 #                     docs/cloud-environment-setup.md documents for Claude
 #                     Code on the web: a Setup Script or SessionStart hook
 #                     can only race a cold `cargo build` against the MCP
-#                     client's dial attempt, but a binary already sitting in
-#                     the checkout the instant it's cloned has no race to
-#                     lose. Built by .github/workflows/prebuild-mcp-binary.yml
-#                     on every push to main; may lag HEAD by one commit,
-#                     which `is_binary_fresh` catches the same way it catches
-#                     a stale local dev build. Only covers
-#                     x86_64-unknown-linux-musl today. Also guarded against
-#                     an unresolved Git LFS pointer (git-lfs not installed,
-#                     or a checkout that skipped the smudge filter) — see
-#                     `is_lfs_pointer`'s comment for why that specific
-#                     failure mode needs an explicit check instead of
-#                     falling through on its own.
+#                     client's dial attempt, but a binary already fetchable
+#                     the instant a fresh clone happens has no race to lose.
+#                     Verified by exact source-tree match (`tree_matches_edge_sha`
+#                     — a `git diff --quiet` against the published EDGE_SHA
+#                     for crates/Cargo.toml/Cargo.lock, not an approximate
+#                     version string), so this is safe to leave enabled by
+#                     default for every environment — unlike tier 2's
+#                     opt-in-only latest-release fallback, there's no
+#                     staleness risk to opt out of. Cached locally after
+#                     first verification, so steady-state sessions in the
+#                     same environment need zero network calls at all. Only
+#                     covers x86_64-unknown-linux-musl today.
+#
+#                     CORRECTION (2026-07-12): this used to be
+#                     `.calm-bin/x86_64-unknown-linux-musl/calm`, a binary
+#                     committed straight into the repo via Git LFS. That
+#                     exhausted the GitHub account's Git LFS bandwidth
+#                     budget (confirmed via job logs: "This repository
+#                     exceeded its LFS budget", breaking CI, this binary's
+#                     own prebuild workflow, and the nightly SCIP overlay
+#                     simultaneously), and indirectly caused a prior AI
+#                     session to mistake an unresolved LFS pointer stub for
+#                     a stale artifact and delete it from main. GitHub
+#                     Release assets have no such quota (docs.github.com:
+#                     "no limit on the total size of a release, nor
+#                     bandwidth usage") — moving to a Release removes this
+#                     failure mode entirely rather than narrowing it. See
+#                     docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md
+#                     for the full audit-design writeup.
 #   2. Verified download — Linux x86_64/aarch64 only, and only when HEAD is
 #                     exactly a released git tag (never guesses a version).
 #                     Downloads the matching GitHub Release asset, verifies
@@ -47,7 +66,14 @@
 #                     to build-from-source — a failed/mismatched download
 #                     never gets executed, but it also never becomes a dead
 #                     end (see docs/mcp-client-setup.md for why fallback was
-#                     chosen over a hard failure here).
+#                     chosen over a hard failure here). Every network call
+#                     in this tier and tier 1.5 carries an explicit
+#                     `--connect-timeout`/`--max-time` — added 2026-07-12
+#                     after audit-design flagged that a hang here (this
+#                     script had none before) would be worse than today's
+#                     straight-to-compile fallback, especially now that
+#                     tier 1.5 makes a network attempt the default path for
+#                     every fresh clone rather than an opt-in edge case.
 #   3. Build from source — `cargo build -p calm-cli`, always available as
 #                     long as a Rust toolchain is present. This is the only
 #                     path for non-Linux platforms, untagged dev checkouts,
@@ -164,8 +190,11 @@ is_binary_fresh() {
 # script, which runs (and errors on "version: command not found") INSTEAD
 # OF returning control to this script — verified directly against a
 # synthetic pointer stub, not assumed. Without this check, an unresolved
-# .calm-bin/ pointer would crash the whole launcher instead of falling
-# through to the next tier.
+# LFS pointer sitting where a real binary was expected would crash the
+# whole launcher instead of falling through to the next tier — matters
+# less now that tier 1.5 no longer uses LFS at all (see the 2026-07-12
+# correction above), but target/release and target/debug are still local
+# artifacts checked here, so this stays as defense-in-depth.
 is_lfs_pointer() {
   [ "$(head -c 7 -- "$1" 2>/dev/null)" = "version" ]
 }
@@ -194,10 +223,61 @@ cache_key="${resolved_tag:-$workspace_version}"
 try_exec_if_fresh "target/release/calm"
 try_exec_if_fresh "target/debug/calm"
 
-# ---- Tier 1.5: prebuilt binary committed via Git LFS (see header) ----
+# ---- Tier 1.5: rolling edge release (see header) ----
 # Only the one platform .github/workflows/prebuild-mcp-binary.yml builds.
-if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
-  try_exec_if_fresh ".calm-bin/x86_64-unknown-linux-musl/calm"
+EDGE_CACHE_DIR="${CACHE_ROOT}/edge"
+
+# True if a binary verified against $1 (a commit SHA) is still safe to use
+# for the current checkout — i.e. no commit between $1 and HEAD touched
+# anything that could change the built binary. Uses `git diff` against the
+# actual tree instead of independently re-deriving "the last commit that
+# touched these paths" on both the publish and check sides, so a
+# docs/config-only commit stacked on top of $1 still counts as fresh
+# without those two derivations ever risking disagreeing with each other.
+# Object-existence is checked first so a shallow clone that never fetched
+# $1 degrades to "can't verify" (falls through to the next tier) instead of
+# an ambiguous git error.
+tree_matches_edge_sha() {
+  local edge_sha="$1"
+  [ -n "$edge_sha" ] || return 1
+  git cat-file -e "${edge_sha}^{commit}" 2>/dev/null || return 1
+  git diff --quiet "$edge_sha" HEAD -- crates Cargo.toml Cargo.lock 2>/dev/null
+}
+
+if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] && [ -d crates ]; then
+  cached_edge_sha=""
+  [ -f "${EDGE_CACHE_DIR}/verified_sha" ] && cached_edge_sha=$(cat "${EDGE_CACHE_DIR}/verified_sha" 2>/dev/null)
+  if [ -x "${EDGE_CACHE_DIR}/calm" ] && tree_matches_edge_sha "$cached_edge_sha"; then
+    # Already verified in a previous session against a tree state that
+    # still matches — zero network calls needed.
+    try_exec "${EDGE_CACHE_DIR}/calm"
+  elif command -v curl >/dev/null 2>&1; then
+    edge_url="${BASE_URL}/releases/download/edge"
+    edge_tmp=$(mktemp -d) || edge_tmp=""
+    if [ -n "$edge_tmp" ]; then
+      if curl -fsSL --connect-timeout 5 --max-time 30 -o "${edge_tmp}/EDGE_SHA" "${edge_url}/EDGE_SHA" \
+        && curl -fsSL --connect-timeout 5 --max-time 30 -o "${edge_tmp}/SHA256SUMS" "${edge_url}/SHA256SUMS" \
+        && curl -fsSL --connect-timeout 5 --max-time 120 -o "${edge_tmp}/calm-x86_64-unknown-linux-musl.tar.gz" "${edge_url}/calm-x86_64-unknown-linux-musl.tar.gz"; then
+        downloaded_edge_sha=$(tr -d '[:space:]' <"${edge_tmp}/EDGE_SHA")
+        if tree_matches_edge_sha "$downloaded_edge_sha" \
+          && (cd "$edge_tmp" && grep ' calm-x86_64-unknown-linux-musl.tar.gz$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1) \
+          && tar -xzf "${edge_tmp}/calm-x86_64-unknown-linux-musl.tar.gz" -C "$edge_tmp" calm; then
+          mkdir -p "$EDGE_CACHE_DIR"
+          mv "${edge_tmp}/calm" "${EDGE_CACHE_DIR}/calm"
+          chmod +x "${EDGE_CACHE_DIR}/calm"
+          printf '%s' "$downloaded_edge_sha" >"${EDGE_CACHE_DIR}/verified_sha"
+          rm -rf "$edge_tmp"
+          try_exec "${EDGE_CACHE_DIR}/calm"
+        else
+          log "downloaded edge release didn't verify against the current source tree — building from source"
+          rm -rf "$edge_tmp"
+        fi
+      else
+        log "edge release download failed or timed out — building from source"
+        rm -rf "$edge_tmp"
+      fi
+    fi
+  fi
 fi
 
 # ---- Tier 2: verified download (Linux only, tagged commit only unless opted in) ----
@@ -228,7 +308,7 @@ download_and_verify() {
   if [ -n "$resolved_tag" ]; then
     tag="$resolved_tag"
   elif [ "${CI_MCP_LAUNCHER_ALLOW_LATEST:-0}" = "1" ]; then
-    tag=$(curl -sS -o /dev/null -w '%{redirect_url}' "${BASE_URL}/releases/latest" | sed 's#.*/##')
+    tag=$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{redirect_url}' "${BASE_URL}/releases/latest" | sed 's#.*/##')
     if [ -z "$tag" ]; then
       log "could not resolve the latest release tag — building from source"
       return 1
@@ -246,12 +326,12 @@ download_and_verify() {
   tmp_dir=$(mktemp -d) || return 1
   trap 'rm -rf "$tmp_dir"' RETURN
 
-  if ! curl -sSL -o "${tmp_dir}/${asset_name}" "$asset_url"; then
-    log "download failed for ${asset_url} — building from source"
+  if ! curl -sSL --connect-timeout 5 --max-time 120 -o "${tmp_dir}/${asset_name}" "$asset_url"; then
+    log "download failed or timed out for ${asset_url} — building from source"
     return 1
   fi
-  if ! curl -sSL -o "${tmp_dir}/SHA256SUMS" "$sums_url"; then
-    log "download failed for ${sums_url} — building from source"
+  if ! curl -sSL --connect-timeout 5 --max-time 30 -o "${tmp_dir}/SHA256SUMS" "$sums_url"; then
+    log "download failed or timed out for ${sums_url} — building from source"
     return 1
   fi
 

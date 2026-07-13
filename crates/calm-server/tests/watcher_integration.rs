@@ -63,7 +63,14 @@ fn watcher_reindexes_add_and_delete() {
             calm_core::analysis::coverage::CoverageData::none(),
         ));
         std::thread::spawn(move || {
-            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+            calm_server::watcher::run_watch_loop(
+                root,
+                db,
+                ct,
+                embedder,
+                coverage,
+                std::sync::Arc::new(std::sync::RwLock::new(None)),
+            )
         })
     };
 
@@ -132,7 +139,14 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
             calm_core::analysis::coverage::CoverageData::none(),
         ));
         std::thread::spawn(move || {
-            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+            calm_server::watcher::run_watch_loop(
+                root,
+                db,
+                ct,
+                embedder,
+                coverage,
+                std::sync::Arc::new(std::sync::RwLock::new(None)),
+            )
         })
     };
     std::thread::sleep(Duration::from_millis(400));
@@ -237,7 +251,14 @@ fn watcher_hot_reloads_coverage_file_change() {
         let embedder: calm_server::EmbedderHandle =
             std::sync::Arc::new(std::sync::RwLock::new(None));
         std::thread::spawn(move || {
-            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+            calm_server::watcher::run_watch_loop(
+                root,
+                db,
+                ct,
+                embedder,
+                coverage,
+                std::sync::Arc::new(std::sync::RwLock::new(None)),
+            )
         })
     };
 

@@ -94,6 +94,7 @@ impl CalmServer {
                 embeddings_error,
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
+                graph_mode: self.last_graph_mode.read_ok().clone(),
                 scip_overlay,
                 scip_overlays,
                 suggested_next: self.filter_sn(sn),
@@ -459,6 +460,14 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) edges_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_updated: Option<String>,
+    /// Which graph-rebuild path the most recent non-noop reindex took:
+    /// `"full"`, `"incremental"`, or `"full_fallback:<reason>"` (Phase B
+    /// L6 — `GraphMode::label`). Absent until this process has served one
+    /// non-noop reindex (edit tool or file watcher). Lets an agent confirm
+    /// the incremental path is actually engaged rather than silently
+    /// falling back to full rebuilds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) graph_mode: Option<String>,
     /// `None` when this build wasn't compiled with the `scip-overlay` feature,
     /// or `rust.scip.enabled` is explicitly `false` — nothing to report.
     /// Otherwise reflects whether Rust call edges are currently up to date

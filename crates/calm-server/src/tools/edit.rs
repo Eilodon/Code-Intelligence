@@ -671,12 +671,29 @@ impl CalmServer {
         match calm_core::db::conn::open_writer(&self.db_path) {
             Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
             Ok(mut write_conn) => {
-                match calm_core::indexer::pipeline::reindex_paths(
+                let reindex_start = std::time::Instant::now();
+                let reindex_result = calm_core::indexer::pipeline::reindex_paths(
                     &mut write_conn,
                     &self.project_root,
                     &[path.to_string()],
-                ) {
+                );
+                match reindex_result {
                     Ok(summary) if !summary.is_noop() => {
+                        // Phase B T6.5: record which rebuild path this edit's
+                        // reindex took (surfaced by indexing_status.graph_mode)
+                        // and log the reindex+graph duration on its own — the
+                        // acceptance number the plan tracks ("reindex+graph <
+                        // 150ms"), isolated here from the surrounding
+                        // write/lock/serialize cost that timed_tool's overall
+                        // duration_ms folds in.
+                        let mode = summary.graph_mode.label();
+                        *self.last_graph_mode.write_ok() = Some(mode.clone());
+                        tracing::info!(
+                            reindex_ms = reindex_start.elapsed().as_millis(),
+                            graph_mode = %mode,
+                            path = %path,
+                            "edit_reindex_completed"
+                        );
                         // Embedding moved out of this lock-held section (Plan 3
                         // §3.1 Phase C) — the reindex above already committed the
                         // DB write, so correctness doesn't depend on embedding

@@ -162,6 +162,20 @@ pub enum GraphMode {
     FullFallback(String),
 }
 
+impl GraphMode {
+    /// Stable, machine-parseable label for `indexing_status.graph_mode` and
+    /// log lines (plan L6): `"full"`, `"incremental"`, or
+    /// `"full_fallback:<reason>"`. Only the prefix before `:` is meant to be
+    /// matched on — the reason tail is human diagnostics.
+    pub fn label(&self) -> String {
+        match self {
+            GraphMode::Full => "full".to_string(),
+            GraphMode::Incremental => "incremental".to_string(),
+            GraphMode::FullFallback(reason) => format!("full_fallback:{reason}"),
+        }
+    }
+}
+
 /// Result of an incremental reindex pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReindexSummary {
@@ -2075,10 +2089,11 @@ pub fn reindex_changed_cancellable(
 ///
 /// A path no longer present on disk is treated as a deletion. A path whose
 /// content hash is unchanged from `file_index` is skipped entirely — no
-/// parse, no graph touch. Still calls `rebuild_graph` (the existing full
-/// call-graph rebuild) when anything actually changed; Phase B replaces
-/// that with an incremental update — this phase's win is purely skipping
-/// the O(repo size) walk+hash on every edit, independent of Phase B.
+/// parse, no graph touch. When anything actually changed it updates the
+/// call graph via `incremental_graph_update` (scoped re-resolve) when
+/// `indexing.incremental_graph` is set, else the full `rebuild_graph` sweep
+/// (Phase B T4) — this dirty-path entry's own win is skipping the O(repo
+/// size) walk+hash every edit, independent of which graph path then runs.
 pub fn reindex_paths(
     conn: &mut Connection,
     project_root: &Path,
@@ -2206,6 +2221,18 @@ mod tests {
     use crate::db::schema::init_db;
     use crate::types::IndexingPhase;
 
+    #[test]
+    fn graph_mode_label_strings() {
+        // Contract shared by indexing_status.graph_mode, the watcher log, and
+        // edit_reindex_completed (Phase B T6.5) — only the prefix before `:`
+        // is meant to be matched on.
+        assert_eq!(GraphMode::Full.label(), "full");
+        assert_eq!(GraphMode::Incremental.label(), "incremental");
+        assert_eq!(
+            GraphMode::FullFallback("delta_paths.len()=51 > 50".to_string()).label(),
+            "full_fallback:delta_paths.len()=51 > 50"
+        );
+    }
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }

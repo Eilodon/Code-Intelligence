@@ -76,6 +76,7 @@ impl CalmServer {
             db_path,
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
             last_index_error: Arc::new(RwLock::new(None)),
+            last_graph_mode: Arc::new(RwLock::new(None)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             last_embed_error: Arc::new(RwLock::new(None)),
@@ -482,6 +483,12 @@ impl CalmServer {
     /// when `phase` transitions to `Failed` (see `IndexingPhase::Failed`).
     pub fn last_index_error_handle(&self) -> Arc<RwLock<Option<String>>> {
         Arc::clone(&self.last_index_error)
+    }
+    /// Shared handle to `last_graph_mode` so the file watcher (which has no
+    /// `CalmServer`) can record which rebuild path each incremental reindex
+    /// took — mirrors `last_index_error_handle`. See `run_watch_loop`.
+    pub fn last_graph_mode_handle(&self) -> Arc<RwLock<Option<String>>> {
+        Arc::clone(&self.last_graph_mode)
     }
     /// Handles the background indexer uses to publish the loaded model + status.
     pub fn embedder_handle(&self) -> Arc<RwLock<Option<Arc<Embedder>>>> {

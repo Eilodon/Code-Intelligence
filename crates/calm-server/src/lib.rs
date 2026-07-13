@@ -152,6 +152,9 @@ pub async fn bootstrap(
     let coverage = server.coverage_handle();
     let watch_embedder = embedder.clone();
     let watch_coverage = coverage.clone();
+    // Phase B T6.5: the watcher records which rebuild path each incremental
+    // reindex took into the same shared slot indexing_status reads.
+    let watch_graph_mode = server.last_graph_mode_handle();
     // Kept outside the `spawn_blocking` closure below so a panic there (caught
     // via the awaited `JoinHandle`) still has a handle to report through —
     // `phase`/`last_index_error` themselves are moved into that closure.
@@ -396,6 +399,7 @@ pub async fn bootstrap(
                 watch_ct,
                 watch_embedder,
                 watch_coverage,
+                watch_graph_mode,
             );
         });
         // Await (rather than discard) the indexer thread's handle so a panic

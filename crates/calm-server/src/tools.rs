@@ -226,6 +226,14 @@ pub struct CalmServer {
     /// incremental reindex), if `phase` is currently `Failed`. Cleared
     /// (set back to `None`) whenever a run completes successfully.
     last_index_error: Arc<RwLock<Option<String>>>,
+    /// Label of the graph-rebuild path (`full` / `incremental` /
+    /// `full_fallback:<reason>`) the most recent non-noop reindex took —
+    /// written by both the edit path (`edit_lines_impl`) and the file
+    /// watcher, read by `indexing_status.graph_mode` (Phase B L6). `None`
+    /// until the first non-noop reindex this process serves. Shared `Arc`
+    /// like `last_index_error`, so every `for_connection` clone reports the
+    /// same latest value.
+    last_graph_mode: Arc<RwLock<Option<String>>>,
     /// Loaded embedding model (None until/unless embeddings are enabled+ready),
     /// shared with the background indexer that loads it.
     embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
@@ -4945,6 +4953,27 @@ mod tests {
     /// on the old `String`-returning tools, without the string round-trip.
     fn jv<T: Serialize>(result: Json<T>) -> serde_json::Value {
         serde_json::to_value(result.0).unwrap()
+    }
+
+    #[test]
+    fn indexing_status_surfaces_graph_mode_after_reindex() {
+        // Phase B T6.5: the field is absent until a non-noop reindex records
+        // a path, then reflects the last one — the signal an agent uses to
+        // confirm incremental is engaged (vs silently falling back to full).
+        let (dir, server) = test_server("indexing_status_graph_mode");
+        let before = jv(server.indexing_status(Parameters(IndexingStatusParams {
+            retry_embeddings: false,
+        })));
+        assert!(
+            before.get("graph_mode").is_none(),
+            "graph_mode must be absent before any reindex, got {before:#}"
+        );
+        *server.last_graph_mode_handle().write().unwrap() = Some("incremental".to_string());
+        let after = jv(server.indexing_status(Parameters(IndexingStatusParams {
+            retry_embeddings: false,
+        })));
+        assert_eq!(after["graph_mode"], "incremental");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn remember_rejects_empty_topic_or_content() {

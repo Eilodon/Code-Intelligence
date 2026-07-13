@@ -74,6 +74,9 @@ pub fn run_watch_loop(
     ct: CancellationToken,
     embedder: crate::EmbedderHandle,
     coverage: crate::CoverageHandle,
+    // Phase B T6.5: shared slot indexing_status reads to report which
+    // rebuild path the most recent reindex took.
+    graph_mode: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 ) {
     let (tx, rx) = mpsc::channel();
     let mut watcher = match recommended_watcher(move |res| {
@@ -166,7 +169,10 @@ pub fn run_watch_loop(
                     Ok(calm_core::indexer::pipeline::ReindexOutcome::Completed(s))
                         if !s.is_noop() =>
                     {
+                        let mode = s.graph_mode.label();
+                        *graph_mode.write().unwrap() = Some(mode.clone());
                         tracing::info!(
+                            graph_mode = %mode,
                             "Incremental reindex: {} changed, {} deleted",
                             s.changed,
                             s.deleted

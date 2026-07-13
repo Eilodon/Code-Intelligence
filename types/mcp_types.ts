@@ -490,6 +490,10 @@ export interface IndexingStatusOutput {
     edges_indexed: number | null;
   };
   last_updated: string;
+  /** Which graph-rebuild path the most recent non-noop reindex took:
+   * "full" | "incremental" | "full_fallback:<reason>" (Phase B L6). Absent
+   * until this process has served one non-noop reindex. */
+  graph_mode?: string;
   suggested_next?: SuggestedNext;
 }
 

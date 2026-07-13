@@ -19,6 +19,18 @@ use crate::types::EdgeConfidence;
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
 
+/// Phase B plan D6: above this many `delta_paths`, `incremental_graph_update`
+/// falls back to a full `rebuild_graph` — the delta-expansion query plus a
+/// scoped-but-wide DELETE/re-resolve stops being cheaper than just doing the
+/// full pass, and full rebuild is always correct regardless.
+const MAX_INCREMENTAL_DELTA_PATHS: usize = 50;
+
+/// Chunk size for any `WHERE col IN (...)` built from a caller-sized list
+/// (`names_delta`, potentially hundreds of entries for a file with many
+/// symbols) — conservative vs. SQLite's own default `SQLITE_MAX_VARIABLE_
+/// NUMBER` of 32766 (3.32+). Phase B plan A-1.
+const DELTA_QUERY_CHUNK_SIZE: usize = 500;
+
 /// True if a symbol's stored `signature` string's return type is `Option<_>`
 /// or `Result<_, _>` (bare `Option`/`Result` too, for generic/associated-type
 /// signatures that elide the parameter). Looks at the segment after the last
@@ -1030,6 +1042,157 @@ fn rebuild_graph(
     Ok(())
 }
 
+/// Result of an `incremental_graph_update` pass — lets the caller set
+/// `ReindexSummary::graph_mode` precisely (plan T4/L6), since only this
+/// function's own delta-expansion (step 1 inside it) can know whether the
+/// fallback threshold was hit, and why.
+pub enum IncrementalOutcome {
+    Applied,
+    /// Fell back to a full `rebuild_graph` internally — already done by the
+    /// time this returns. Payload is a human-readable reason (delta size),
+    /// not matched on.
+    FellBackToFull(String),
+}
+
+/// Phase B plan §3: scoped call-graph re-resolve for exactly the files a
+/// reindex pass touched, instead of `rebuild_graph`'s full sweep. Only ever
+/// called when the caller's own `ReindexSummary` is non-noop — `delta_seed`
+/// is `ReindexSummary::changed_paths` (changed ∪ deleted rel_paths) and
+/// `names_delta` is `ReindexSummary::names_delta` (old_names ∪ new_names
+/// union across those same paths, plan D2). Shares `build_resolution_context`/
+/// `resolve_sites_to_edges` with `rebuild_graph` verbatim (plan D4) — the
+/// ONLY differences from a full rebuild are (a) which `call_sites` get
+/// loaded and (b) how much of `call_edges` gets deleted first; see plan
+/// §3.1 for the proof that `delta_paths` below is sufficient to catch every
+/// input `resolve_sites_to_edges` depends on.
+pub fn incremental_graph_update(
+    tx: &rusqlite::Transaction,
+    delta_seed: &[String],
+    names_delta: &HashSet<String>,
+    hub_config: &crate::config::HubThresholdConfig,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<IncrementalOutcome> {
+    // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
+    // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
+    // calls a renamed/added/removed name must still be re-resolved, or its
+    // stale edge survives alongside a newly-ambiguous one (audit finding
+    // L1). Chunked (plan A-1): names_delta can be arbitrarily large (every
+    // symbol name in every changed/deleted file this pass), unlike
+    // delta_paths itself, which is bounded by the fallback check below.
+    let mut delta_paths: HashSet<String> = delta_seed.iter().cloned().collect();
+    let names: Vec<&str> = names_delta.iter().map(String::as_str).collect();
+    for chunk in names.chunks(DELTA_QUERY_CHUNK_SIZE) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM call_sites WHERE callee_name IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let found = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        delta_paths.extend(found);
+    }
+
+    // Step 2 (plan D6): full rebuild is always correct; past this size the
+    // delta-expansion + scoped-DELETE overhead isn't worth it over just
+    // doing the full pass. Falls back INTERNALLY (not by returning an error
+    // for the caller to react to) so there is exactly one place that knows
+    // this decision, matching D4's one-resolver principle.
+    if delta_paths.len() > MAX_INCREMENTAL_DELTA_PATHS {
+        let reason = format!(
+            "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
+            delta_paths.len()
+        );
+        rebuild_graph(tx, hub_config, crate_map, psr4, namespace_map)?;
+        return Ok(IncrementalOutcome::FellBackToFull(reason));
+    }
+
+    // From here delta_paths.len() <= MAX_INCREMENTAL_DELTA_PATHS (50), well
+    // under any SQLite variable-count ceiling — no chunking needed for the
+    // two queries below, unlike step 1's names_delta-driven expansion.
+    let path_refs: Vec<&str> = delta_paths.iter().map(String::as_str).collect();
+    let placeholders = vec!["?"; path_refs.len()].join(",");
+
+    // Step 3 (plan D1): scoped DELETE — every edge belongs to exactly one
+    // from_path, so this partitions cleanly; scip-inserted edges with
+    // from_path ∈ delta are correctly deleted too (that file's content just
+    // changed, the background overlay will re-insert what's still true).
+    tx.execute(
+        &format!("DELETE FROM call_edges WHERE from_path IN ({placeholders})"),
+        rusqlite::params_from_iter(path_refs.iter().copied()),
+    )?;
+
+    // Step 4 (plan D5): dangling sweep, unconditional every pass — catches
+    // scip-inserted edges (no call_sites backing) whose target symbol was
+    // just deleted, which no from_path-scoped re-resolve above would ever
+    // touch.
+    tx.execute(
+        "DELETE FROM call_edges WHERE to_symbol NOT IN (SELECT qualified_name FROM symbols)",
+        [],
+    )?;
+
+    // Step 5 (plan D4): same shared resolver full rebuild uses — still one
+    // global SELECT over symbols (accepted cost, see build_resolution_context's
+    // own doc comment; scoping this too is Phase B+ backlog).
+    let ctx = build_resolution_context(tx, namespace_map)?;
+
+    // Step 6: re-resolve exactly delta_paths' sites. `ORDER BY id` matches
+    // rebuild_graph's own load (plan A-3/T2) so "first site wins" seen_pairs
+    // dedup attribution agrees between the two paths on identical input.
+    let sites: Vec<CallSiteRow> = {
+        let sql = format!(
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+                    looks_option_or_result_chained, module_hint, edge_kind \
+             FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(path_refs.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let edges = resolve_sites_to_edges(&ctx, &sites);
+    insert_call_edges_batch(tx, &edges)?;
+    // Same one-shot fact as rebuild_graph's identical UPDATE (see its own
+    // comment): a `formal` row here came from the stack-graphs upgrade
+    // already baked into `confidence` at extraction time. Global, not
+    // scoped to delta — matches plan §3 step 6, correct because rows
+    // outside delta already carry their own formal_source from a prior
+    // pass.
+    tx.execute(
+        "UPDATE call_edges SET formal_source = 'stack_graphs' \
+         WHERE edge_confidence = 'formal' AND formal_source IS NULL",
+        [],
+    )?;
+
+    // Step 7 (plan D3): identical 5 global metric passes, same order as
+    // rebuild_graph — equivalence-by-construction holds for all of them
+    // once the edge set matches, since every one is a pure function of
+    // current DB state, not of how the edges got there.
+    refresh_caller_counts(tx)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
+    crate::graph::coreness::compute_coreness(tx)?;
+    crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
+    crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
+
+    Ok(IncrementalOutcome::Applied)
+}
+
 /// Recompute every symbol's `caller_count` from `call_edges`, using the same
 /// "confirmed caller" definition as the `callers` tool's `direct_count`
 /// (`ruled_out_by_scip = 0` and not `ambiguous`-confidence): an `ambiguous`
@@ -1702,6 +1865,34 @@ fn cached_resolution_maps(
     (crate_map, psr4, namespace_map)
 }
 
+/// Phase B plan T4b: the 3 manifest filenames `cached_resolution_maps`
+/// tracks mtimes for (see its doc comment) — a standalone predicate so both
+/// `reindex_paths` and `reindex_changed_cancellable` check the same thing.
+/// Root-relative exact match only, matching that function's own
+/// `project_root.join(name)` checks — a nested workspace member's manifest
+/// doesn't affect this cache.
+fn is_manifest_path(rel: &str) -> bool {
+    matches!(rel, "Cargo.toml" | "Cargo.lock" | "composer.json")
+}
+
+/// Phase B plan T4b (Risk Abductive-1 mitigation): force-evict
+/// `project_root`'s `cached_resolution_maps` entry. Belt-and-suspenders on
+/// top of that function's own mtime comparison, which is correct only to
+/// the filesystem's mtime resolution — some filesystems round to 1s, so two
+/// edits to the same manifest inside one second would otherwise look
+/// "unchanged" and keep serving the first edit's stale maps. Called only
+/// when this pass's own `changed_paths` already proves a manifest was
+/// touched (a hard fact, not a heuristic), so an unconditional evict here is
+/// free insurance rather than a guess. A no-op if nothing has been cached
+/// yet for this `project_root`.
+fn invalidate_resolution_maps_cache(project_root: &Path) {
+    if let Some(lock) = RESOLUTION_MAPS_CACHE.get() {
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(project_root);
+    }
+}
+
 pub fn reindex_changed_cancellable(
     conn: &mut Connection,
     project_root: &Path,
@@ -1826,15 +2017,42 @@ pub fn reindex_changed_cancellable(
     }
 
     if !summary.is_noop() {
+        debug_assert!(
+            !summary.changed_paths.is_empty(),
+            "non-noop summary must have at least one changed_paths entry (Phase B plan T4 Failure Mode 3 guard)"
+        );
+        // Phase B plan T4b — see invalidate_resolution_maps_cache's doc
+        // comment for why this can't just rely on cached_resolution_maps'
+        // own mtime comparison.
+        if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
+            invalidate_resolution_maps_cache(project_root);
+        }
         let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
-        rebuild_graph(
-            &tx,
-            &config.hub_threshold,
-            &crate_map,
-            &psr4,
-            &namespace_map,
-        )?;
-        summary.graph_mode = GraphMode::Full;
+        if config.indexing.incremental_graph {
+            match incremental_graph_update(
+                &tx,
+                &summary.changed_paths,
+                &summary.names_delta,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )? {
+                IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
+                IncrementalOutcome::FellBackToFull(reason) => {
+                    summary.graph_mode = GraphMode::FullFallback(reason)
+                }
+            }
+        } else {
+            rebuild_graph(
+                &tx,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )?;
+            summary.graph_mode = GraphMode::Full;
+        }
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
@@ -1942,15 +2160,42 @@ pub fn reindex_paths(
     }
 
     if !summary.is_noop() {
+        debug_assert!(
+            !summary.changed_paths.is_empty(),
+            "non-noop summary must have at least one changed_paths entry (Phase B plan T4 Failure Mode 3 guard)"
+        );
+        // Phase B plan T4b — see invalidate_resolution_maps_cache's doc
+        // comment for why this can't just rely on cached_resolution_maps'
+        // own mtime comparison.
+        if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
+            invalidate_resolution_maps_cache(project_root);
+        }
         let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
-        rebuild_graph(
-            &tx,
-            &config.hub_threshold,
-            &crate_map,
-            &psr4,
-            &namespace_map,
-        )?;
-        summary.graph_mode = GraphMode::Full;
+        if config.indexing.incremental_graph {
+            match incremental_graph_update(
+                &tx,
+                &summary.changed_paths,
+                &summary.names_delta,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )? {
+                IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
+                IncrementalOutcome::FellBackToFull(reason) => {
+                    summary.graph_mode = GraphMode::FullFallback(reason)
+                }
+            }
+        } else {
+            rebuild_graph(
+                &tx,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )?;
+            summary.graph_mode = GraphMode::Full;
+        }
     }
     tx.commit()?;
     Ok(summary)

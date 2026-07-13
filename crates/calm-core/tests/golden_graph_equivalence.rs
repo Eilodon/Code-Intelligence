@@ -306,11 +306,28 @@ fn apply_mutation(root: &Path, m: Mutation, rng: &mut XorShift64) {
     }
 }
 
-fn run_rounds_for_seed(seed: u64) {
+fn run_rounds_for_seed(seed: u64, incremental: bool) {
     let mut rng = XorShift64::new(seed);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
     copy_dir_recursive(&fixture_root(), &root);
+    // Set the flag EXPLICITLY (never rely on the compile-time default) so
+    // this driver tests exactly one mode regardless of what
+    // `IndexingConfig::default()` currently is — T6.4 flips that default,
+    // and without this an unrelated flip would silently change what every
+    // round here compares. Written before the first index so `config.json`
+    // never appears as a changed path in a later round (same reasoning as
+    // `enable_incremental_graph`'s doc comment).
+    if incremental {
+        enable_incremental_graph(&root);
+    } else {
+        disable_incremental_graph(&root);
+    }
+    let expected_mode = if incremental {
+        GraphMode::Incremental
+    } else {
+        GraphMode::Full
+    };
 
     // DB A starts from the PRISTINE fixture so that round 0 (seed-file
     // creation) is already a real continued-vs-fresh comparison, not a
@@ -322,6 +339,10 @@ fn run_rounds_for_seed(seed: u64) {
     assert!(
         summary.changed >= 4,
         "seed files not picked up as changes: {summary:?}"
+    );
+    assert_eq!(
+        summary.graph_mode, expected_mode,
+        "seed round took the wrong graph path (seed={seed})"
     );
     let db_b = index_fresh(&root);
     assert_graph_equal(&db_a, &db_b, &format!("seed={seed} round=0 op=SeedFiles"));
@@ -353,6 +374,12 @@ fn run_rounds_for_seed(seed: u64) {
             "mutation {mutation:?} produced a no-op reindex (seed={seed} round={})",
             round + 1
         );
+        assert_eq!(
+            summary.graph_mode,
+            expected_mode,
+            "mutation {mutation:?} took the wrong graph path (seed={seed} round={})",
+            round + 1
+        );
         let db_b = index_fresh(&root);
         assert_graph_equal(
             &db_a,
@@ -362,15 +389,32 @@ fn run_rounds_for_seed(seed: u64) {
     }
 }
 
-/// 3 seeds × (1 seed-file round + 5 mutation rounds), every round comparing
-/// the continued DB against a from-scratch index — 18 full comparisons. The
-/// "Done when" bar of 3 consecutive green runs maps onto the 3 seeds here
-/// plus CI re-runs; a failure message always carries (seed, round, op) for
-/// exact reproduction.
+/// FULL-vs-full harness sanity: continued index (full `rebuild_graph`) vs
+/// from-scratch index across 3 seeds × (1 seed-file round + 5 mutation
+/// rounds) = 18 comparisons. Proves the fingerprint harness and pipeline
+/// determinism (A-3/A-4) independently of the incremental path — the flag is
+/// forced OFF here regardless of the compile-time default, so a future
+/// default flip can't silently turn this into an incremental test.
 #[test]
 fn golden_equivalence_continued_vs_fresh_across_mutation_rounds() {
     for seed in [1u64, 2, 3] {
-        run_rounds_for_seed(seed);
+        run_rounds_for_seed(seed, false);
+    }
+}
+
+/// INCREMENTAL-vs-full golden equivalence: identical 18 comparisons, but the
+/// continued side runs `incremental_graph_update` (flag forced ON) while the
+/// reference side is always a full from-scratch rebuild. The permanent,
+/// CI-resident form of the plan's "golden 5-vòng xanh" bar (Phase B §4
+/// Done-when): any delta-selection bug that lets a stale edge survive, or
+/// drops one it shouldn't, surfaces as a fingerprint mismatch tagged with the
+/// exact (seed, round, op). Overlay-free by construction (`index_fresh` runs
+/// neither embeddings nor SCIP), the only state on which incremental == full
+/// holds exactly (plan D7).
+#[test]
+fn golden_equivalence_incremental_vs_fresh_across_mutation_rounds() {
+    for seed in [1u64, 2, 3] {
+        run_rounds_for_seed(seed, true);
     }
 }
 
@@ -910,4 +954,201 @@ fn flag_off_is_bitwise_full_rebuild() {
     let summary = reindex_continued(&mut db, &root);
     assert!(!summary.is_noop());
     assert_eq!(summary.graph_mode, GraphMode::Full);
+}
+
+/// Inverse of `enable_incremental_graph`: pins the flag OFF explicitly. Used
+/// by the full-vs-full sanity driver and `flag_off_is_bitwise_full_rebuild`
+/// so neither depends on `IndexingConfig::default()` — T6.4 flips that
+/// default to `true`, and without an explicit `false` here those tests would
+/// start exercising the incremental path (or, for the flag-off test, fail).
+fn disable_incremental_graph(root: &Path) {
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"indexing":{"incremental_graph":false}}"#,
+    )
+    .unwrap();
+}
+
+/// Repo root of the live CALM checkout this test crate lives in
+/// (`.../crates/calm-core` → `../..`). Canonicalized so `copy_repo_filtered`'s
+/// recursion starts from a real absolute path.
+fn real_repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+/// Copy `src` into `dst`, skipping every dot-directory (`.git`, `.calm`,
+/// `.codegraph`, `.venv`, ...) and known build dir — exactly the set the
+/// indexer itself never walks (`is_relevant_path` rejects any dot-prefixed
+/// component), so the copy matches what the daemon sees. Two entries make
+/// this non-optional rather than cosmetic: `.calm/index.db` is >170 MB, and
+/// `.codegraph/daemon.sock` is a unix socket `std::fs::copy` errors on
+/// (ENXIO). Only REGULAR files are copied — symlinks (some dangle, e.g.
+/// under `benchmarks/.venv`) and special files are skipped, since a
+/// `DirEntry::file_type` reports them as neither dir nor file.
+fn copy_repo_filtered(src: &Path, dst: &Path) {
+    const SKIP_DIRS: &[&str] = &[
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        "venv",
+    ];
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let ft = entry.file_type().unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_str().unwrap_or("");
+        if ft.is_dir() {
+            if name_str.starts_with('.') || SKIP_DIRS.contains(&name_str) {
+                continue;
+            }
+            copy_repo_filtered(&entry.path(), &dst.join(&name));
+        } else if ft.is_file() {
+            std::fs::copy(entry.path(), dst.join(&name)).unwrap();
+        }
+    }
+}
+
+/// T6.1 (plan §4): the golden round the whole gate hinges on — run the
+/// incremental path against a full rebuild on a copy of the ENTIRE real CALM
+/// repo, not just the small fixture. The real repo is what exercises scale:
+/// ~3k symbols and ~14k call sites form the "unchanged backdrop" while a
+/// couple of seed files drive the delta, so `build_resolution_context`'s
+/// global `by_name` map, the `names_delta` expansion query, and the
+/// cross-language resolver all run at production size. Seed names are
+/// deliberately UNIQUE (no collision with a hot repo name like `new`, whose
+/// ~740 call sites would push the delta past the 50-file fallback and defeat
+/// the Incremental assertion — plan Abductive-2 / Finding B). `#[ignore]`
+/// because it indexes the real tree several times over (seconds each); run:
+/// `cargo test -p calm-core --test golden_graph_equivalence -- --ignored`.
+#[test]
+#[ignore = "heavy: copies + indexes the whole real CALM repo several times; Phase B T6 gate, run with --ignored"]
+fn golden_equivalence_incremental_vs_fresh_on_real_calm_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("calm");
+    copy_repo_filtered(&real_repo_root(), &root);
+    enable_incremental_graph(&root);
+
+    // Seed files under a real crate's src/ so they index as Rust against the
+    // full real symbol table. Two cross-calling functions with repo-unique
+    // names: the delta touches a genuine intra-seed edge plus (after the
+    // rename round) an untouched caller in the victim file.
+    let seed_dir = root.join("crates/calm-core/src");
+    let seed = seed_dir.join("phase_b_t6_seed.rs");
+    std::fs::write(
+        &seed,
+        "pub fn phase_b_t6_alpha() -> String {\n    phase_b_t6_helper()\n}\npub fn phase_b_t6_helper() -> String {\n    String::from(\"v1\")\n}\n",
+    )
+    .unwrap();
+    let victim = seed_dir.join("phase_b_t6_victim.rs");
+    std::fs::write(
+        &victim,
+        "pub fn phase_b_t6_victim() -> String {\n    phase_b_t6_helper()\n}\n",
+    )
+    .unwrap();
+
+    let mut db_a = index_fresh(&root);
+    // Determinism at real scale (A-4): a from-scratch index of the identical
+    // tree must fingerprint-match, or there is a pre-existing nondeterminism
+    // to fix before trusting any incremental comparison.
+    assert_graph_equal(
+        &db_a,
+        &index_fresh(&root),
+        "real-repo baseline: fresh vs fresh",
+    );
+
+    let reindex = |db: &mut Connection, rel: &str| -> GraphMode {
+        let summary = pipeline::reindex_paths(db, &root, &[rel.to_string()]).unwrap();
+        assert!(!summary.is_noop(), "expected a real change for {rel}");
+        summary.graph_mode
+    };
+
+    // Round 1 — body-only edit (name unchanged).
+    std::fs::write(
+        &seed,
+        "pub fn phase_b_t6_alpha() -> String {\n    phase_b_t6_helper()\n}\npub fn phase_b_t6_helper() -> String {\n    String::from(\"v2\")\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        reindex(&mut db_a, "crates/calm-core/src/phase_b_t6_seed.rs"),
+        GraphMode::Incremental,
+        "body edit of a repo-unique-named file must run incremental, not fall back"
+    );
+    assert_graph_equal(&db_a, &index_fresh(&root), "real-repo round=1 op=BodyEdit");
+
+    // Round 2 — rename the helper; the untouched victim file's call to the
+    // old name must re-resolve via the names_delta fan-out at real scale.
+    std::fs::write(
+        &seed,
+        "pub fn phase_b_t6_alpha() -> String {\n    phase_b_t6_helper2()\n}\npub fn phase_b_t6_helper2() -> String {\n    String::from(\"v2\")\n}\n",
+    )
+    .unwrap();
+    reindex(&mut db_a, "crates/calm-core/src/phase_b_t6_seed.rs");
+    assert_graph_equal(&db_a, &index_fresh(&root), "real-repo round=2 op=Rename");
+
+    // Round 3 — delete the victim file entirely.
+    std::fs::remove_file(&victim).unwrap();
+    reindex(&mut db_a, "crates/calm-core/src/phase_b_t6_victim.rs");
+    assert_graph_equal(
+        &db_a,
+        &index_fresh(&root),
+        "real-repo round=3 op=DeleteFile",
+    );
+}
+
+/// A-1 (plan Risk/Assumptions): the `names_delta` expansion query chunks its
+/// IN-list at `DELTA_QUERY_CHUNK_SIZE` (500) to stay under SQLite's variable
+/// ceiling. No fixture or real file has >500 symbols, so that boundary never
+/// fires naturally — this forces it with one generated file of 600 functions,
+/// then edits it so all 600 names enter `names_delta` at once. Proves the
+/// multi-chunk path both succeeds and produces a graph identical to a full
+/// rebuild.
+#[test]
+fn names_delta_over_chunk_size_matches_full() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    enable_incremental_graph(&root);
+
+    // 600 > DELTA_QUERY_CHUNK_SIZE (500): one file, 600 distinct names, all
+    // of which land in names_delta on the body edit below.
+    let mut big = String::new();
+    for i in 0..600 {
+        big.push_str(&format!("def chunk_fn_{i}():\n    return {i}\n\n\n"));
+    }
+    std::fs::write(root.join("big.py"), &big).unwrap();
+    // A caller in another file so there's a cross-file edge to check.
+    std::fs::write(
+        root.join("caller.py"),
+        "def caller():\n    return chunk_fn_0() + chunk_fn_599()\n",
+    )
+    .unwrap();
+
+    let mut db = index_fresh(&root);
+
+    // Change every body (names unchanged) — names_delta = all 600 names of
+    // big.py (D2 union), forcing ≥2 chunks through the IN-list loop.
+    let mut big2 = String::new();
+    for i in 0..600 {
+        big2.push_str(&format!("def chunk_fn_{i}():\n    return {}\n\n\n", i + 1));
+    }
+    std::fs::write(root.join("big.py"), &big2).unwrap();
+    let summary = pipeline::reindex_paths(&mut db, &root, &["big.py".to_string()]).unwrap();
+    assert!(!summary.is_noop());
+    assert_eq!(
+        summary.graph_mode,
+        GraphMode::Incremental,
+        "2 changed files (big.py + fan-out to caller.py) is well under the 50-file fallback"
+    );
+
+    assert_graph_equal(
+        &db,
+        &index_fresh(&root),
+        "names_delta chunk-boundary: incremental must match full rebuild",
+    );
 }

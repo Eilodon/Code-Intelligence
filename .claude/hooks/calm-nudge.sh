@@ -29,6 +29,24 @@
 # `Write` is deliberately NOT hard-gated: it also covers brand-new file
 # creation, where no symbol exists yet for `edit_context` to look up —
 # blocking it would deadlock. It keeps the pre-existing advisory nudge only.
+#
+# ADVISORY layer (2026-07-13 redesign, driven by an agent's own retro on why
+# it drifted to native tools despite this hook — three levers, each aimed at
+# a real friction rather than "nag harder"):
+#   1. PRECISION over coverage. A nudge that fires on a *correct* native use
+#      (grepping a .log, a piped `... | grep`, a dotdir CALM can't index)
+#      teaches the agent to discount every nudge. So the advisory paths now
+#      bail out on piped greps, unindexed targets, and — for the Stage-5
+#      deny too — files under paths CALM never indexes (this script itself
+#      lives under .claude/ and used to get falsely denied).
+#   2. ACTIONABLE, not generic. Nudges interpolate the actual query/path so
+#      the CALM alternative is copy-paste-ready — removing the "translate my
+#      grep into a CALM call" step that made native feel cheaper.
+#   3. A CHANGING NUMBER beats a fixed sentence. After the per-kind nudge cap,
+#      instead of going fully silent (the blind spot where drift happens),
+#      surface a running native-vs-CALM exploration tally every few calls and
+#      at the commit checkpoint — a self-referential number resists the
+#      habituation an identical reminder can't.
 set -uo pipefail
 
 input=$(cat)
@@ -93,9 +111,65 @@ log_decision() {
 trap log_decision EXIT
 
 save_state() {
-  jq -n --argjson ecf "$1" --argjson nd "$2" --argjson nc "$3" \
-    '{edit_context_files: $ecf, needs_diff_impact: $nd, nudge_counts: $nc}' \
+  # Merge onto existing state so orthogonal exploration counters
+  # (native_explore / calm_explore, maintained by `bump`) survive a save of
+  # the three gate-relevant fields — without the merge every save would wipe
+  # them, silently zeroing the tally.
+  local prev='{}'
+  [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  jq -n --argjson prev "$prev" --argjson ecf "$1" --argjson nd "$2" --argjson nc "$3" \
+    '$prev + {edit_context_files: $ecf, needs_diff_impact: $nd, nudge_counts: $nc}' \
     >"$state_file" 2>/dev/null || true
+}
+
+# Increment one orthogonal counter in the state file, preserving every other
+# field (unlike save_state, which manages only the three gate fields). Backs
+# the native-vs-CALM exploration tally — the "changing number" signal.
+bump() {
+  local prev='{}'
+  [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  jq -c --arg k "$1" '.[$k] = ((.[$k] // 0) + 1)' <<<"$prev" >"$state_file" 2>/dev/null || true
+}
+
+# True when a Bash command's target is somewhere CALM never indexes (logs,
+# dotdirs, build artifacts, /tmp, scratchpad) — a grep/find there has no CALM
+# equivalent, so nudging toward search/locate would be crying wolf. Errs
+# toward NOT nudging (credibility over coverage): a loose substring match.
+command_targets_unindexed() {
+  case "$1" in
+    *.calm/* | *.log* | *target/* | *node_modules* | *.git/* | *dist/* | \
+    *build/* | *__pycache__* | *venv/* | *tmp/* | *.claude/* | *scratchpad*)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Formats the running native-vs-CALM exploration tally. Names the *specific*
+# capability the native reads bypassed (session_context / blast-radius
+# awareness) so the cost is concrete, not an abstract "prefer CALM".
+explore_tally() {
+  local s ne ce
+  s=$(cat "$state_file" 2>/dev/null || echo '{}')
+  ne=$(jq -r '.native_explore // 0' <<<"$s")
+  ce=$(jq -r '.calm_explore // 0' <<<"$s")
+  printf 'CALM liveness check — this session: %s native code reads/greps vs %s via CALM (search/source/locate). The %s native lookups never touched session_context, so blast-radius and "what have I already explored" awareness is blind to them. A CALM search/source keeps the map live at no extra cost.' \
+    "$ne" "$ce" "$ne"
+}
+
+# Emitted at the commit checkpoint — a reflection point the agent never skips
+# (diff_impact is hard-gated right before it), so a changing number lands here
+# in a way a mid-flow nudge doesn't. No-op when nothing was explored natively.
+emit_commit_tally() {
+  local s ne ce
+  s=$(cat "$state_file" 2>/dev/null || echo '{}')
+  ne=$(jq -r '.native_explore // 0' <<<"$s")
+  ce=$(jq -r '.calm_explore // 0' <<<"$s")
+  [ "${ne:-0}" -eq 0 ] 2>/dev/null && return 0
+  decision="commit_tally"
+  decision_detail="native=$ne calm=$ce"
+  jq -n --arg msg "About to commit — this session you explored code natively ${ne}x vs ${ce}x via CALM. Those ${ne} native reads/greps never updated the liveness map (session_context). Leaning on mcp__calm__search/source/locate next time keeps blast-radius awareness intact." \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+  exit 0
 }
 
 # True if `path` has had edit_context called for it THIS session — per-FILE
@@ -128,6 +202,13 @@ deny() {
 # hint cannot account for"), or repeating it further isn't going to help.
 NUDGE_CAP=2
 
+# After the per-kind nudge cap, a native exploration doesn't go fully silent:
+# every TALLY_EVERY-th one surfaces the running native-vs-CALM tally instead.
+# A *changing* number is the one signal that escapes the habituation NUDGE_CAP
+# exists to avoid — it's a fact about the agent's own conduct this call, not a
+# fixed sentence to tune out.
+TALLY_EVERY=6
+
 # $1 = throttle key (distinct budget per nudge *kind*, not shared), $2 = message
 nudge() {
   local key="$1" msg="$2" count
@@ -138,11 +219,41 @@ nudge() {
     exit 0
   fi
   nudge_counts=$(jq -c --arg k "$key" '.[$k] = ((.[$k] // 0) + 1)' <<<"$nudge_counts")
-  save_state "$edit_context_called" "$needs_diff_impact" "$nudge_counts"
+  save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
   decision="nudge"
   decision_detail="$key"
   jq -n --arg msg "$msg" \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+  exit 0
+}
+
+# Like nudge(), but for native *exploration* (Read/Grep/bash-grep/find on
+# indexed code): under the cap it shows the actionable message; past the cap
+# it falls back to the changing tally every TALLY_EVERY-th native lookup
+# rather than pure silence. Assumes the caller already did `bump
+# native_explore`, so the tally count reflects this call.
+nudge_or_tally() {
+  local key="$1" msg="$2" count ne
+  count=$(jq -r --arg k "$key" '.[$k] // 0' <<<"$nudge_counts")
+  if [ "$count" -lt "$NUDGE_CAP" ]; then
+    nudge_counts=$(jq -c --arg k "$key" '.[$k] = ((.[$k] // 0) + 1)' <<<"$nudge_counts")
+    save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
+    decision="nudge"
+    decision_detail="$key"
+    jq -n --arg msg "$msg" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    exit 0
+  fi
+  ne=$(jq -r '.native_explore // 0' <<<"$(cat "$state_file" 2>/dev/null || echo '{}')")
+  if [ $((ne % TALLY_EVERY)) -eq 0 ] 2>/dev/null; then
+    decision="tally"
+    decision_detail="$key:native=$ne"
+    jq -n --arg msg "$(explore_tally)" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    exit 0
+  fi
+  decision="allow_nudge_capped"
+  decision_detail="$key"
   exit 0
 }
 
@@ -336,27 +447,48 @@ if [ "$tool_name" = "mcp__calm__edit_lines" ] || [ "$tool_name" = "mcp__calm__ed
   save_state "$edit_context_files" true "$nudge_counts"
   exit 0
 fi
+# calm's own read/navigation tools — not gated, just counted, so the
+# native-vs-CALM tally has a denominator (this hook's matcher in
+# settings.json must list them for these to be observed at all).
+case "$tool_name" in
+  mcp__calm__search | mcp__calm__source | mcp__calm__locate | mcp__calm__file_overview | mcp__calm__understand)
+    bump calm_explore
+    decision="allow"
+    decision_detail="calm_explore++"
+    exit 0
+    ;;
+esac
 
 case "$tool_name" in
   Read)
     if [ -n "$file_path" ] && is_definitely_unindexed_path "$file_path"; then
       : # ci has nothing indexed here (dotdir / build-artifact dir) — native Read is correct
     elif [ -z "$file_path" ] || is_code_file "$file_path"; then
-      nudge read_native 'CI available in this repo — prefer mcp__calm__source(symbol) for a symbol-precise read, or mcp__calm__file_overview(path) instead of reading the whole file (AGENTS.md Stage 3).'
+      bump native_explore
+      nudge_or_tally read_native "CI available in this repo — prefer mcp__calm__source(symbol) for a symbol-precise read, or mcp__calm__file_overview(path=\"${file_path}\") over reading the whole file (AGENTS.md Stage 3)."
     fi
     ;;
   Grep)
     grep_path=$(jq -r '.tool_input.path // ""' <<<"$input")
+    grep_pat=$(jq -r '.tool_input.pattern // ""' <<<"$input")
     if [ -n "$grep_path" ] && is_definitely_unindexed_path "$grep_path"; then
       : # nothing indexed under this path — search/locate would come back empty, not stale
     elif [ -z "$grep_path" ] || ! is_clearly_non_code_file "$grep_path"; then
-      nudge grep_tool 'CI available in this repo — prefer mcp__calm__search(query, kind="hybrid") or mcp__calm__locate(query) for a symbol-aware search, or mcp__calm__search(query, kind="grep") for a literal/regex match (also covers files the parser skips) instead of Grep (AGENTS.md Stage 2).'
+      bump native_explore
+      nudge_or_tally grep_tool "CI available in this repo — prefer mcp__calm__search(query=\"${grep_pat}\", kind=\"hybrid\") or mcp__calm__locate(query=\"${grep_pat}\") for a symbol-aware search, or mcp__calm__search(query=\"${grep_pat}\", kind=\"grep\") for a literal match (also covers files the parser skips) instead of Grep (AGENTS.md Stage 2)."
     fi
     ;;
   Edit)
     decision_detail="state:needs_diff_impact=true"
     save_state "$edit_context_files" true "$nudge_counts"
-    if is_code_file "$file_path" && ! file_has_edit_context "$file_path"; then
+    if is_definitely_unindexed_path "$file_path"; then
+      : # CALM never indexes this path (dotdir/build-artifact) — edit_context
+        # can't resolve a symbol here, so demanding it would be crying wolf
+        # (this hook itself lives under .claude/ and used to hit exactly that).
+        # The Stage 7 diff_impact gate above still applies to the write.
+      decision="allow"
+      decision_detail="edit_unindexed_path_no_edit_context_required"
+    elif is_code_file "$file_path" && ! file_has_edit_context "$file_path"; then
       deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
     fi
     ;;
@@ -373,10 +505,23 @@ case "$tool_name" in
           deny 'MANDATORY per AGENTS.md Stage 7 — call mcp__calm__diff_impact(staged=true) before this commit/push, never skip. Files changed since the last diff_impact check.'
         fi
       fi
+      # Commit allowed (gate satisfied): a reflection point the agent never
+      # skips — surface the session's native-vs-CALM tally here, where a
+      # changing number actually lands, instead of only mid-flow.
+      emit_commit_tally
+    elif command_targets_unindexed "$command"; then
+      : # grep/find over a log / dotdir / build-artifact / tmp path — not
+        # indexed, CALM search would come back empty; native is correct
+    elif grep -qE '\|[[:space:]]*(grep|rg|ag)\b' <<<"$command"; then
+      : # piped grep = filtering another command's stream output, not
+        # searching files — CALM search/locate can't replace it, and a
+        # false nudge here erodes trust in every real one
     elif grep -qE '\b(grep|rg|ag)\b' <<<"$command"; then
-      nudge bash_grep 'CI available in this repo — prefer mcp__calm__search(query, kind="hybrid"|"grep") or mcp__calm__locate instead of grep via Bash (AGENTS.md Stage 2).'
+      bump native_explore
+      nudge_or_tally bash_grep 'CI available in this repo — prefer mcp__calm__search(query, kind="hybrid"|"grep") or mcp__calm__locate over a standalone file grep via Bash (AGENTS.md Stage 2).'
     elif grep -qE '\bfind\b.*-i?name\b' <<<"$command"; then
-      nudge bash_find 'CI available in this repo — prefer mcp__calm__search(query, kind="file") or mcp__calm__file_overview / mcp__calm__dependencies instead of find (AGENTS.md Stage 1-2).'
+      bump native_explore
+      nudge_or_tally bash_find 'CI available in this repo — prefer mcp__calm__search(query, kind="file") or mcp__calm__file_overview / mcp__calm__dependencies over find (AGENTS.md Stage 1-2).'
     fi
     ;;
 esac

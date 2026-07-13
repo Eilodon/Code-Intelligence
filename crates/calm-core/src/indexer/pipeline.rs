@@ -19,6 +19,18 @@ use crate::types::EdgeConfidence;
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
 
+/// Phase B plan D6: above this many `delta_paths`, `incremental_graph_update`
+/// falls back to a full `rebuild_graph` — the delta-expansion query plus a
+/// scoped-but-wide DELETE/re-resolve stops being cheaper than just doing the
+/// full pass, and full rebuild is always correct regardless.
+const MAX_INCREMENTAL_DELTA_PATHS: usize = 50;
+
+/// Chunk size for any `WHERE col IN (...)` built from a caller-sized list
+/// (`names_delta`, potentially hundreds of entries for a file with many
+/// symbols) — conservative vs. SQLite's own default `SQLITE_MAX_VARIABLE_
+/// NUMBER` of 32766 (3.32+). Phase B plan A-1.
+const DELTA_QUERY_CHUNK_SIZE: usize = 500;
+
 /// True if a symbol's stored `signature` string's return type is `Option<_>`
 /// or `Result<_, _>` (bare `Option`/`Result` too, for generic/associated-type
 /// signatures that elide the parameter). Looks at the segment after the last
@@ -136,11 +148,44 @@ fn rel_path(project_root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Which graph-rebuild path a non-noop reindex actually took. `Full` is the
+/// only variant that exists before Phase B T4 wires `incremental_graph_update`
+/// in — `Incremental`/`FullFallback` are plumbed now (Phase B T3) so
+/// `ReindexSummary`'s shape doesn't change again when T4 lands, but nothing
+/// constructs them yet. See docs/plans/2026-07-13-phase-b-incremental-graph-update.md §4 T3/T4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GraphMode {
+    #[default]
+    Full,
+    Incremental,
+    /// delta too large / flag off / etc. — human-readable, not matched on.
+    FullFallback(String),
+}
+
 /// Result of an incremental reindex pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReindexSummary {
     pub changed: usize,
     pub deleted: usize,
+    /// Every path `remove_file_rows` ran against this pass — both
+    /// content-changed (still on disk) and deleted files, i.e. exactly
+    /// Phase B plan §3's `delta_seed = changed ∪ deleted rel_paths`. One flat
+    /// list rather than two separate vecs since nothing downstream needs the
+    /// changed/deleted split — `summary.changed`/`summary.deleted` above
+    /// already carry those counts.
+    pub changed_paths: Vec<String>,
+    /// Phase B plan D2: `old_names ∪ new_names` for every path in
+    /// `changed_paths` — `old_names` read from `symbols` before
+    /// `remove_file_rows` clears them, `new_names` from the freshly parsed
+    /// `ExtractedFile.symbols` (no second SELECT). Union, not symmetric
+    /// difference: a signature-only change (name unchanged) still needs its
+    /// name in here so return-shape-filter-dependent sites elsewhere
+    /// re-resolve — see D2's full proof in the plan doc.
+    pub names_delta: HashSet<String>,
+    /// Which rebuild path this pass took — `Full` unconditionally until
+    /// Phase B T4 wires incremental in. Left at `GraphMode::default()`
+    /// (`Full`) when the pass was a no-op (no rebuild ran at all).
+    pub graph_mode: GraphMode,
 }
 
 impl ReindexSummary {
@@ -158,6 +203,17 @@ fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<(
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM code_chunks WHERE path = ?1", [rel])?;
     Ok(())
+}
+
+/// Bare `name`s currently persisted for `path`, read BEFORE
+/// `remove_file_rows` clears them — the `old_names` half of Phase B plan
+/// D2's `names_delta = old_names ∪ new_names` union; the `new_names` half
+/// comes straight from a freshly parsed `ExtractedFile.symbols`, no second
+/// SELECT needed there.
+fn names_for_path(tx: &rusqlite::Transaction, path: &str) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = tx.prepare("SELECT DISTINCT name FROM symbols WHERE path = ?1")?;
+    stmt.query_map([path], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<String>>>()
 }
 
 /// `lang` is `None` for a recognized-but-unparsed extension (see
@@ -575,20 +631,44 @@ fn persist_file(
 ///
 /// This is pure DB work (no file parsing), so incremental passes only re-parse
 /// the files that actually changed while the graph stays globally consistent.
-fn rebuild_graph(
+// (qualified_name, path, language) — candidate list entry shared by
+// `by_name`/`by_name_class` lookups in `ResolutionCtx`.
+type SymbolCandidate = (String, String, String);
+
+/// Per-site candidate lookup tables shared by every call site in one
+/// resolution pass — built once via `build_resolution_context`, consumed by
+/// `resolve_sites_to_edges`. Split out of `rebuild_graph` (Phase B plan D4,
+/// docs/plans/2026-07-13-phase-b-incremental-graph-update.md) so
+/// `incremental_graph_update` can reuse the exact same resolution logic
+/// instead of a second, divergence-prone copy.
+struct ResolutionCtx<'a> {
+    by_name: HashMap<String, Vec<SymbolCandidate>>,
+    by_name_class: HashMap<(String, String), Vec<SymbolCandidate>>,
+    sig_by_qn: HashMap<String, String>,
+    path_lang: HashMap<String, String>,
+    caller_usings: HashMap<String, HashSet<String>>,
+    namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
+}
+
+/// Build the candidate-lookup tables `resolve_sites_to_edges` narrows
+/// against: `by_name`/`by_name_class` (bare-name and `Type::method` lookup),
+/// `sig_by_qn` (return-shape filter), `path_lang` (same-language filter),
+/// `caller_usings` (C# same-namespace filter). One global `SELECT` over
+/// `symbols`/`import_edges` — same cost whether the caller is about to
+/// resolve every site (`rebuild_graph`) or only a delta
+/// (`incremental_graph_update`, Phase B plan §3 step 5: resolution inputs
+/// like a candidate's own signature can change even when the *site* calling
+/// it didn't, so the lookup tables themselves are never scoped to the delta).
+fn build_resolution_context<'a>(
     tx: &rusqlite::Transaction,
-    hub_config: &crate::config::HubThresholdConfig,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-) -> rusqlite::Result<()> {
+    namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<ResolutionCtx<'a>> {
     // name → [(qn, path, language)] for tier-1; (name, class) → [(qn, path,
     // language)] for tier-2. `language` rides along so a call site can never
     // resolve to a same-named symbol written in a different language (see
     // `path_lang` and the same-language filter below) — a bare-name/textual
     // match across languages is never a real call, just an incidental name
     // collision (e.g. a Rust `new` and a Python `new` sharing `by_name`).
-    type SymbolCandidate = (String, String, String); // (qualified_name, path, language)
     let mut by_name: HashMap<String, Vec<SymbolCandidate>> = HashMap::new();
     let mut by_name_class: HashMap<(String, String), Vec<SymbolCandidate>> = HashMap::new();
     // qualified_name → signature, so the `MAX_CALLEE_CANDIDATES` fallback below
@@ -634,28 +714,6 @@ fn rebuild_graph(
         }
     }
 
-    let sites: Vec<CallSiteRow> = {
-        let mut stmt = tx.prepare(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind \
-             FROM call_sites",
-        )?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)? != 0,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, String>(8)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
     // C# `using X;` directives, per caller file — feeds the same-namespace
     // candidate narrowing below (8-language plan P1.5's "using -> namespace"
     // remainder). `import_edges` is already populated by this point (this
@@ -679,11 +737,36 @@ fn rebuild_graph(
         }
     }
 
+    Ok(ResolutionCtx {
+        by_name,
+        by_name_class,
+        sig_by_qn,
+        path_lang,
+        caller_usings,
+        namespace_map,
+    })
+}
+
+/// Narrow every call site in `sites` against `ctx` and produce the final,
+/// deduped `CallEdge` list — a pure function of `(ctx, sites)` with no DB
+/// access (the caller owns the DELETE/INSERT scope, letting `rebuild_graph`
+/// clear all edges and `incremental_graph_update`, Phase B T4, clear only
+/// `from_path IN delta_paths`, per plan D1/D4). Shared unchanged by both, so
+/// resolution logic can never diverge between full and incremental runs.
+///
+/// `sites` order matters: `seen_pairs` dedup below keeps the FIRST site's
+/// line/confidence per (caller, callee) pair ("first call site wins"), so
+/// callers MUST load `sites` in a stable, explicit order (`ORDER BY id`) —
+/// an unordered `SELECT` relies on SQLite's incidental full-table-scan
+/// (rowid) order, which silently breaks the moment a `WHERE` clause makes
+/// the query planner prefer an index instead (exactly what incremental's
+/// delta-scoped load does) — see Phase B plan A-3.
+fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<CallEdge> {
     // One edge per (caller, callee, call-site line) — distinct sites in the same caller stay separate (so `callers`/`callees` show every site); exact same-line dupes are deduped.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
     //
-    // Candidate lookup (HashMap reads against `by_name`/`by_name_class`) is pure
+    // Candidate lookup (HashMap reads against `ctx.by_name`/`ctx.by_name_class`) is pure
     // CPU work independent per site, so it runs in parallel; the dedup merge
     // below stays sequential, walking sites in their original order so the
     // "first call site wins" line/confidence attribution is unchanged.
@@ -720,8 +803,8 @@ fn rebuild_graph(
                 _,
             )| {
                 let targets = match target_class {
-                    Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
-                    None => by_name.get(callee),
+                    Some(cls) => ctx.by_name_class.get(&(callee.clone(), cls.clone())),
+                    None => ctx.by_name.get(callee),
                 };
                 let Some(t) = targets else {
                     return (Vec::new(), false);
@@ -736,7 +819,7 @@ fn rebuild_graph(
                 // constraint rather than a preference — the rest of this
                 // function is unchanged from here on, just operating on the
                 // now same-language-only, language-stripped candidate list.
-                let caller_lang = path_lang.get(from_path);
+                let caller_lang = ctx.path_lang.get(from_path);
                 let same_lang: Vec<(String, String)> = t
                     .iter()
                     .filter(|(_, _, lang)| Some(lang) == caller_lang)
@@ -757,7 +840,7 @@ fn rebuild_graph(
                     filtered = t
                         .iter()
                         .filter(|(qn, _)| {
-                            sig_by_qn
+                            ctx.sig_by_qn
                                 .get(qn)
                                 .is_some_and(|sig| signature_returns_option_or_result(sig))
                         })
@@ -838,10 +921,10 @@ fn rebuild_graph(
                     if caller_lang.map(String::as_str) != Some("csharp") {
                         return None;
                     }
-                    let usings = caller_usings.get(from_path)?;
+                    let usings = ctx.caller_usings.get(from_path)?;
                     let ns_matches: Vec<_> = t
                         .iter()
-                        .filter(|(_, p)| usings.iter().any(|ns| namespace_map.contains(ns, p)))
+                        .filter(|(_, p)| usings.iter().any(|ns| ctx.namespace_map.contains(ns, p)))
                         .cloned()
                         .collect();
                     (!ns_matches.is_empty()).then_some(ns_matches)
@@ -897,12 +980,51 @@ fn rebuild_graph(
             });
         }
     }
+    edges
+}
+
+fn rebuild_graph(
+    tx: &rusqlite::Transaction,
+    hub_config: &crate::config::HubThresholdConfig,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<()> {
+    let ctx = build_resolution_context(tx, namespace_map)?;
+
+    // Stable, explicit order (Phase B plan T2/A-3) so full and future
+    // incremental resolution attribute `seen_pairs` dedup identically in
+    // `resolve_sites_to_edges` — see that function's doc comment.
+    let sites: Vec<CallSiteRow> = {
+        let mut stmt = tx.prepare(
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+                    looks_option_or_result_chained, module_hint, edge_kind \
+             FROM call_sites ORDER BY id",
+        )?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let edges = resolve_sites_to_edges(&ctx, &sites);
 
     tx.execute("DELETE FROM call_edges", [])?;
     insert_call_edges_batch(tx, &edges)?;
-    // Every `formal` row at this point came from the stack-graphs upgrade at
-    // this function's own confidence-assignment loop above (`formally_resolved`)
-    // — the SCIP overlay (`scip::ingest::ingest_occurrences`) is a separate,
+    // Every `formal` row at this point came from the stack-graphs upgrade
+    // already baked into `confidence` at extraction time, carried through
+    // unchanged by `resolve_sites_to_edges`'s confidence-assignment loop —
+    // the SCIP overlay (`scip::ingest::ingest_occurrences`) is a separate,
     // later UPDATE pass that runs after this one and sets `formal_source =
     // 'scip'` itself. Cheaper than threading a new field through
     // `CallSiteData`/`CallEdge`/`insert_call_edges_batch` for what's
@@ -919,6 +1041,158 @@ fn rebuild_graph(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     Ok(())
 }
+
+/// Result of an `incremental_graph_update` pass — lets the caller set
+/// `ReindexSummary::graph_mode` precisely (plan T4/L6), since only this
+/// function's own delta-expansion (step 1 inside it) can know whether the
+/// fallback threshold was hit, and why.
+pub enum IncrementalOutcome {
+    Applied,
+    /// Fell back to a full `rebuild_graph` internally — already done by the
+    /// time this returns. Payload is a human-readable reason (delta size),
+    /// not matched on.
+    FellBackToFull(String),
+}
+
+/// Phase B plan §3: scoped call-graph re-resolve for exactly the files a
+/// reindex pass touched, instead of `rebuild_graph`'s full sweep. Only ever
+/// called when the caller's own `ReindexSummary` is non-noop — `delta_seed`
+/// is `ReindexSummary::changed_paths` (changed ∪ deleted rel_paths) and
+/// `names_delta` is `ReindexSummary::names_delta` (old_names ∪ new_names
+/// union across those same paths, plan D2). Shares `build_resolution_context`/
+/// `resolve_sites_to_edges` with `rebuild_graph` verbatim (plan D4) — the
+/// ONLY differences from a full rebuild are (a) which `call_sites` get
+/// loaded and (b) how much of `call_edges` gets deleted first; see plan
+/// §3.1 for the proof that `delta_paths` below is sufficient to catch every
+/// input `resolve_sites_to_edges` depends on.
+pub fn incremental_graph_update(
+    tx: &rusqlite::Transaction,
+    delta_seed: &[String],
+    names_delta: &HashSet<String>,
+    hub_config: &crate::config::HubThresholdConfig,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<IncrementalOutcome> {
+    // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
+    // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
+    // calls a renamed/added/removed name must still be re-resolved, or its
+    // stale edge survives alongside a newly-ambiguous one (audit finding
+    // L1). Chunked (plan A-1): names_delta can be arbitrarily large (every
+    // symbol name in every changed/deleted file this pass), unlike
+    // delta_paths itself, which is bounded by the fallback check below.
+    let mut delta_paths: HashSet<String> = delta_seed.iter().cloned().collect();
+    let names: Vec<&str> = names_delta.iter().map(String::as_str).collect();
+    for chunk in names.chunks(DELTA_QUERY_CHUNK_SIZE) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM call_sites WHERE callee_name IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let found = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        delta_paths.extend(found);
+    }
+
+    // Step 2 (plan D6): full rebuild is always correct; past this size the
+    // delta-expansion + scoped-DELETE overhead isn't worth it over just
+    // doing the full pass. Falls back INTERNALLY (not by returning an error
+    // for the caller to react to) so there is exactly one place that knows
+    // this decision, matching D4's one-resolver principle.
+    if delta_paths.len() > MAX_INCREMENTAL_DELTA_PATHS {
+        let reason = format!(
+            "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
+            delta_paths.len()
+        );
+        rebuild_graph(tx, hub_config, crate_map, psr4, namespace_map)?;
+        return Ok(IncrementalOutcome::FellBackToFull(reason));
+    }
+
+    // From here delta_paths.len() <= MAX_INCREMENTAL_DELTA_PATHS (50), well
+    // under any SQLite variable-count ceiling — no chunking needed for the
+    // two queries below, unlike step 1's names_delta-driven expansion.
+    let path_refs: Vec<&str> = delta_paths.iter().map(String::as_str).collect();
+    let placeholders = vec!["?"; path_refs.len()].join(",");
+
+    // Step 3 (plan D1): scoped DELETE — every edge belongs to exactly one
+    // from_path, so this partitions cleanly; scip-inserted edges with
+    // from_path ∈ delta are correctly deleted too (that file's content just
+    // changed, the background overlay will re-insert what's still true).
+    tx.execute(
+        &format!("DELETE FROM call_edges WHERE from_path IN ({placeholders})"),
+        rusqlite::params_from_iter(path_refs.iter().copied()),
+    )?;
+
+    // Step 4 (plan D5): dangling sweep, unconditional every pass — catches
+    // scip-inserted edges (no call_sites backing) whose target symbol was
+    // just deleted, which no from_path-scoped re-resolve above would ever
+    // touch.
+    tx.execute(
+        "DELETE FROM call_edges WHERE to_symbol NOT IN (SELECT qualified_name FROM symbols)",
+        [],
+    )?;
+
+    // Step 5 (plan D4): same shared resolver full rebuild uses — still one
+    // global SELECT over symbols (accepted cost, see build_resolution_context's
+    // own doc comment; scoping this too is Phase B+ backlog).
+    let ctx = build_resolution_context(tx, namespace_map)?;
+
+    // Step 6: re-resolve exactly delta_paths' sites. `ORDER BY id` matches
+    // rebuild_graph's own load (plan A-3/T2) so "first site wins" seen_pairs
+    // dedup attribution agrees between the two paths on identical input.
+    let sites: Vec<CallSiteRow> = {
+        let sql = format!(
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+                    looks_option_or_result_chained, module_hint, edge_kind \
+             FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(path_refs.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let edges = resolve_sites_to_edges(&ctx, &sites);
+    insert_call_edges_batch(tx, &edges)?;
+    // Same one-shot fact as rebuild_graph's identical UPDATE (see its own
+    // comment): a `formal` row here came from the stack-graphs upgrade
+    // already baked into `confidence` at extraction time. Global, not
+    // scoped to delta — matches plan §3 step 6, correct because rows
+    // outside delta already carry their own formal_source from a prior
+    // pass.
+    tx.execute(
+        "UPDATE call_edges SET formal_source = 'stack_graphs' \
+         WHERE edge_confidence = 'formal' AND formal_source IS NULL",
+        [],
+    )?;
+
+    // Step 7 (plan D3): identical 5 global metric passes, same order as
+    // rebuild_graph — equivalence-by-construction holds for all of them
+    // once the edge set matches, since every one is a pure function of
+    // current DB state, not of how the edges got there.
+    refresh_caller_counts(tx)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
+    crate::graph::coreness::compute_coreness(tx)?;
+    crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
+    crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
+
+    Ok(IncrementalOutcome::Applied)
+}
+
 /// Recompute every symbol's `caller_count` from `call_edges`, using the same
 /// "confirmed caller" definition as the `callers` tool's `direct_count`
 /// (`ruled_out_by_scip = 0` and not `ambiguous`-confidence): an `ambiguous`
@@ -1591,6 +1865,34 @@ fn cached_resolution_maps(
     (crate_map, psr4, namespace_map)
 }
 
+/// Phase B plan T4b: the 3 manifest filenames `cached_resolution_maps`
+/// tracks mtimes for (see its doc comment) — a standalone predicate so both
+/// `reindex_paths` and `reindex_changed_cancellable` check the same thing.
+/// Root-relative exact match only, matching that function's own
+/// `project_root.join(name)` checks — a nested workspace member's manifest
+/// doesn't affect this cache.
+fn is_manifest_path(rel: &str) -> bool {
+    matches!(rel, "Cargo.toml" | "Cargo.lock" | "composer.json")
+}
+
+/// Phase B plan T4b (Risk Abductive-1 mitigation): force-evict
+/// `project_root`'s `cached_resolution_maps` entry. Belt-and-suspenders on
+/// top of that function's own mtime comparison, which is correct only to
+/// the filesystem's mtime resolution — some filesystems round to 1s, so two
+/// edits to the same manifest inside one second would otherwise look
+/// "unchanged" and keep serving the first edit's stale maps. Called only
+/// when this pass's own `changed_paths` already proves a manifest was
+/// touched (a hard fact, not a heuristic), so an unconditional evict here is
+/// free insurance rather than a guess. A no-op if nothing has been cached
+/// yet for this `project_root`.
+fn invalidate_resolution_maps_cache(project_root: &Path) {
+    if let Some(lock) = RESOLUTION_MAPS_CACHE.get() {
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(project_root);
+    }
+}
+
 pub fn reindex_changed_cancellable(
     conn: &mut Connection,
     project_root: &Path,
@@ -1683,8 +1985,12 @@ pub fn reindex_changed_cancellable(
             .collect();
 
         for (c, data) in &extracted {
+            summary.names_delta.extend(names_for_path(&tx, &c.rel)?);
             remove_file_rows(&tx, &c.rel)?;
             if let Some(data) = data {
+                summary
+                    .names_delta
+                    .extend(data.symbols.iter().map(|s| s.name.clone()));
                 persist_file(&tx, &c.rel, &c.hash, data)?;
             }
             upsert_file_index(
@@ -1697,25 +2003,56 @@ pub fn reindex_changed_cancellable(
                 now,
             )?;
             summary.changed += 1;
+            summary.changed_paths.push(c.rel.clone());
         }
     }
 
     for path in existing.keys() {
         if !seen_paths.contains(path) {
+            summary.names_delta.extend(names_for_path(&tx, path)?);
             remove_file_rows(&tx, path)?;
             summary.deleted += 1;
+            summary.changed_paths.push(path.clone());
         }
     }
 
     if !summary.is_noop() {
+        debug_assert!(
+            !summary.changed_paths.is_empty(),
+            "non-noop summary must have at least one changed_paths entry (Phase B plan T4 Failure Mode 3 guard)"
+        );
+        // Phase B plan T4b — see invalidate_resolution_maps_cache's doc
+        // comment for why this can't just rely on cached_resolution_maps'
+        // own mtime comparison.
+        if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
+            invalidate_resolution_maps_cache(project_root);
+        }
         let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
-        rebuild_graph(
-            &tx,
-            &config.hub_threshold,
-            &crate_map,
-            &psr4,
-            &namespace_map,
-        )?;
+        if config.indexing.incremental_graph {
+            match incremental_graph_update(
+                &tx,
+                &summary.changed_paths,
+                &summary.names_delta,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )? {
+                IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
+                IncrementalOutcome::FellBackToFull(reason) => {
+                    summary.graph_mode = GraphMode::FullFallback(reason)
+                }
+            }
+        } else {
+            rebuild_graph(
+                &tx,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )?;
+            summary.graph_mode = GraphMode::Full;
+        }
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
@@ -1769,8 +2106,10 @@ pub fn reindex_paths(
 
         if !abs.exists() {
             if existing_hash.is_some() {
+                summary.names_delta.extend(names_for_path(&tx, rel)?);
                 remove_file_rows(&tx, rel)?;
                 summary.deleted += 1;
+                summary.changed_paths.push(rel.clone());
             }
             continue;
         }
@@ -1799,8 +2138,12 @@ pub fn reindex_paths(
 
         let data =
             lang.map(|lang| extract_file_data(rel, lang, &source, &config.entry_points, formal));
+        summary.names_delta.extend(names_for_path(&tx, rel)?);
         remove_file_rows(&tx, rel)?;
         if let Some(data) = &data {
+            summary
+                .names_delta
+                .extend(data.symbols.iter().map(|s| s.name.clone()));
             persist_file(&tx, rel, &hash, data)?;
         }
         upsert_file_index(
@@ -1813,17 +2156,46 @@ pub fn reindex_paths(
             now,
         )?;
         summary.changed += 1;
+        summary.changed_paths.push(rel.clone());
     }
 
     if !summary.is_noop() {
+        debug_assert!(
+            !summary.changed_paths.is_empty(),
+            "non-noop summary must have at least one changed_paths entry (Phase B plan T4 Failure Mode 3 guard)"
+        );
+        // Phase B plan T4b — see invalidate_resolution_maps_cache's doc
+        // comment for why this can't just rely on cached_resolution_maps'
+        // own mtime comparison.
+        if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
+            invalidate_resolution_maps_cache(project_root);
+        }
         let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
-        rebuild_graph(
-            &tx,
-            &config.hub_threshold,
-            &crate_map,
-            &psr4,
-            &namespace_map,
-        )?;
+        if config.indexing.incremental_graph {
+            match incremental_graph_update(
+                &tx,
+                &summary.changed_paths,
+                &summary.names_delta,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )? {
+                IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
+                IncrementalOutcome::FellBackToFull(reason) => {
+                    summary.graph_mode = GraphMode::FullFallback(reason)
+                }
+            }
+        } else {
+            rebuild_graph(
+                &tx,
+                &config.hub_threshold,
+                &crate_map,
+                &psr4,
+                &namespace_map,
+            )?;
+            summary.graph_mode = GraphMode::Full;
+        }
     }
     tx.commit()?;
     Ok(summary)
@@ -3968,11 +4340,8 @@ impl StructB {
         std::fs::write(dir.join("a.py"), original).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
         assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            },
+            (s.changed, s.deleted),
+            (1, 0),
             "a revert to prior content is still a content-hash change and must be picked up"
         );
         assert_eq!(
@@ -4013,13 +4382,7 @@ impl StructB {
         // Add a second file that calls helper → new symbol + cross-file edge.
         std::fs::write(dir.join("b.py"), "def caller():\n    helper()\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (1, 0));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
         assert_eq!(
             count(
@@ -4032,13 +4395,7 @@ impl StructB {
         // Modify b.py to no longer call helper → edge drops, caller_count → 0.
         std::fs::write(dir.join("b.py"), "def caller():\n    pass\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (1, 0));
         assert_eq!(
             count(
                 &conn,
@@ -4050,13 +4407,7 @@ impl StructB {
         // Delete b.py → its symbol disappears.
         std::fs::remove_file(dir.join("b.py")).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 0,
-                deleted: 1
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (0, 1));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4100,13 +4451,7 @@ impl StructB {
         .unwrap();
         std::fs::write(dir.join("b.py"), "def other():\n    pass\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 2,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (2, 0));
 
         // Exactly one chunk per file — the stale a.py chunk was replaced, not
         // accumulated alongside the new one.
@@ -4130,13 +4475,7 @@ impl StructB {
         // Delete a.py → its chunk disappears; b.py's chunk is untouched.
         std::fs::remove_file(dir.join("a.py")).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 0,
-                deleted: 1
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (0, 1));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM code_chunks"), 1);
         assert_eq!(
             count(

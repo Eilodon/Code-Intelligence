@@ -27,6 +27,7 @@ pub struct Config {
     pub php: PhpConfig,
     pub clang: ClangConfig,
     pub ruby: RubyConfig,
+    pub indexing: IndexingConfig,
 }
 
 impl Default for Config {
@@ -86,6 +87,7 @@ impl Default for Config {
             php: PhpConfig::default(),
             clang: ClangConfig::default(),
             ruby: RubyConfig::default(),
+            indexing: IndexingConfig::default(),
         }
     }
 }
@@ -97,6 +99,22 @@ pub struct HubThresholdConfig {
     pub min_callers: i64,
     pub min_callers_bridge: i64,
     pub coreness_pct: f64,
+}
+
+/// Phase B (`docs/plans/2026-07-13-phase-b-incremental-graph-update.md`)
+/// indexing-pipeline flags.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct IndexingConfig {
+    /// Route `reindex_paths`/`reindex_changed_cancellable`'s non-noop passes
+    /// through `incremental_graph_update` (scoped re-resolve) instead of the
+    /// full `rebuild_graph` sweep. Default `false` per plan D8: this whole
+    /// code path stays dead weight, never executed by any build, until it
+    /// has passed golden-equivalence on a real indexed DB (plan T6) and this
+    /// default flips. `calm index` (CLI one-shot / fresh index) always goes
+    /// through `run_indexing_pipeline_cancellable`, which never reads this
+    /// flag — a permanent full-rebuild escape hatch independent of it.
+    pub incremental_graph: bool,
 }
 
 impl Default for HubThresholdConfig {

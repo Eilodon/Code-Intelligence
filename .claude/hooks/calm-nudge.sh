@@ -153,6 +153,99 @@ command_targets_unindexed() {
   esac
 }
 
+# --- 2026-07-14 "steepest hill" redesign: conditional enforcement for
+# search/grep specifically ---
+#
+# A user-supplied analysis (grounded in MCP-Bench data + a documented Claude
+# Code community report that even Anthropic's OWN Grep/Read native tools get
+# bypassed for raw Bash `cat`/`grep` without a blocking hook) argued that
+# search/grep is the single steepest hill to nudge, for three compounding
+# reasons: (1) "type a query -> reach for grep" is a pretraining-level
+# reflex, reinforced a SECOND time by Claude Code's own system prompt
+# training a model to prefer ITS OWN native Grep/Read over raw Bash --
+# meaning an MCP tool has to out-compete two stacked habits, not one, unlike
+# Edit/Write which face only the second; (2) search/grep fires 10-40x more
+# often per session than edit/write (MCP-Bench: ~20-80 tool calls/task), so
+# even an IDENTICAL per-call compliance rate produces a visibly worse
+# aggregate ratio purely from volume; (3) a mutating action gets more model
+# "caution" (slow down, re-read guidance) than a read-only one, which gets
+# processed as a cheap reflexive action.
+#
+# The actionable recommendation, and the one implemented below: don't treat
+# compliance as one blob. Nudge (or, if ever hardened, deny) ONLY the case
+# CALM actually wins clearly -- multi-file/repo-wide scope, or a
+# symbol/identifier-shaped query even when scoped to one file (locate
+# returns definition+callers+type, strictly more than a text match). Stay
+# SILENT for a single-file grep with a real regex/free-text pattern --
+# ripgrep genuinely has no CALM equivalent there, and nudging it anyway is
+# exactly the false-positive class this file's header (lever #1) already
+# identifies as corrosive to every OTHER, genuinely-useful nudge. This also
+# directly serves the frequency-effect problem above: fewer, better-targeted
+# nudges land more of NUDGE_CAP's two "full message" shows on cases that
+# actually matter, instead of burning them on trivial single-file lookups.
+
+# True when `pat` looks like a plain identifier (a symbol/function/class
+# name) rather than a real regex or free-text phrase -- mcp__calm__locate
+# gives strictly more (definition + callers + type) than a text match for
+# exactly this query shape, regardless of file scope, so it's worth nudging
+# even when grep_path names one specific file.
+pattern_looks_like_identifier() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+# True when a Bash grep/rg/ag invocation clearly targets ONE existing
+# regular file rather than a directory/recursive scope -- the case where
+# mcp__calm__search has no real leverage over native (same one-round-trip
+# cost, no query-translation step saved). Heuristic, not a shell parser
+# (same tolerance as is_real_git_commit_or_push above): any `-r`/`-R`/
+# `--recursive` flag, any directory argument, or anything other than
+# EXACTLY one existing-regular-file token defaults to "multi-file" (nudge),
+# since an ambiguous parse should fail toward the existing, already-safe
+# behavior, not toward new silence.
+bash_grep_targets_single_file() {
+  local cmd="$1" tok file_count=0
+  case "$cmd" in
+    *-r* | *-R* | *--recursive*) return 1 ;;
+  esac
+  for tok in $cmd; do
+    case "$tok" in
+      -*) continue ;;
+    esac
+    if [ -d "$tok" ]; then
+      return 1
+    elif [ -f "$tok" ]; then
+      file_count=$((file_count + 1))
+    fi
+  done
+  [ "$file_count" -eq 1 ]
+}
+
+# A short file is cheap to read in full either way -- source(symbol) or
+# file_overview only pay off once reading the whole file is real waste
+# relative to what was actually needed. 80 lines: roughly "longer than one
+# screen", not a CALM-internal number with any other significance.
+READ_WORTH_NUDGE_LINE_THRESHOLD=80
+file_worth_symbol_read() {
+  local n
+  n=$(wc -l <"$1" 2>/dev/null || echo 0)
+  [ "${n:-0}" -ge "$READ_WORTH_NUDGE_LINE_THRESHOLD" ] 2>/dev/null
+}
+
+# Appended to every "prefer mcp__calm__X" nudge message: some MCP clients
+# (this environment's harness among them) defer a server's tool schemas
+# until an explicit discovery step requests them, so "prefer
+# mcp__calm__search" can be technically correct advice that's still
+# impossible to act on if that tool was never loaded into context this
+# session -- the agent has no way to distinguish "this tool doesn't exist"
+# from "this tool exists but I never asked for its schema" without being
+# told the second case is possible. Deliberately does NOT name a specific
+# client mechanism (e.g. "call ToolSearch") -- that would be actively wrong
+# guidance in a client that loads every tool upfront (the majority of MCP
+# clients today) and have no way to detect which kind of client is running
+# from inside a shell hook. Generic enough to be correct everywhere, still
+# concrete enough to prompt a real check instead of silent non-compliance.
+TOOL_DISCOVERY_HINT=" (If mcp__calm__* tools don't appear in your available tools yet this session, your MCP client may defer tool schemas until requested — check for a tool-discovery step before assuming they're unavailable.)"
+
 # Formats the running native-vs-CALM exploration tally. Names the *specific*
 # capability the native reads bypassed (session_context / blast-radius
 # awareness) so the cost is concrete, not an abstract "prefer CALM".
@@ -590,11 +683,17 @@ case "$tool_name" in
     should_nudge=false
     if [ -n "$file_path" ]; then
       if is_indexed_file "$file_path"; then
-        should_nudge=true
-        would_deny="read_native"
+        # 2026-07-14 conditional-enforcement redesign: a short file is cheap
+        # to read whole either way, so only nudge once the file is long
+        # enough that source(symbol)/file_overview's savings are real (see
+        # this file's "steepest hill" header block above).
+        if file_worth_symbol_read "$file_path"; then
+          should_nudge=true
+          would_deny="read_native"
+        fi
       elif is_definitely_unindexed_path "$file_path"; then
         : # ci has nothing indexed here (dotdir / build-artifact dir) — native Read is correct
-      elif is_code_file "$file_path"; then
+      elif is_code_file "$file_path" && file_worth_symbol_read "$file_path"; then
         should_nudge=true
       fi
     else
@@ -602,29 +701,39 @@ case "$tool_name" in
     fi
     if [ "$should_nudge" = true ]; then
       bump native_explore
-      nudge_or_tally read_native "CI available in this repo — prefer mcp__calm__source(symbol) for a symbol-precise read, or mcp__calm__file_overview(path=\"${file_path}\") over reading the whole file (AGENTS.md Stage 3)."
+      nudge_or_tally read_native "CI available in this repo — prefer mcp__calm__source(symbol) for a symbol-precise read, or mcp__calm__file_overview(path=\"${file_path}\") over reading the whole file (AGENTS.md Stage 3).${TOOL_DISCOVERY_HINT}"
     fi
     ;;
   Grep)
     grep_path=$(jq -r '.tool_input.path // ""' <<<"$input")
     grep_pat=$(jq -r '.tool_input.pattern // ""' <<<"$input")
-    # Same ground-truth-first structure as Read above.
+    # Same ground-truth-first structure as Read above, now also gated on
+    # whether CALM actually has leverage here (2026-07-14 redesign, see
+    # "steepest hill" header block above): multi-file/repo-wide scope, or a
+    # symbol-shaped pattern even in one file. A single-file grep for a real
+    # regex/free-text phrase is left silent — native genuinely wins there.
     should_nudge=false
+    calm_has_leverage=false
+    if [ -z "$grep_path" ] || [ -d "$grep_path" ] || pattern_looks_like_identifier "$grep_pat"; then
+      calm_has_leverage=true
+    fi
     if [ -n "$grep_path" ]; then
       if is_indexed_file "$grep_path"; then
-        should_nudge=true
-        would_deny="grep_tool"
+        if [ "$calm_has_leverage" = true ]; then
+          should_nudge=true
+          would_deny="grep_tool"
+        fi
       elif is_definitely_unindexed_path "$grep_path"; then
         : # nothing indexed under this path — search/locate would come back empty, not stale
-      elif ! is_clearly_non_code_file "$grep_path"; then
+      elif ! is_clearly_non_code_file "$grep_path" && [ "$calm_has_leverage" = true ]; then
         should_nudge=true
       fi
-    else
+    elif [ "$calm_has_leverage" = true ]; then
       should_nudge=true
     fi
     if [ "$should_nudge" = true ]; then
       bump native_explore
-      nudge_or_tally grep_tool "CI available in this repo — prefer mcp__calm__search(query=\"${grep_pat}\", kind=\"hybrid\") or mcp__calm__locate(query=\"${grep_pat}\") for a symbol-aware search, or mcp__calm__search(query=\"${grep_pat}\", kind=\"grep\") for a literal match (also covers files the parser skips) instead of Grep (AGENTS.md Stage 2)."
+      nudge_or_tally grep_tool "CI available in this repo — prefer mcp__calm__search(query=\"${grep_pat}\", kind=\"hybrid\") or mcp__calm__locate(query=\"${grep_pat}\") for a symbol-aware search, or mcp__calm__search(query=\"${grep_pat}\", kind=\"grep\") for a literal match (also covers files the parser skips) instead of Grep (AGENTS.md Stage 2).${TOOL_DISCOVERY_HINT}"
     fi
     ;;
   Edit)
@@ -640,7 +749,7 @@ case "$tool_name" in
     # what the amnesty heuristic would have guessed (2026-07-14 B3 audit).
     if is_indexed_file "$file_path"; then
       if ! file_has_edit_context "$file_path"; then
-        deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
+        deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum.${TOOL_DISCOVERY_HINT}"
       fi
     elif is_definitely_unindexed_path "$file_path"; then
       : # CALM never indexes this path (dotdir/build-artifact) — edit_context
@@ -650,7 +759,7 @@ case "$tool_name" in
       decision="allow"
       decision_detail="edit_unindexed_path_no_edit_context_required"
     elif is_code_file "$file_path" && ! file_has_edit_context "$file_path"; then
-      deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
+      deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum.${TOOL_DISCOVERY_HINT}"
     fi
     ;;
   Write)
@@ -658,7 +767,7 @@ case "$tool_name" in
     if is_indexed_file "$file_path"; then
       # Same ground-truth-first reasoning as Edit above -- a tracked file
       # always gets the advisory nudge regardless of path-shape guessing.
-      nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
+      nudge write_native "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.${TOOL_DISCOVERY_HINT}"
     elif is_definitely_unindexed_path "$file_path"; then
       : # CALM never indexes this path (outside the repo root entirely, or a
         # dotdir/build-artifact dir) — edit_context can't resolve a symbol
@@ -668,7 +777,7 @@ case "$tool_name" in
         # already got this is_definitely_unindexed_path guard in the
         # 2026-07-13 redesign, Write was missed).
     else
-      nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
+      nudge write_native "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.${TOOL_DISCOVERY_HINT}"
     fi
     ;;
   Bash)
@@ -677,7 +786,7 @@ case "$tool_name" in
         target_root=$(resolve_git_target_root "$command")
         project_root=$(git rev-parse --show-toplevel 2>/dev/null)
         if [ -z "$target_root" ] || [ "$target_root" = "$project_root" ]; then
-          deny 'MANDATORY per AGENTS.md Stage 7 — call mcp__calm__diff_impact(staged=true) before this commit/push, never skip. Files changed since the last diff_impact check.'
+          deny "MANDATORY per AGENTS.md Stage 7 — call mcp__calm__diff_impact(staged=true) before this commit/push, never skip. Files changed since the last diff_impact check.${TOOL_DISCOVERY_HINT}"
         fi
       fi
       # Commit allowed (gate satisfied): a reflection point the agent never
@@ -692,11 +801,22 @@ case "$tool_name" in
         # searching files — CALM search/locate can't replace it, and a
         # false nudge here erodes trust in every real one
     elif grep -qE '\b(grep|rg|ag)\b' <<<"$command"; then
-      bump native_explore
-      nudge_or_tally bash_grep 'CI available in this repo — prefer mcp__calm__search(query, kind="hybrid"|"grep") or mcp__calm__locate over a standalone file grep via Bash (AGENTS.md Stage 2).'
+      # 2026-07-14 conditional-enforcement redesign (see "steepest hill"
+      # header block above): a single-existing-file, non-recursive grep is
+      # left silent — native genuinely has no CALM disadvantage there, and
+      # nudging it anyway is exactly the false-positive class that erodes
+      # trust in every other nudge. Pattern-shape (identifier vs regex)
+      # isn't checked here — too fragile to extract reliably from an
+      # arbitrary shell command string, unlike Grep's clean JSON `pattern`
+      # field above — so this only gates on file-count/recursion, which
+      # `bash_grep_targets_single_file` can determine robustly.
+      if ! bash_grep_targets_single_file "$command"; then
+        bump native_explore
+        nudge_or_tally bash_grep "CI available in this repo — prefer mcp__calm__search(query, kind=\"hybrid\"|\"grep\") or mcp__calm__locate over a standalone file grep via Bash (AGENTS.md Stage 2).${TOOL_DISCOVERY_HINT}"
+      fi
     elif grep -qE '\bfind\b.*-i?name\b' <<<"$command"; then
       bump native_explore
-      nudge_or_tally bash_find 'CI available in this repo — prefer mcp__calm__search(query, kind="file") or mcp__calm__file_overview / mcp__calm__dependencies over find (AGENTS.md Stage 1-2).'
+      nudge_or_tally bash_find "CI available in this repo — prefer mcp__calm__search(query, kind=\"file\") or mcp__calm__file_overview / mcp__calm__dependencies over find (AGENTS.md Stage 1-2).${TOOL_DISCOVERY_HINT}"
     fi
     ;;
 esac

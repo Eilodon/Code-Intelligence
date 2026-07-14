@@ -98,4 +98,75 @@ if [ -f .calm/index.db ]; then
   fi
 fi
 
+# --- 2026-07-14 conditional-enforcement tests (search/grep "steepest hill"
+# redesign): nudge only when CALM actually has leverage, silent otherwise ---
+run_hook_grep() {
+  # $1=path (may be empty for repo-wide) $2=pattern
+  jq -nc --arg session "$session_id_test" --arg path "${1:-}" --arg pat "${2:-}" \
+    '{session_id: $session, tool_name: "Grep", tool_input: {path: $path, pattern: $pat}}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
+run_hook_bash() {
+  jq -nc --arg session "$session_id_test" --arg cmd "$1" \
+    '{session_id: $session, tool_name: "Bash", tool_input: {command: $cmd}}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
+run_hook_read_path() {
+  jq -nc --arg session "$session_id_test" --arg path "$1" \
+    '{session_id: $session, tool_name: "Read", tool_input: {file_path: $path}}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
+is_silent() { [ -z "$1" ]; }
+
+# 6. Grep on one specific indexed file with a real regex/free-text pattern
+#    -> SILENT (native genuinely has no CALM disadvantage here).
+out=$(run_hook_grep "crates/calm-core/src/edit.rs" 'fn\s+\w+\(')
+is_silent "$out" || fail "expected silence for single-file regex grep, got: $out"
+
+# 7. Same file, but an identifier-shaped pattern -> NUDGE (mcp__calm__locate
+#    gives strictly more than a text match here, regardless of file scope).
+#    Also checked here for the tool-discovery hint (2026-07-14 redesign):
+#    "prefer mcp__calm__X" is only actionable if the agent knows a deferred-
+#    tools client might need an explicit discovery step first. Checked on
+#    this specific call (not a separate one) since NUDGE_CAP=2 means the
+#    SAME key ("grep_tool") only carries the full message twice per session
+#    -- a later call would silently fall into tally mode and this assertion
+#    would flake depending on how many prior grep_tool nudges ran earlier
+#    in this test file.
+out=$(run_hook_grep "crates/calm-core/src/edit.rs" "validate_syntax_diff")
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "expected a nudge for single-file identifier-shaped grep, got: $out"
+echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "tool-discovery step" \
+  || fail "expected TOOL_DISCOVERY_HINT in a grep nudge, got: $out"
+
+# 8. No path at all (repo-wide) -> NUDGE regardless of pattern shape.
+out=$(run_hook_grep "" 'fn\s+\w+\(')
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "expected a nudge for repo-wide grep (no path), got: $out"
+
+# 9. Bash grep targeting exactly one existing file, no -r -> SILENT.
+out=$(run_hook_bash 'grep -n "fn validate_syntax" crates/calm-core/src/edit.rs')
+is_silent "$out" || fail "expected silence for single-file Bash grep, got: $out"
+
+# 10. Bash grep with -r -> NUDGE (multi-file/repo-wide scope).
+out=$(run_hook_bash 'grep -rn "fn validate_syntax" crates/')
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "expected a nudge for recursive Bash grep, got: $out"
+
+# 11. Deny messages also carry the tool-discovery hint -- edit_context is
+#     just as deferrable as search/locate, and a hard deny whose only
+#     remediation is an unloadable tool is a real deadlock, not just noise.
+out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted2.rs")
+echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "tool-discovery step" \
+  || fail "expected TOOL_DISCOVERY_HINT in the edit_context deny reason, got: $out"
+
+# 12. Read on a short (<80 line) real indexed source file -> SILENT.
+out=$(run_hook_read_path "$(pwd)/crates/calm-core/src/lib.rs")
+is_silent "$out" || fail "expected silence for a short (34-line) indexed file Read, got: $out"
+
+# 13. Read on a long real indexed source file -> NUDGE.
+out=$(run_hook_read_path "$(pwd)/crates/calm-server/src/tools/edit.rs")
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "expected a nudge for a long indexed file Read, got: $out"
+
 echo "PASS"

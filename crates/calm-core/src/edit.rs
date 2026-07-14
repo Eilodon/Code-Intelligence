@@ -458,8 +458,8 @@ fn count_parse_errors(node: tree_sitter::Node) -> usize {
 /// as "allow the write", same convention as `validate_syntax`.
 pub fn validate_syntax_diff(original: &str, new_content: &str, extension: &str) -> Option<bool> {
     let language = language_for_extension(extension)?;
-    let new_errors = parse_tree(new_content, language)
-        .map(|t| count_parse_errors(t.root_node()))?;
+    let new_errors =
+        parse_tree(new_content, language).map(|t| count_parse_errors(t.root_node()))?;
     if new_errors == 0 {
         return Some(true);
     }

@@ -526,14 +526,20 @@ fn daemon_calm_dir_and_socket_have_restrictive_permissions() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(daemon_log_mode, 0o600, "daemon.log must be created at exactly 0600");
+    assert_eq!(
+        daemon_log_mode, 0o600,
+        "daemon.log must be created at exactly 0600"
+    );
 
     let audit_log_mode = std::fs::metadata(calm_dir.join("audit.log"))
         .unwrap()
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(audit_log_mode, 0o600, "audit.log must be created at exactly 0600");
+    assert_eq!(
+        audit_log_mode, 0o600,
+        "audit.log must be created at exactly 0600"
+    );
 
     let pid = read_daemon_pid(project.path()).unwrap();
     unsafe {

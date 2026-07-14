@@ -108,6 +108,20 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
+        /// Also scaffold the CALM MCP tool workflow into AGENTS.md at the
+        /// project root, inside a `<!-- calm:workflow:start/end -->`
+        /// marker block shared verbatim with the `calm_workflow` MCP
+        /// Prompt (`calm_core::workflow::CALM_WORKFLOW_GUIDE`). Rerunning
+        /// is idempotent (replaces only the marked block). Off by default
+        /// — `calm init` alone never touches AGENTS.md.
+        #[arg(long)]
+        agents_md: bool,
+        /// With `--agents-md`: append the CALM block to an existing
+        /// AGENTS.md that has no marker yet, instead of refusing. Has no
+        /// effect once a marker block already exists (that rerun is
+        /// always safe without `--force` — see `write_agents_md_block`).
+        #[arg(long)]
+        force: bool,
     },
     /// Write MCP client config (.mcp.json, .cursor/mcp.json,
     /// .vscode/mcp.json) pointing at this binary, so an external project
@@ -629,7 +643,11 @@ async fn main() -> Result<()> {
                 std::io::Write::write_all(&mut w, b"\n")?;
             }
         }
-        Commands::Init { project_root } => {
+        Commands::Init {
+            project_root,
+            agents_md,
+            force,
+        } => {
             let root = if project_root.exists() {
                 std::fs::canonicalize(&project_root)?
             } else {
@@ -646,6 +664,13 @@ async fn main() -> Result<()> {
             } else {
                 std::fs::write(&config_path, calm_core::config::default_config_json())?;
                 println!("Created {}", config_path.display());
+            }
+
+            if agents_md {
+                match write_agents_md_block(&root, force) {
+                    Ok(action) => println!("AGENTS.md: {action}"),
+                    Err(e) => println!("AGENTS.md: skipped ({e})"),
+                }
             }
 
             println!();
@@ -786,6 +811,111 @@ fn write_mcp_config_entry(
         format!("{}\n", serde_json::to_string_pretty(&root_value)?),
     )?;
     Ok(action)
+}
+
+/// Writes/updates `calm init --agents-md`'s managed block inside
+/// `<project_root>/AGENTS.md` -- `calm_core::workflow::CALM_WORKFLOW_GUIDE`,
+/// the same const the `calm_workflow` MCP Prompt renders, wrapped in a
+/// `<!-- calm:workflow:start/end -->` marker pair so a rerun can find and
+/// replace exactly its own prior output without touching anything else in
+/// the file. Mirrors `write_mcp_config_entry`'s "never touch ambiguous
+/// state" philosophy, adapted for a markdown file instead of JSON:
+///
+/// - file absent -> create it with just the marked block (LF line endings,
+///   this repo's own convention).
+/// - file present, exactly one well-formed marker pair -> idempotent
+///   replace between the markers -- CALM's own managed content, safe
+///   without `--force`, same as re-running never needs `--force` for its
+///   own `"calm"` key in `write_mcp_config_entry`.
+/// - file present, zero markers -> refuse unless `force`; `--force`
+///   appends the block to the end of the existing file instead of
+///   touching its content.
+/// - file present, malformed markers (only one of the pair, or either
+///   marker appears more than once) -> always refuse, even with
+///   `--force` -- this is the one case where we can't tell what's safe to
+///   touch, matching `write_mcp_config_entry`'s unconditional refusal on
+///   invalid JSON (that case ignores `force` too).
+///
+/// Preserves the target file's existing line-ending convention (CRLF if
+/// the file already uses it) for the inserted block, so a rerun on a
+/// Windows-authored file doesn't introduce mixed line endings.
+fn write_agents_md_block(root: &std::path::Path, force: bool) -> Result<&'static str> {
+    use calm_core::workflow::{AGENTS_MD_MARKER_END, AGENTS_MD_MARKER_START, CALM_WORKFLOW_GUIDE};
+
+    let path = root.join("AGENTS.md");
+    let block_body = format!(
+        "{AGENTS_MD_MARKER_START}\n\
+         ## CALM MCP workflow\n\
+         \n\
+         {CALM_WORKFLOW_GUIDE}\n\
+         \n\
+         _This block is managed by `calm init --agents-md` \u{2014} content \
+         between the markers is replaced on rerun; edit freely outside \
+         them._\n\
+         {AGENTS_MD_MARKER_END}"
+    );
+
+    if !path.exists() {
+        std::fs::write(&path, format!("{block_body}\n"))?;
+        return Ok("wrote");
+    }
+
+    let existing = std::fs::read_to_string(&path)?;
+    let uses_crlf = existing.contains("\r\n");
+    let block_body = if uses_crlf {
+        block_body.replace('\n', "\r\n")
+    } else {
+        block_body
+    };
+    let nl = if uses_crlf { "\r\n" } else { "\n" };
+
+    let start_count = existing.matches(AGENTS_MD_MARKER_START).count();
+    let end_count = existing.matches(AGENTS_MD_MARKER_END).count();
+
+    match (start_count, end_count) {
+        (0, 0) => {
+            if !force {
+                anyhow::bail!(
+                    "AGENTS.md exists without a calm:workflow marker \u{2014} pass --force to append the CALM block, or add the markers by hand"
+                );
+            }
+            let double_nl = format!("{nl}{nl}");
+            let sep: &str = if existing.is_empty() || existing.ends_with(&double_nl) {
+                ""
+            } else if existing.ends_with(nl) {
+                nl
+            } else {
+                &double_nl
+            };
+            let updated = format!("{existing}{sep}{block_body}{nl}");
+            std::fs::write(&path, updated)?;
+            Ok("appended")
+        }
+        (1, 1) => {
+            let start_idx = existing.find(AGENTS_MD_MARKER_START).unwrap();
+            let end_idx = existing.find(AGENTS_MD_MARKER_END).unwrap() + AGENTS_MD_MARKER_END.len();
+            if end_idx <= start_idx {
+                anyhow::bail!(
+                    "AGENTS.md's calm:workflow end marker appears before its start marker \u{2014} leaving it untouched, fix by hand"
+                );
+            }
+            let before = &existing[..start_idx];
+            let after = existing[end_idx..].trim_start_matches(['\n', '\r']);
+            let mut updated = String::with_capacity(existing.len() + block_body.len());
+            updated.push_str(before);
+            updated.push_str(&block_body);
+            updated.push_str(nl);
+            updated.push_str(after);
+            if updated == existing {
+                return Ok("up to date");
+            }
+            std::fs::write(&path, updated)?;
+            Ok("updated")
+        }
+        _ => anyhow::bail!(
+            "AGENTS.md has an unexpected number of calm:workflow markers (start={start_count}, end={end_count}) \u{2014} leaving it untouched, this needs a manual fix, not --force"
+        ),
+    }
 }
 
 /// Manual MCP config snippet for clients that only read a global (not
@@ -1045,5 +1175,144 @@ mod tests {
             written["mcpServers"]["calm"]["args"],
             serde_json::json!(["-y", "@eilodon/calm-mcp", "serve"])
         );
+    }
+
+    #[test]
+    fn agents_md_block_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let action = write_agents_md_block(dir.path(), false).unwrap();
+
+        assert_eq!(action, "wrote");
+        let text = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(text.contains(calm_core::workflow::AGENTS_MD_MARKER_START));
+        assert!(text.contains(calm_core::workflow::AGENTS_MD_MARKER_END));
+        assert!(text.contains(calm_core::workflow::CALM_WORKFLOW_GUIDE));
+        assert!(!text.contains("\r\n"), "new file must use LF");
+    }
+
+    #[test]
+    fn agents_md_block_rerun_is_idempotent_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_agents_md_block(dir.path(), false).unwrap();
+        let first = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        let action = write_agents_md_block(dir.path(), false).unwrap();
+        let second = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+
+        assert_eq!(action, "up to date");
+        assert_eq!(first, second, "rerun must be byte-identical, not grow");
+    }
+
+    #[test]
+    fn agents_md_block_rerun_preserves_content_outside_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+
+        write_agents_md_block(dir.path(), false).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let hand_written = format!(
+            "# My notes\n\nSome human-written context.\n\n{original}\n\nMore notes after.\n"
+        );
+        std::fs::write(&path, &hand_written).unwrap();
+
+        let action = write_agents_md_block(dir.path(), false).unwrap();
+
+        assert_eq!(action, "updated");
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# My notes"));
+        assert!(updated.contains("Some human-written context."));
+        assert!(updated.contains("More notes after."));
+        assert_eq!(
+            updated
+                .matches(calm_core::workflow::AGENTS_MD_MARKER_START)
+                .count(),
+            1
+        );
+
+        // Idempotent from here on too.
+        let action2 = write_agents_md_block(dir.path(), false).unwrap();
+        assert_eq!(action2, "up to date");
+    }
+
+    #[test]
+    fn agents_md_block_refuses_existing_file_without_marker_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &path,
+            "# Existing project notes\n\nHand-written, no CALM block.\n",
+        )
+        .unwrap();
+
+        let err = write_agents_md_block(dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("--force"));
+        let unchanged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            unchanged,
+            "# Existing project notes\n\nHand-written, no CALM block.\n"
+        );
+
+        let action = write_agents_md_block(dir.path(), true).unwrap();
+        assert_eq!(action, "appended");
+        let appended = std::fs::read_to_string(&path).unwrap();
+        assert!(appended.contains("# Existing project notes"));
+        assert!(appended.contains(calm_core::workflow::AGENTS_MD_MARKER_START));
+
+        // Second run (even without --force) now hits the (1,1) idempotent
+        // path, not the zero-marker path — --force is only needed once.
+        let action2 = write_agents_md_block(dir.path(), false).unwrap();
+        assert_eq!(action2, "up to date");
+    }
+
+    #[test]
+    fn agents_md_block_refuses_malformed_markers_even_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+
+        // Only a start marker, no matching end — orphaned pair.
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nsome content, never closed\n",
+                calm_core::workflow::AGENTS_MD_MARKER_START
+            ),
+        )
+        .unwrap();
+        let err = write_agents_md_block(dir.path(), true).unwrap_err();
+        assert!(err.to_string().contains("unexpected number"));
+
+        // Two start markers — ambiguous, also refused even with force.
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\ncontent\n{}\n",
+                calm_core::workflow::AGENTS_MD_MARKER_START,
+                calm_core::workflow::AGENTS_MD_MARKER_START,
+                calm_core::workflow::AGENTS_MD_MARKER_END
+            ),
+        )
+        .unwrap();
+        let err = write_agents_md_block(dir.path(), true).unwrap_err();
+        assert!(err.to_string().contains("unexpected number"));
+    }
+
+    #[test]
+    fn agents_md_block_preserves_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "# Windows-authored notes\r\n\r\nContent.\r\n").unwrap();
+
+        write_agents_md_block(dir.path(), true).unwrap();
+        let appended = std::fs::read_to_string(&path).unwrap();
+        assert!(appended.contains("\r\n"));
+        assert!(
+            !appended.replace("\r\n", "").contains('\n'),
+            "every newline must be paired with \\r once CRLF is detected, got: {appended:?}"
+        );
+
+        // Rerun stays idempotent under CRLF too.
+        let action = write_agents_md_block(dir.path(), false).unwrap();
+        assert_eq!(action, "up to date");
     }
 }

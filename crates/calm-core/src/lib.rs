@@ -18,6 +18,7 @@ pub mod scip;
 pub mod search;
 pub mod types;
 pub mod walk;
+pub mod workflow;
 
 /// Git commit this binary was built from (short SHA, `-dirty` suffix if the
 /// working tree had uncommitted changes at build time), or `"unknown"` if

@@ -507,19 +507,22 @@ fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Opt
         // Condensed, not a copy of AGENTS.md: names the tool per stage and
         // the 2 hard-enforced checks, points to AGENTS.md for full detail
         // rather than re-deriving every signal/edge-case bullet it documents.
-        "calm_workflow" => Some(
-            "CALM MCP tool workflow -- 8 stages, ~29 tools, `suggested_next` on every response tells you what to call next:\n\
-             1. Orient -- repo_overview() ALWAYS first, then hotspots()/fitness_report() as needed.\n\
-             2. Locate -- locate(query) (search+file_overview+symbol_info in 1 call) or search(query, kind=...).\n\
-             3. Inspect -- source(symbol) for a symbol-precise read, or understand(symbol) for locate+source+callers together.\n\
-             4. Trace -- callers(symbol), callees(symbol), path(from,to), dependencies(path).\n\
-             5. Pre-Edit -- edit_context(symbol): MANDATORY before touching any symbol, no exceptions for real code (a Markdown/text heading is the one exception -- never carries a blast radius to check).\n\
-             6. Edit -- edit_symbol(...)/edit_lines(...): CALM's own write path, hash-verified, risk-gated, reindexes immediately. Fall back to native Edit/Write only for a brand-new file or a path CALM doesn't index (dotdirs, target/, node_modules/, etc.).\n\
-             7. Verify -- diff_impact(staged=true) MANDATORY before any commit/push -- no exceptions.\n\
-             8. Recover -- session_context() after 10+ calls without progress; remember(topic, content)/recall(topic) for durable cross-session notes.\n\
-             Only steps 5 and 7 are hard-enforced (a hook denies the native equivalent without them, under Claude Code); the rest is strongly recommended but not blocking. Full detail, every edge case, and the preset/toolset reference: AGENTS.md at the project root."
-                .to_string(),
-        ),
+        //
+        // The core 8-stage text is `calm_core::workflow::CALM_WORKFLOW_GUIDE`
+        // -- shared with `calm init --agents-md`'s AGENTS.md scaffold (see
+        // that const's own doc comment) so the two surfaces can't silently
+        // drift apart. The trailer below is deliberately NOT part of the
+        // shared const: it says where to find "full detail" conditionally
+        // (scaffold it, or read it if already present) rather than
+        // asserting AGENTS.md exists, since by default (no `--agents-md`)
+        // it doesn't.
+        "calm_workflow" => Some(format!(
+            "{}\n\n\
+             Full detail, every edge case, and the preset/toolset reference: run \
+             `calm init --agents-md` once to scaffold this into AGENTS.md, or read \
+             AGENTS.md at the project root if it's already present.",
+            calm_core::workflow::CALM_WORKFLOW_GUIDE
+        )),
         _ => None,
     }
 }
@@ -535,13 +538,28 @@ impl rmcp::ServerHandler for CalmServer {
         // `.prompts` are omitted from `initialize`, and a spec-compliant MCP
         // client never calls `tools/list`/`prompts/list` at all — the server
         // answers fine if asked directly, but nothing ever gets discovered.
+        //
+        // `instructions` is the one PUSH channel in the whole protocol: every
+        // client receives it on `initialize` with no further action needed,
+        // unlike Prompts (pull-only — a client must call `prompts/get` on its
+        // own initiative). Verified live, not assumed: this exact string
+        // reaches Claude Code's model context today as an "MCP Server
+        // Instructions" system block (2026-07-14 audit-design pass,
+        // docs/superskills/specs/2026-07-14-calm-mcp-external-onboarding.md,
+        // Item C). Naming `calm_workflow` here is what makes it
+        // discoverable at all for a client that never thinks to list prompts.
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .build(),
         )
-        .with_instructions("CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools")
+        .with_instructions(
+            "CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools. \
+             Call the `calm_workflow` prompt (no arguments) first: it returns the \
+             full 8-stage tool workflow, including the 2 gates every edit and \
+             commit must go through.",
+        )
     }
 
     // Hand-written instead of relying on `#[tool_router]`'s bare merged

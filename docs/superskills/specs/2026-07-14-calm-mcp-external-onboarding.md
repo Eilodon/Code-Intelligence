@@ -375,3 +375,32 @@ new — message this to users honestly as best-effort/defense-in-depth, never
 as guaranteed-unbypassable, matching Anthropic's own framing of what hooks
 are and are not reliable for; (f) new — file the same `exit 2` finding as a
 follow-up for `calm-nudge.sh` itself, independent of Item B's own fate.
+
+## calm-nudge.sh follow-up (f) — implemented, tested, resolved
+
+Shipped 2026-07-14, same day, commit `f1523ad`. `deny()` migrated from
+JSON `permissionDecision: "deny"` + `exit 0` to `exit 2` + stderr, framed
+in its own comment as best-effort/defense-in-depth (not unbypassable), per
+this addendum's finding that Anthropic's docs recommend the static
+permission system over hooks for hard enforcement.
+
+**Found along the way, not anticipated by this spec:** the migration
+exposed a real, previously-invisible bug in `acquire_state_lock`/
+`release_state_lock` (today's earlier DEBT-010 fix) — `exec {FD}>file
+2>/dev/null`, a bare `exec` with only redirects and no command, applies
+*every* one of its redirects to the current shell permanently, not
+per-command. The trailing `2>/dev/null` silently redirected this script's
+real stderr to `/dev/null` for the rest of the process the first time the
+lock ran successfully — invisible until this migration purely because the
+old JSON-based `deny()` never touched stderr. Root-caused via direct
+instrumentation (not guessed): a debug marker confirmed `deny()` was
+reached with the correct message, then a minimal standalone repro
+isolated the exact `exec ... 2>/dev/null` construct as the cause. Fixed by
+scoping the suppression to a `{ ...; } 2>/dev/null` group, which bash
+saves/restores around, while the `{FD}>file` open inside it still applies
+permanently as intended.
+
+**Verified live, not assumed:** both deny call sites (Stage 5 native-Edit
+gate, Stage 7 diff_impact gate) checked with byte-level stdout/stderr
+inspection before and after the fix. Stage 7 had zero automated coverage
+before this pass — added. Full suite (25 assertions) run 3x clean.

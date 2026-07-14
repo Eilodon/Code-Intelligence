@@ -108,7 +108,11 @@ state_file="$state_dir/${session_id}.json"
 # 1-in-20 still bounds unbounded growth of $state_dir without paying that
 # scan on every single hook call.
 if [ $((RANDOM % 20)) -eq 0 ]; then
-  find "$state_dir" -maxdepth 1 -name '*.json' -mtime +1 -delete 2>/dev/null || true
+  # DEBT-010 fix (L3 finding): *.json.lock siblings (introduced by
+  # acquire_state_lock/release_state_lock below) weren't covered by the
+  # original *.json-only glob -- would have accumulated as orphans forever
+  # otherwise, a new self-inflicted debt on top of fixing the race itself.
+  find "$state_dir" -maxdepth 1 \( -name '*.json' -o -name '*.json.lock' \) -mtime +1 -delete 2>/dev/null || true
 fi
 
 state='{}'
@@ -209,25 +213,60 @@ log_decision() {
 }
 trap log_decision EXIT
 
+# DEBT-010 fix (2026-07-14, docs/pattern-debt-registry.yaml; audit-design
+# PASS WITH FLAGS, docs/superskills/specs/2026-07-14-calm-remaining-
+# backlog-read-hardening-and-toctou.md): save_state/bump/
+# maybe_nudge_session_context all read-modify-write the same
+# $state_file ("cat" + jq + redirect, no lock between the read and the
+# write) — a real race, not theoretical: measured directly against this
+# repo's own decisions.jsonl, 92 distinct (timestamp, session_id) seconds
+# where 2+ hook invocations landed in the exact same wall-clock second,
+# consistent with this harness's own parallel tool-call dispatch within one
+# assistant turn. fd-based flock, NOT `flock -c "..."` — that form runs the
+# wrapped command in a subshell, which would silently drop any variable the
+# command needs to set for its caller (L2 finding from the audit that
+# reviewed this exact fix). 2s timeout, fails OPEN (proceeds unlocked
+# rather than blocking a tool call indefinitely on contention) — every
+# field these three functions write is an advisory-only counter/cache
+# (nudge_counts, edit_context_files, since_session_context); no currently-
+# shipped hard gate depends on one of these updates surviving a lost race,
+# so an occasional dropped increment is the acceptable failure mode, a hung
+# hook invocation is not.
+STATE_LOCK_FD=""
+acquire_state_lock() {
+  exec {STATE_LOCK_FD}>"${state_file}.lock" 2>/dev/null || { STATE_LOCK_FD=""; return; }
+  flock -w 2 "$STATE_LOCK_FD" 2>/dev/null || true
+}
+release_state_lock() {
+  [ -n "$STATE_LOCK_FD" ] || return 0
+  flock -u "$STATE_LOCK_FD" 2>/dev/null || true
+  exec {STATE_LOCK_FD}>&- 2>/dev/null || true
+  STATE_LOCK_FD=""
+}
+
 save_state() {
   # Merge onto existing state so orthogonal exploration counters
   # (native_explore / calm_explore, maintained by `bump`) survive a save of
   # the three gate-relevant fields — without the merge every save would wipe
   # them, silently zeroing the tally.
+  acquire_state_lock
   local prev='{}'
   [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
   jq -n --argjson prev "$prev" --argjson ecf "$1" --argjson nd "$2" --argjson nc "$3" \
     '$prev + {edit_context_files: $ecf, needs_diff_impact: $nd, nudge_counts: $nc}' \
     >"$state_file" 2>/dev/null || true
+  release_state_lock
 }
 
 # Increment one orthogonal counter in the state file, preserving every other
 # field (unlike save_state, which manages only the three gate fields). Backs
 # the native-vs-CALM exploration tally — the "changing number" signal.
 bump() {
+  acquire_state_lock
   local prev='{}'
   [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
   jq -c --arg k "$1" '.[$k] = ((.[$k] // 0) + 1)' <<<"$prev" >"$state_file" 2>/dev/null || true
+  release_state_lock
 }
 
 # True when a Bash command's target is somewhere CALM never indexes (logs,
@@ -402,17 +441,26 @@ SESSION_CONTEXT_REMINDER_EVERY=25
 # disk; using the stale start-of-script `$state` here would silently
 # clobber those with an outdated copy.
 maybe_nudge_session_context() {
+  # DEBT-010 fix: same shared state-file lock as save_state/bump — this
+  # function does its own independent read-modify-write cycle on
+  # $state_file (by design, see its own header comment above), so it
+  # shares the exact same race and needs the exact same protection.
+  # Released before EITHER exit point below (not just at the bottom) so
+  # the lock is never held past the last write in a given call.
+  acquire_state_lock
   local prev
   prev=$(cat "$state_file" 2>/dev/null || echo '{}')
   if [ "$tool_name" = "mcp__calm__session_context" ]; then
     if [ "$(jq -r '.since_session_context // 0' <<<"$prev")" != "0" ]; then
       jq -c '.since_session_context = 0' <<<"$prev" >"$state_file" 2>/dev/null || true
     fi
+    release_state_lock
     return 0
   fi
   local n
   n=$(jq -r '((.since_session_context // 0) + 1)' <<<"$prev")
   jq -c --argjson n "$n" '.since_session_context = $n' <<<"$prev" >"$state_file" 2>/dev/null || true
+  release_state_lock
   if [ $((n % SESSION_CONTEXT_REMINDER_EVERY)) -eq 0 ]; then
     decision="session_context_reminder"
     decision_detail="since_session_context=$n"

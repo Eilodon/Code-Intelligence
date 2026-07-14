@@ -9,7 +9,7 @@ source: audit-distill
 audit: calm-agent-experience-round2-fixes (docs/superskills/specs/2026-07-14-calm-agent-experience-round2-fixes.md)
 vheatm-version: audit-design FAST (no numeric VHEATM version tag in the source audit — pre-mortem + L1-L7 quick scan format, not a scored VHEATM run)
 skills-updated: [audit-design]
-pattern-debts-created: [DEBT-007-hook-state-toctou-race]
+pattern-debts-created: [DEBT-010-hook-state-toctou-race]
 mat-entries: 0
 ---
 
@@ -22,7 +22,7 @@ mat-entries: 0
   caught before it shipped. ✅
 
 ### PATTERN-DEBT Created
-- `DEBT-007-hook-state-toctou-race` (docs/pattern-debt-registry.yaml):
+- `DEBT-010-hook-state-toctou-race` (docs/pattern-debt-registry.yaml):
   unlocked read-modify-write on `.calm/.hook-state/<session_id>.json` in
   `calm-nudge.sh`'s `save_state`/`bump` — flagged `open`/`low` urgency
   (real but likely rare in practice; recommends measuring before fixing).
@@ -49,7 +49,7 @@ audit intentionally left open for a *future* session: (1) whether to harden
 Read/Grep from advisory to a real deny gate (F3 produced the evidence —
 16/27 real would_deny events are clean code-file misses — but the decision
 itself was deliberately deferred, not distilled as "done"); (2) the
-DEBT-007 TOCTOU race above (flagged, not fixed). Both remain real backlog,
+DEBT-010 TOCTOU race above (flagged, not fixed). Both remain real backlog,
 tracked in their respective source documents, not resolved by this
 distillation pass.
 

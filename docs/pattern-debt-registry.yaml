@@ -216,27 +216,32 @@ items:
       - "So sánh giá trị/chi phí với DEBT-005 (fix builtins pop rule) — cùng ngân sách kỹ thuật, builtins fix cải thiện tier formal đã có sẵn, phủ mọi file Python (len/print/range dùng khắp nơi)"
     owner_hint: calm-core/resolver
 
-  DEBT-007-hook-state-toctou-race:
-    status: open
-    urgency: low
+  DEBT-010-hook-state-toctou-race:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-07-14"
     description: >
       audit-design (2026-07-14, docs/superskills/specs/2026-07-14-calm-agent-
       experience-round2-fixes.md, L2 finding) xác nhận: `.claude/hooks/
-      calm-nudge.sh`'s `save_state()`/`bump()` đọc-sửa-ghi state file
-      (`.calm/.hook-state/<session_id>.json`) qua `cat` + `jq` + redirect rời
-      để, không có lock nào giữa 2 bước đọc và ghi — race thật nếu 2 hook
-      invocation chạy gần như đồng thời cùng 1 session_id (ví dụ 2 tool call
-      song song trong cùng phiên). Không phải speculation — pattern này vừa
-      lan rộng thêm trong cùng phiên (F1/F4/F5, 2026-07-14) thêm nhiều code
-      path mới cùng đọc/ghi chung file này, tăng bề mặt cho race cũ chứ
-      không tạo ra nó.
+      calm-nudge.sh`'s `save_state()`/`bump()`/`maybe_nudge_session_context()`
+      đọc-sửa-ghi state file (`.calm/.hook-state/<session_id>.json`) qua `cat`
+      + `jq` + redirect rời rạc, không có lock nào giữa 2 bước đọc và ghi.
+      Đo lại trước khi sửa (không đoán): 92 cửa sổ (timestamp, session_id)
+      trùng đúng 1 giây trong decisions.jsonl thật của repo này — khớp với
+      dispatch tool-call song song trong 1 lượt trả lời, không hiếm như đánh
+      giá "current_control" cũ (đã sai) từng ghi.
     current_control: >
-      Không có gì — audit ghi nhận rủi ro nhưng không chặn merge (F1/F2/F4/F5
-      đều không làm race tồi tệ hơn bản chất, chỉ thêm surface). Thực tế 2
-      tool call thật sự CHẠY ĐỖNG THờI (không chỉ gần nhau) hiếm trong 1
-      session Claude Code (thường tuần tự), nên severity thực tế thấp hơn lý
-      thuyết.
-    remaining:
-      - "Thêm file lock (flock) quanh read-modify-write trong save_state/bump, hoặc chuyển sang append-only log + tính toán lại từ log thay vì giữ state tổng hợp có thể ghì đè nhau"
-      - "Đo thực tế: có bao giờ 2 tool call cùng session_id thật sự concurrent không, trước khi đầu tư fix — tránh premature optimization cho race chưa từng quan sát thật"
+      Đã fix 2026-07-14 (audit-design PASS WITH FLAGS,
+      docs/superskills/specs/2026-07-14-calm-remaining-backlog-read-hardening-
+      and-toctou.md): `acquire_state_lock`/`release_state_lock` (fd-based
+      `flock`, KHÔNG dùng `flock -c` subshell theo đúng flag L2 của audit) bọc
+      cả 3 hàm đọc-sửa-ghi. Timeout 2s, fail-open (mất 1 lần tăng đếm rẻ hơn
+      là treo 1 lời gọi tool vô thời hạn). Verify sống: 15 tiến trình
+      calm-nudge.sh chạy THẬT SỰ song song, cùng session_id — bản CHƯA fix
+      (checkout từ commit trước) làm state file rỗng hoàn toàn (0 byte, không
+      chỉ mất vài lần tăng); bản đã fix cho đúng 15/15, chạy lại 3 lần liên
+      tiếp đều ổn định. Test hồi quy thường trực: test-calm-nudge.sh #24.
+      Cũng tiện thể mở rộng dọn dẹp (`find -delete`) sang cả `*.json.lock` để
+      không tạo nợ mới (L3 finding).
+    remaining: []
     owner_hint: hooks

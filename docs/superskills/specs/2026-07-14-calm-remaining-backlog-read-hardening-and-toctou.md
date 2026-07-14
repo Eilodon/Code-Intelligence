@@ -1,5 +1,5 @@
 ---
-title: CALM remaining backlog — graduated Read/Grep hard-gate + DEBT-007 state-file locking
+title: CALM remaining backlog — graduated Read/Grep hard-gate + DEBT-010 state-file locking
 date: 2026-07-14
 SPEC_APPROVED: true
 SPEC_ESCALATION: false
@@ -28,7 +28,7 @@ real evidence, but still a modest N against a mechanism that fires far more
 often than Edit — the asymmetric-risk argument in Rule 4 is a reason for
 caution in *how* we harden, not a reason to keep doing nothing forever.
 
-**B. `DEBT-007-hook-state-toctou-race`** (just opened this session,
+**B. `DEBT-010-hook-state-toctou-race`** (just opened this session,
 `docs/pattern-debt-registry.yaml`) flagged `calm-nudge.sh`'s
 `save_state()`/`bump()` read-modify-write on `.calm/.hook-state/
 <session_id>.json` as unlocked, but rated it `low` urgency assuming real
@@ -122,4 +122,17 @@ pending "measure first" — the measurement is done, and it says fix it.
 <!-- PASS | PASS WITH FLAGS | HOLD -->
 **HOLD on Item A** (Read/Grep graduated hard-gate). Two HIGH findings both undercut the core premise: the evidence base is ~2 independent sessions, not 16 (Failure Mode 2), and the counter as designed doesn't measure what it claims to (Failure Mode 1). Required before revisiting: (a) keep collecting shadow-mode `would_deny` data with the F4 UUID filter applied from the start, across more distinct real sessions, not just more raw events from the same few sessions; (b) redesign the counter to distinguish situations (e.g., per-file, or require no intervening CALM-tool call) before it can claim to measure "repeated disregard"; (c) add shadow-mode measurement for the escalation gate itself before it goes live.
 
-**PASS WITH FLAGS on Item B** (DEBT-007 `flock` fix) -- proceeds independently of Item A's HOLD (Failure Mode 3's concern doesn't apply while Item A stays unshipped). Flags for the plan: use the fd-based `flock` idiom (L2), extend the cleanup glob to cover `*.json.lock` (L3). Re-review Failure Mode 3 if Item A is ever revisited later.
+**PASS WITH FLAGS on Item B** (DEBT-010 `flock` fix) -- proceeds independently of Item A's HOLD (Failure Mode 3's concern doesn't apply while Item A stays unshipped). Flags for the plan: use the fd-based `flock` idiom (L2), extend the cleanup glob to cover `*.json.lock` (L3). Re-review Failure Mode 3 if Item A is ever revisited later.
+
+## Item B Results — implemented, tested, resolved
+
+Shipped 2026-07-14 exactly per the audit's PASS WITH FLAGS mitigations. `acquire_state_lock`/`release_state_lock` (fd-based `flock` -- `exec {fd}>"$lock"; flock -w 2 "$fd"`, never `flock -c "..."`, closing the exact L2 gap the audit flagged) now wrap all three read-modify-write sites on `$state_file`: `save_state`, `bump`, and `maybe_nudge_session_context` (the audit's Problem section only named the first two; the third does its own independent read-modify-write on the same file and needed the identical fix). 2s timeout, fails open. Cleanup glob extended to `*.json.lock` per the L3 finding.
+
+**Verified live, not assumed:**
+- 15 truly-parallel (backgrounded, same `session_id`) hook invocations against the fixed code: `native_explore` landed at exactly 15/15, three runs in a row, no flakiness.
+- The same 15-way race against the actual last-committed PRE-fix `calm-nudge.sh` (`git show HEAD:...`, not a hand-edited approximation): the state file came out **completely empty (0 bytes)**, not just missing a few increments — a more dramatic, unambiguous confirmation of the bug than the spec's Problem section even claimed.
+- New permanent regression test `test-calm-nudge.sh` #24 formalizes this exact 15-way race check.
+
+**Registry updated:** `DEBT-010-hook-state-toctou-race` (renamed from a colliding `DEBT-007` -- a real duplicate-ID bug caught and fixed in the same pass, see commit history) moved `open` → `resolved` in `docs/pattern-debt-registry.yaml`, with the stale "severity thực tế thấp hơn lý thuyết" (rare in practice) claim corrected to reflect the 92-window measurement instead.
+
+Item A remains HOLD, untouched -- not part of this implementation pass.

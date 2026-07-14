@@ -346,4 +346,29 @@ if [ "$((f5_after - f5_before))" -ne 1 ]; then
   fail "F5: an irrelevant Bash command must produce exactly 1 decisions.jsonl line via the fast path, got delta=$((f5_after - f5_before))"
 fi
 
+# 24. DEBT-010 (2026-07-14 audit-design PASS WITH FLAGS): N truly-parallel
+#     PostToolUse Bash-grep invocations for the SAME session_id must not
+#     lose any native_explore increments -- the flock around save_state/
+#     bump/maybe_nudge_session_context's read-modify-write on $state_file
+#     is what this test actually exercises. Proven real without the fix:
+#     the same test against the last-committed pre-fix calm-nudge.sh left
+#     the state file completely EMPTY (0 bytes, not just a lower count) --
+#     see the spec's Risk Assessment for that comparison. Uses its own
+#     session_id (not session_id_test) so it starts from a clean counter.
+race_sid="toctou-race-test-$$"
+race_pids=()
+for i in $(seq 1 15); do
+  jq -nc --arg session "$race_sid" \
+    '{session_id: $session, hook_event_name: "PostToolUse", tool_name: "Bash",
+      tool_input: {command: "grep -rn foo crates/"},
+      tool_response: {stdout: "crates/a.rs:1:foo\ncrates/b.rs:2:foo\ncrates/c.rs:3:foo"}}' \
+    | bash .claude/hooks/calm-nudge.sh >/dev/null 2>&1 &
+  race_pids+=($!)
+done
+for p in "${race_pids[@]}"; do wait "$p"; done
+race_count=$(jq -r '.native_explore // 0' "$state_dir/${race_sid}.json" 2>/dev/null || echo 0)
+if [ "$race_count" -ne 15 ]; then
+  fail "DEBT-010: expected exactly 15 native_explore increments after 15 truly-parallel same-session hook invocations (state-file lock must prevent lost updates), got: $race_count"
+fi
+
 echo "PASS"

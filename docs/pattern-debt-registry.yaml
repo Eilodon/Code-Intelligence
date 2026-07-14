@@ -215,3 +215,28 @@ items:
       - "Nếu muốn dữ liệu dương tính thật (goto-definition) phải qua LSP (ty server/pyright-langserver), không phải subprocess một lần — chi phí kỹ thuật khác hẳn, cần đánh giá riêng"
       - "So sánh giá trị/chi phí với DEBT-005 (fix builtins pop rule) — cùng ngân sách kỹ thuật, builtins fix cải thiện tier formal đã có sẵn, phủ mọi file Python (len/print/range dùng khắp nơi)"
     owner_hint: calm-core/resolver
+
+  DEBT-007-hook-state-toctou-race:
+    status: open
+    urgency: low
+    description: >
+      audit-design (2026-07-14, docs/superskills/specs/2026-07-14-calm-agent-
+      experience-round2-fixes.md, L2 finding) xác nhận: `.claude/hooks/
+      calm-nudge.sh`'s `save_state()`/`bump()` đọc-sửa-ghi state file
+      (`.calm/.hook-state/<session_id>.json`) qua `cat` + `jq` + redirect rời
+      để, không có lock nào giữa 2 bước đọc và ghi — race thật nếu 2 hook
+      invocation chạy gần như đồng thời cùng 1 session_id (ví dụ 2 tool call
+      song song trong cùng phiên). Không phải speculation — pattern này vừa
+      lan rộng thêm trong cùng phiên (F1/F4/F5, 2026-07-14) thêm nhiều code
+      path mới cùng đọc/ghi chung file này, tăng bề mặt cho race cũ chứ
+      không tạo ra nó.
+    current_control: >
+      Không có gì — audit ghi nhận rủi ro nhưng không chặn merge (F1/F2/F4/F5
+      đều không làm race tồi tệ hơn bản chất, chỉ thêm surface). Thực tế 2
+      tool call thật sự CHẠY ĐỖNG THờI (không chỉ gần nhau) hiếm trong 1
+      session Claude Code (thường tuần tự), nên severity thực tế thấp hơn lý
+      thuyết.
+    remaining:
+      - "Thêm file lock (flock) quanh read-modify-write trong save_state/bump, hoặc chuyển sang append-only log + tính toán lại từ log thay vì giữ state tổng hợp có thể ghì đè nhau"
+      - "Đo thực tế: có bao giờ 2 tool call cùng session_id thật sự concurrent không, trước khi đầu tư fix — tránh premature optimization cho race chưa từng quan sát thật"
+    owner_hint: hooks

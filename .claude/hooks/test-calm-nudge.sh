@@ -6,6 +6,7 @@
 # non-zero with a FAIL message naming which assertion broke.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+repo_root="$(pwd)"
 
 session_id_test="test-$$"
 # Isolated per-run state dir (2026-07-14 eval-set prerequisite): calm-nudge.sh
@@ -278,5 +279,71 @@ echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "format_fi
 out=$(run_hook_bash 'cargo fmt --all -- --check')
 echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "format_files" \
   || fail "expected a format_files nudge for a raw cargo fmt invocation, got: $out"
+
+# 19. F2 (2026-07-14 audit-design): native Edit on a prose (.md) file with
+#     no prior edit_context this session -> NUDGE, not deny (is_prose_file
+#     exemption -- a Markdown heading never carries a blast radius to
+#     check, see is_prose_file's own doc comment in calm-nudge.sh).
+out=$(run_hook "Edit" "AGENTS.md")
+if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+  fail "F2: expected a nudge (not deny) for a prose-file Edit with no prior edit_context, got: $out"
+fi
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "F2: expected a nudge for a prose-file Edit with no prior edit_context, got silence: $out"
+
+# 20. F2 regression: a real code file with no prior edit_context this
+#     session must still hard-deny -- is_prose_file must not have widened
+#     the exemption beyond .md/.txt.
+out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted3.rs")
+echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 \
+  || fail "F2 regression: expected deny for a real .rs file with no prior edit_context, got: $out"
+
+# 21. F4 (2026-07-14 audit-design): a non-UUID session_id WITHOUT
+#     CALM_NUDGE_STATE_DIR set must route to decisions.jsonl.manual, not
+#     decisions.jsonl -- run in an isolated throwaway CWD (its own .calm/)
+#     so this never touches this repo's own real decisions.jsonl.
+f4_dir=$(mktemp -d)
+(
+  cd "$f4_dir"
+  unset CALM_NUDGE_STATE_DIR
+  echo '{"session_id":"not-a-real-uuid-shape","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo hi"}}' \
+    | bash "$repo_root/.claude/hooks/calm-nudge.sh" >/dev/null
+)
+if [ ! -f "$f4_dir/.calm/.hook-state/decisions.jsonl.manual" ]; then
+  fail "F4: non-UUID session_id without CALM_NUDGE_STATE_DIR should create decisions.jsonl.manual"
+fi
+if [ -s "$f4_dir/.calm/.hook-state/decisions.jsonl" ]; then
+  fail "F4: non-UUID session_id without CALM_NUDGE_STATE_DIR should NOT write to decisions.jsonl, got: $(cat "$f4_dir/.calm/.hook-state/decisions.jsonl")"
+fi
+rm -rf "$f4_dir"
+
+# 22. F4 regression: a real UUIDv4-shaped session_id, same no-override
+#     conditions, must still land in decisions.jsonl (not .manual) -- the
+#     allowlist must not over-trigger on real traffic.
+f4_dir2=$(mktemp -d)
+(
+  cd "$f4_dir2"
+  unset CALM_NUDGE_STATE_DIR
+  echo '{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo hi"}}' \
+    | bash "$repo_root/.claude/hooks/calm-nudge.sh" >/dev/null
+)
+if [ ! -s "$f4_dir2/.calm/.hook-state/decisions.jsonl" ]; then
+  fail "F4 regression: a real UUID-shaped session_id should still write to decisions.jsonl"
+fi
+if [ -f "$f4_dir2/.calm/.hook-state/decisions.jsonl.manual" ]; then
+  fail "F4 regression: a real UUID-shaped session_id must NOT be routed to decisions.jsonl.manual"
+fi
+rm -rf "$f4_dir2"
+
+# 23. F5 (2026-07-14 audit-design mitigation): an irrelevant Bash command
+#     (no git/grep/rg/ag/find/rustfmt/fmt) must still produce exactly one
+#     decisions.jsonl line -- the fast path must never bypass log_decision
+#     (audit Failure Mode 3).
+f5_before=$(wc -l < "$state_dir/decisions.jsonl" 2>/dev/null || echo 0)
+run_hook_bash 'cargo build --quiet -p calm-cli' >/dev/null
+f5_after=$(wc -l < "$state_dir/decisions.jsonl" 2>/dev/null || echo 0)
+if [ "$((f5_after - f5_before))" -ne 1 ]; then
+  fail "F5: an irrelevant Bash command must produce exactly 1 decisions.jsonl line via the fast path, got delta=$((f5_after - f5_before))"
+fi
 
 echo "PASS"

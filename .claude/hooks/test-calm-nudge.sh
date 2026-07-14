@@ -62,4 +62,40 @@ if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/
   fail "expected a.rs to STILL be allowed after b.rs was separately unlocked (per-file state must be additive), got deny: $out"
 fi
 
+# 4. edit_context(symbol) with NO `path` (the normal way to call it for a
+#    globally-unique symbol name -- see EditContextParams' own doc comment)
+#    must still unlock that file for a later native Edit, by falling back to
+#    a read-only lookup against .calm/index.db mirroring resolve_symbol's own
+#    "exactly one row named X" criterion. Uses a real symbol from this repo
+#    (crates/calm-server/src/tools/common.rs::resolve_symbol_candidates) so
+#    the DB lookup has something real to find -- this is the exact regression
+#    a prior session hit editing crates/calm-cli/src/main.rs (see memory
+#    calm-two-tooling-bugs-root-cause-2026-07-14).
+run_hook_symbol_only() {
+  jq -nc --arg session "$session_id_test" --arg tool "$1" --arg symbol "$2" \
+    '{session_id: $session, tool_name: $tool, tool_input: {symbol: $symbol}}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
+if [ -f .calm/index.db ]; then
+  run_hook_symbol_only "mcp__calm__edit_context" "resolve_symbol_candidates" >/dev/null
+  out=$(run_hook "Edit" "crates/calm-server/src/tools/common.rs")
+  if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+    fail "expected allow for common.rs after edit_context(symbol-only) resolved it via the DB fallback, got deny: $out"
+  fi
+
+  # 5. A symbol name with more than one row in the DB (genuinely ambiguous,
+  #    or the real tool call would itself return `ambiguous`) must NOT be
+  #    guessed at -- no file gets unlocked, so a same-session native Edit on
+  #    an unrelated, never-edit_context'd file still denies as usual.
+  multi_name=$(sqlite3 -readonly -separator '|' .calm/index.db \
+    "SELECT name FROM symbols GROUP BY name HAVING COUNT(*) > 1 LIMIT 1;" 2>/dev/null || true)
+  if [ -n "$multi_name" ]; then
+    run_hook_symbol_only "mcp__calm__edit_context" "$multi_name" >/dev/null
+    out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted.rs")
+    if ! echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+      fail "expected deny: an ambiguous symbol name (>1 row) must not unlock any file, got: $out"
+    fi
+  fi
+fi
+
 echo "PASS"

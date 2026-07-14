@@ -257,6 +257,19 @@ impl CalmServer {
                 .unwrap_or_default();
             other_active_sessions.sort_by_key(|s| s.session_id);
 
+            // Backlog B5: purely derived from data already collected above --
+            // no new state, no new lock. Checked against the FULL (pre-
+            // max_fetched-truncation) `explored_files` so capping the display
+            // list below never hides a real overlap.
+            let mut overlapping_files: Vec<String> = other_active_sessions
+                .iter()
+                .filter_map(|s| s.last_touched_file.as_deref())
+                .filter(|f| explored_files.iter().any(|e| e == f))
+                .map(|f| f.to_string())
+                .collect();
+            overlapping_files.sort();
+            overlapping_files.dedup();
+
             let sn = if pending_diff_impact {
                 // Outranks frontier exploration — an unverified write is the
                 // more urgent gap regardless of client/host (this signal
@@ -302,6 +315,7 @@ impl CalmServer {
                 calls_since_progress,
                 possibly_stuck,
                 other_active_sessions,
+                overlapping_files,
                 suggested_next: sn,
             })
         }))
@@ -416,6 +430,15 @@ pub(crate) struct SessionContextOutput {
     /// file X" before stepping on the same area, without needing full A2A
     /// protocol support — see `CalmServer::active_sessions`.
     pub(crate) other_active_sessions: Vec<SessionSummary>,
+    /// Backlog B5 (docs/plans/2026-07-14-calm-agent-experience-audit-and-
+    /// backlog.md): files in `explored_files` (untruncated, before
+    /// `max_fetched` capping) that also match some OTHER active session's
+    /// `last_touched_file` -- a narrow, purely-derived overlap signal built
+    /// entirely from data `other_active_sessions` already carries, not a new
+    /// subsystem. Informational only, like `possibly_stuck` -- never gates
+    /// or reorders `suggested_next`; no reservation/locking semantics.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) overlapping_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

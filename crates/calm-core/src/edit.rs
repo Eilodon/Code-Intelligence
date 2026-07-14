@@ -692,6 +692,38 @@ mod tests {
     }
 
     #[test]
+    fn test_replacing_one_function_with_multiple_functions_parses_cleanly() {
+        // Repro for the reported "PARSE_ERROR false positive when replacing
+        // 1 function with N functions via edit_lines/edit_symbol"
+        // (2026-07-13 session, crates/calm-cli/src/main.rs split of
+        // write_mcp_config into calm_entry + write_mcp_config +
+        // write_mcp_config_entry). Checks whether apply_hunks + validate_syntax
+        // correctly accept a hash-matched hunk whose new_text holds several
+        // top-level functions instead of exactly one.
+        let original =
+            "fn before() {}\n\nfn old_impl(x: i32) -> i32 {\n    x + 1\n}\n\nfn after() {}\n";
+        let old_text = "fn old_impl(x: i32) -> i32 {\n    x + 1\n}\n";
+        let old_hash = hash_content(old_text);
+        let new_text = "fn helper_a() -> i32 {\n    1\n}\n\nfn helper_b(x: i32) -> i32 {\n    x + helper_a()\n}\n\nfn old_impl(x: i32) -> i32 {\n    helper_b(x)\n}\n";
+        let outcome = apply_hunks(
+            original,
+            &[HunkRequest {
+                start_line: 3,
+                end_line: 5,
+                expected_hash: Some(old_hash),
+                new_text: new_text.to_string(),
+            }],
+        )
+        .unwrap();
+        let new_content = outcome.new_content.expect("hash matched, should apply");
+        assert_eq!(
+            validate_syntax(&new_content, "rs"),
+            Some(true),
+            "new_content was:\n{new_content}"
+        );
+    }
+
+    #[test]
     fn test_unicode_multibyte_line_boundary_safe() {
         let original = "日本語\n中文测试\nEnglish\n";
         let old_hash = hash_content("中文测试\n");
@@ -961,6 +993,34 @@ mod tests {
         assert_eq!(
             out.new_content.unwrap(),
             "fn a() {}\nfn b() {}\nfn tail() {}\n"
+        );
+    }
+
+    #[test]
+    fn test_insertion_hunk_before_sandwiches_between_leading_doc_comment_and_symbol() {
+        // Deeper-dig finding for the reported "PARSE_ERROR false positive
+        // when replacing 1 function with N functions" (2026-07-13 main.rs
+        // session): `insertion_hunk`'s `Before` position anchors at
+        // `line_start`, which for any indexed symbol is the item's OWN
+        // line (see walk_symbols, crates/calm-core/src/indexer/parser.rs:
+        // 587 — `node.start_position().row + 1`, the raw tree-sitter node
+        // span). A leading `///` doc comment is a separate sibling node,
+        // never folded into that span. So `edit_symbol(position="before")`
+        // on a symbol that has its own doc comment lands the new content
+        // BETWEEN the doc comment and the symbol, not above the doc
+        // comment — the doc comment silently ends up describing whatever
+        // was just inserted, not the symbol it was written for. Always
+        // syntactically valid (doc comments precede anything), so this
+        // can never trigger PARSE_ERROR itself — it's a real but
+        // low-severity documentation-association gap, not a correctness
+        // bug, and does not on its own explain the original PARSE_ERROR.
+        let src = "/// Old doc for write_mcp_config.\nfn write_mcp_config() {}\n";
+        let h = insertion_hunk(src, 2, 2, InsertPosition::Before, "fn calm_entry() {}").unwrap();
+        let out = apply_hunks(src, &[h]).unwrap();
+        assert_eq!(
+            out.new_content.unwrap(),
+            "/// Old doc for write_mcp_config.\nfn calm_entry() {}\nfn write_mcp_config() {}\n",
+            "the old doc comment now sits above calm_entry, not write_mcp_config"
         );
     }
 

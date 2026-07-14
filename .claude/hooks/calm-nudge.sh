@@ -90,6 +90,14 @@ decision_log="$state_dir/decisions.jsonl"
 decision_log_cap=5000
 decision="allow"
 decision_detail=""
+# Shadow-mode signal (2026-07-14): set to a nudge key (e.g. "read_native")
+# whenever file_index-backed ground truth confirms a native Read/Grep hit a
+# file CALM actually has indexed — i.e. exactly the case a FUTURE hard-deny
+# gate (mirroring edit_context's) would block. Logged alongside the real
+# (still advisory) decision so the false-positive rate can be measured from
+# real sessions before ever flipping enforcement — never changes
+# permissionDecision itself.
+would_deny=""
 log_decision() {
   jq -nc \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -98,7 +106,8 @@ log_decision() {
     --arg decision "$decision" \
     --arg detail "$decision_detail" \
     --arg file "$file_path" \
-    '{ts: $ts, session_id: $session, tool_name: $tool, decision: $decision, detail: $detail, file_path: ($file | select(. != "") // null)}' \
+    --arg would_deny "$would_deny" \
+    '{ts: $ts, session_id: $session, tool_name: $tool, decision: $decision, detail: $detail, file_path: ($file | select(. != "") // null), would_deny: ($would_deny | select(. != "") // null)}' \
     >>"$decision_log" 2>/dev/null || true
   if [ -f "$decision_log" ]; then
     lines=$(wc -l <"$decision_log" 2>/dev/null || echo 0)
@@ -195,6 +204,30 @@ to_repo_relative() {
   esac
 }
 
+# Ground-truth (not guessed) check: does CALM's own index actually track this
+# exact file? `file_index` (`.calm/index.db`) is keyed by repo-relative path
+# (PRIMARY KEY, so this is a single fast lookup) and is populated for EVERY
+# walked file regardless of language or symbol count — the same table
+# `repo_overview`'s `total_files` and `file_overview` draw from. Found live
+# 2026-07-14 investigating why a native Read on AGENTS.md (293 lines, 13
+# indexed heading symbols) never even got nudged: the OLD path-shape guess
+# (`is_code_file`'s extension allowlist) doesn't include `.md`, so any
+# indexed markdown/docs file was silently invisible to the Read/Grep nudge —
+# a false NEGATIVE, the opposite failure from is_definitely_unindexed_path's
+# occasional false positives. This replaces guessing with certainty for the
+# "is this specific file indexed" question; `is_definitely_unindexed_path`
+# stays in use as the fallback for paths this can't confirm either way
+# (not yet indexed, or DB unavailable) so existing coverage never shrinks.
+is_indexed_file() {
+  local p; p=$(to_repo_relative "$1")
+  local db=".calm/index.db"
+  [ -f "$db" ] || return 1
+  local escaped="${p//\'/\'\'}"
+  local hit
+  hit=$(sqlite3 -readonly "$db" "SELECT 1 FROM file_index WHERE path = '$escaped' LIMIT 1;" 2>/dev/null || true)
+  [ "$hit" = "1" ]
+}
+
 # True if `path` has had edit_context called for it THIS session — per-FILE
 # state (not per-symbol: correlating each individual edit to a specific
 # prior edit_context(symbol) call still isn't reliable from a shell hook,
@@ -234,20 +267,41 @@ NUDGE_CAP=2
 TALLY_EVERY=6
 
 # $1 = throttle key (distinct budget per nudge *kind*, not shared), $2 = message
+#
+# 2026-07-14 backlog B2: NUDGE_CAP was counting *how many times shown* as a
+# proxy for "lesson learned", then going FULLY AND PERMANENTLY silent past
+# it — including no longer incrementing nudge_counts, so the count itself
+# froze at NUDGE_CAP forever and there was no way to tell "shown twice, never
+# happened again" apart from "shown twice, then happened 50 more times
+# silently". Fixed the same way nudge_or_tally already handles this for
+# native-explore: keep counting past the cap, and resurface every
+# TALLY_EVERY-th occurrence with the actual count instead of staying silent
+# forever. Deliberately NOT auto-escalating to a deny here (that would skip
+# the shadow-mode measurement step already agreed for Read/Grep in Part A of
+# the backlog doc) — this only ever changes message cadence, never
+# permissionDecision.
 nudge() {
-  local key="$1" msg="$2" count
+  local key="$1" msg="$2" count shown
   count=$(jq -r --arg k "$key" '.[$k] // 0' <<<"$nudge_counts")
-  if [ "$count" -ge "$NUDGE_CAP" ]; then
-    decision="allow_nudge_capped"
-    decision_detail="$key"
-    exit 0
-  fi
   nudge_counts=$(jq -c --arg k "$key" '.[$k] = ((.[$k] // 0) + 1)' <<<"$nudge_counts")
   save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
-  decision="nudge"
+  if [ "$count" -lt "$NUDGE_CAP" ]; then
+    decision="nudge"
+    decision_detail="$key"
+    jq -n --arg msg "$msg" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    exit 0
+  fi
+  shown=$((count + 1))
+  if [ $((shown % TALLY_EVERY)) -eq 0 ]; then
+    decision="nudge_repeat_tally"
+    decision_detail="$key:count=$shown"
+    jq -n --arg msg "$msg" --arg n "$shown" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: ("This is occurrence #" + $n + " of the same situation this session, without a change in approach: " + $msg)}}'
+    exit 0
+  fi
+  decision="allow_nudge_capped"
   decision_detail="$key"
-  jq -n --arg msg "$msg" \
-    '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
   exit 0
 }
 
@@ -446,15 +500,41 @@ resolve_git_target_root() {
 # matters here, and PreToolUse is all that's needed to observe it.
 if [ "$tool_name" = "mcp__calm__edit_context" ]; then
   ec_path=$(jq -r '.tool_input.path // ""' <<<"$input")
+  ec_symbol=$(jq -r '.tool_input.symbol // ""' <<<"$input")
   [ -n "$ec_path" ] && ec_path=$(to_repo_relative "$ec_path")
+  # `path` is legitimately optional on edit_context (only needed to
+  # disambiguate a same-named symbol across files -- see EditContextParams'
+  # own doc comment), so an agent calling it the normal way for a unique
+  # symbol name has no reason to pass it. But this hook only ever sees the
+  # REQUEST at PreToolUse, never the tool's response (Claude Code hooks
+  # don't expose tool_response here the way a PostToolUse hook would) --
+  # so without this fallback, edit_context_files silently never gains that
+  # file, and the very next native Edit on it is falsely denied even though
+  # edit_context genuinely ran and resolved it. Mirror
+  # resolve_symbol_candidates' own query (crates/calm-server/src/tools/
+  # common.rs) read-only against the same DB the server queries: if $db has
+  # exactly one row named $ec_symbol, that IS the file the real call just
+  # resolved to (same table, same `name = ?` match, same "exactly one row"
+  # criterion `resolve_symbol` uses to decide Found vs. Ambiguous) -- record
+  # it. Any other row count (0 or >1) means the real call either found
+  # nothing or came back `ambiguous` (no symbol actually resolved), so
+  # staying silent here is correct, not just conservative.
+  if [ -z "$ec_path" ] && [ -n "$ec_symbol" ]; then
+    db=".calm/index.db"
+    if [ -f "$db" ]; then
+      escaped=${ec_symbol//\'/\'\'}
+      rows=$(sqlite3 -readonly -separator '|' "$db" \
+        "SELECT path FROM symbols WHERE name = '$escaped';" 2>/dev/null || true)
+      row_count=$(printf '%s\n' "$rows" | grep -c . 2>/dev/null || echo 0)
+      if [ "${row_count:-0}" -eq 1 ] 2>/dev/null; then
+        ec_path=$(to_repo_relative "$rows")
+      fi
+    fi
+  fi
   decision_detail="state:edit_context_files+=${ec_path:-<any>}"
   if [ -n "$ec_path" ]; then
     edit_context_files=$(jq -c --arg p "$ec_path" '. + [$p] | unique' <<<"$edit_context_files")
   fi
-  # No `path` given (symbol-name-only lookup, ambiguous across files) --
-  # can't attribute to one file, so this call alone doesn't unlock any
-  # file. Fails toward stricter (still enforcing the gate), not toward
-  # silently trusting a guess.
   save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
   exit 0
 fi
@@ -497,9 +577,30 @@ esac
 
 case "$tool_name" in
   Read)
-    if [ -n "$file_path" ] && is_definitely_unindexed_path "$file_path"; then
-      : # ci has nothing indexed here (dotdir / build-artifact dir) — native Read is correct
-    elif [ -z "$file_path" ] || is_code_file "$file_path"; then
+    # Ground truth (is_indexed_file, file_index table) takes priority over the
+    # path-shape guesses below: if CALM confirms this exact file is indexed,
+    # nudge AND record would_deny (2026-07-14 shadow-mode measurement for a
+    # possible future hard gate — see is_indexed_file's doc comment). This
+    # also fixes a real false negative the old is_code_file-only check had:
+    # a `.md` file (e.g. AGENTS.md itself, 13 indexed heading symbols) was
+    # never nudged before, since `.md` isn't in is_code_file's extension list.
+    # Falls back to the pre-existing path-shape heuristics when file_index
+    # can't confirm either way (not yet (re)indexed, or DB unavailable) so
+    # existing coverage never shrinks.
+    should_nudge=false
+    if [ -n "$file_path" ]; then
+      if is_indexed_file "$file_path"; then
+        should_nudge=true
+        would_deny="read_native"
+      elif is_definitely_unindexed_path "$file_path"; then
+        : # ci has nothing indexed here (dotdir / build-artifact dir) — native Read is correct
+      elif is_code_file "$file_path"; then
+        should_nudge=true
+      fi
+    else
+      should_nudge=true
+    fi
+    if [ "$should_nudge" = true ]; then
       bump native_explore
       nudge_or_tally read_native "CI available in this repo — prefer mcp__calm__source(symbol) for a symbol-precise read, or mcp__calm__file_overview(path=\"${file_path}\") over reading the whole file (AGENTS.md Stage 3)."
     fi
@@ -507,9 +608,21 @@ case "$tool_name" in
   Grep)
     grep_path=$(jq -r '.tool_input.path // ""' <<<"$input")
     grep_pat=$(jq -r '.tool_input.pattern // ""' <<<"$input")
-    if [ -n "$grep_path" ] && is_definitely_unindexed_path "$grep_path"; then
-      : # nothing indexed under this path — search/locate would come back empty, not stale
-    elif [ -z "$grep_path" ] || ! is_clearly_non_code_file "$grep_path"; then
+    # Same ground-truth-first structure as Read above.
+    should_nudge=false
+    if [ -n "$grep_path" ]; then
+      if is_indexed_file "$grep_path"; then
+        should_nudge=true
+        would_deny="grep_tool"
+      elif is_definitely_unindexed_path "$grep_path"; then
+        : # nothing indexed under this path — search/locate would come back empty, not stale
+      elif ! is_clearly_non_code_file "$grep_path"; then
+        should_nudge=true
+      fi
+    else
+      should_nudge=true
+    fi
+    if [ "$should_nudge" = true ]; then
       bump native_explore
       nudge_or_tally grep_tool "CI available in this repo — prefer mcp__calm__search(query=\"${grep_pat}\", kind=\"hybrid\") or mcp__calm__locate(query=\"${grep_pat}\") for a symbol-aware search, or mcp__calm__search(query=\"${grep_pat}\", kind=\"grep\") for a literal match (also covers files the parser skips) instead of Grep (AGENTS.md Stage 2)."
     fi
@@ -517,7 +630,19 @@ case "$tool_name" in
   Edit)
     decision_detail="state:needs_diff_impact=true"
     save_state "$edit_context_files" true "$nudge_counts"
-    if is_definitely_unindexed_path "$file_path"; then
+    # Ground truth (is_indexed_file) takes priority over the path-shape amnesty
+    # below: a source file whose path happens to contain a segment that LOOKS
+    # like an ignored dir name (e.g. a Rust module literally named `target`)
+    # would otherwise slip through is_definitely_unindexed_path's guess and
+    # skip the edit_context requirement entirely -- a real safety gap (missing
+    # a mandatory pre-edit check), not just nudge noise. If file_index confirms
+    # this file IS tracked, the requirement below always applies regardless of
+    # what the amnesty heuristic would have guessed (2026-07-14 B3 audit).
+    if is_indexed_file "$file_path"; then
+      if ! file_has_edit_context "$file_path"; then
+        deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
+      fi
+    elif is_definitely_unindexed_path "$file_path"; then
       : # CALM never indexes this path (dotdir/build-artifact) — edit_context
         # can't resolve a symbol here, so demanding it would be crying wolf
         # (this hook itself lives under .claude/ and used to hit exactly that).
@@ -530,7 +655,21 @@ case "$tool_name" in
     ;;
   Write)
     save_state "$edit_context_files" true "$nudge_counts"
-    nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
+    if is_indexed_file "$file_path"; then
+      # Same ground-truth-first reasoning as Edit above -- a tracked file
+      # always gets the advisory nudge regardless of path-shape guessing.
+      nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
+    elif is_definitely_unindexed_path "$file_path"; then
+      : # CALM never indexes this path (outside the repo root entirely, or a
+        # dotdir/build-artifact dir) — edit_context can't resolve a symbol
+        # here, so the nudge would be crying wolf (found live 2026-07-14:
+        # every Write under this session's own memory directory, well
+        # outside the repo, still fired this nudge — the Edit branch above
+        # already got this is_definitely_unindexed_path guard in the
+        # 2026-07-13 redesign, Write was missed).
+    else
+      nudge write_native 'MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub). If this is editing an existing tracked file rather than creating a new one, consider mcp__calm__edit_lines/edit_symbol (AGENTS.md Stage 6) instead — hash-verified, risk-gated, reindexes immediately.'
+    fi
     ;;
   Bash)
     if is_real_git_commit_or_push "$command"; then

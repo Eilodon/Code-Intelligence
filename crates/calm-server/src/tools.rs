@@ -2590,6 +2590,37 @@ mod tests {
     }
 
     #[test]
+    fn session_context_reports_overlapping_files_with_other_active_sessions() {
+        // Backlog B5: purely derived from explored_files + other_active_
+        // sessions, both already exercised by the test above -- this just
+        // checks the new field itself. `last_touched_file` is the MOST
+        // RECENT touch only (not a history), so conn_b's overlapping touch
+        // must be its LAST track_file call for the overlap to be visible.
+        let dir = std::env::temp_dir().join(format!("ci_overlap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+        conn_a.track_file("shared.rs");
+        conn_b.track_file("only_b.rs");
+        conn_b.track_file("shared.rs");
+
+        let a_ctx = jv(conn_a.session_context());
+        let overlap = a_ctx["overlapping_files"].as_array().unwrap();
+        assert_eq!(
+            overlap,
+            &vec![serde_json::json!("shared.rs")],
+            "conn_a explored shared.rs and conn_b's MOST RECENT touch (last_touched_file) \
+             is also shared.rs -- only_b.rs was touched earlier so it must not appear \
+             (conn_a never explored it): {a_ctx}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_context_other_active_sessions_reflects_edit_context_review() {
         let dir = std::env::temp_dir().join(format!("ci_reviewing_symbol_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6617,6 +6648,94 @@ mod tests {
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 1\ndef other():\n    return 2\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_before_warns_when_symbol_has_leading_doc_comment() {
+        // Backlog B1 (docs/plans/2026-07-14-calm-agent-experience-audit-and-
+        // backlog.md): position="before" anchors on the symbol's own
+        // line_start, which never includes a leading doc comment -- so the
+        // insertion lands BETWEEN the comment and the symbol. Not a syntax
+        // break (so PARSE_ERROR never fires), just a silent misattribution.
+        // insertion_hunk_for now attaches a warning to the response's `note`
+        // whenever the resolved symbol has a non-empty docstring.
+        let (dir, server) = test_server("edit_symbol_before_doc_sandwich");
+        std::fs::write(
+            dir.join("a.rs"),
+            "/// old doc for helper\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 2, 4, '', 'old doc for helper', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "fn other() -> i32 {\n    2\n}".into(),
+                position: Some("before".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        let note = v["note"].as_str().unwrap_or("");
+        assert!(
+            note.contains("leading doc comment") && note.contains("helper"),
+            "expected doc-comment-sandwich warning in note, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_before_omits_warning_when_no_leading_doc_comment() {
+        // Same shape as above but an empty docstring (the common case) --
+        // must NOT get the sandwich warning (or any note at all), since
+        // position_anchored hunks otherwise carry no ambiguity_note.
+        let (dir, server) = test_server("edit_symbol_before_no_doc");
+        std::fs::write(dir.join("a.rs"), "fn helper() -> i32 {\n    1\n}\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 1, 3, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "fn other() -> i32 {\n    2\n}".into(),
+                position: Some("before".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert!(v["note"].is_null(), "expected no note, got: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -40,7 +40,7 @@ impl CalmServer {
                     new_text: h.new_text,
                 })
                 .collect();
-            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref(), false)
+            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref(), false, None)
         }))
     }
 
@@ -116,7 +116,7 @@ impl CalmServer {
                     }
                 };
                 return self
-                    .edit_lines_impl(path, vec![hunk], p.confirm, p.reason.as_deref(), true)
+                    .edit_lines_impl(path, vec![hunk], p.confirm, p.reason.as_deref(), true, None)
                     .into_resolved();
             }
             let c = {
@@ -158,6 +158,7 @@ impl CalmServer {
                 p.position.as_deref(),
                 Some("before" | "after" | "append_inside")
             );
+            let mut insertion_note: Option<String> = None;
             let hunk = match p.position.as_deref().unwrap_or("replace") {
                 "replace" => match &p.old_text {
                     None => calm_core::edit::HunkRequest {
@@ -228,7 +229,10 @@ impl CalmServer {
                         _ => calm_core::edit::InsertPosition::AppendInside,
                     };
                     match insertion_hunk_for(&self.project_root, &c, position, &p.new_text) {
-                        Ok(h) => h,
+                        Ok((h, note)) => {
+                            insertion_note = note;
+                            h
+                        }
                         Err(detail) => return ResolvedOutcome::error(detail),
                     }
                 }
@@ -250,6 +254,7 @@ impl CalmServer {
                 p.confirm,
                 p.reason.as_deref(),
                 position_anchored,
+                insertion_note,
             )
             .into_resolved()
         }))
@@ -272,6 +277,7 @@ impl CalmServer {
         confirm: bool,
         reason: Option<&str>,
         position_anchored: bool,
+        extra_note: Option<String>,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -347,7 +353,11 @@ impl CalmServer {
         // and the edit lands at the wrong spot. Surface that on every
         // response that reports such a hunk — preview AND applied.
         let ambiguity_note = if position_anchored {
-            None
+            // 2026-07-14 backlog B1: insertion modes can carry their own
+            // warning computed by the caller (e.g. insertion_hunk_for's
+            // doc-comment-sandwich note) -- distinct from the hash-ambiguity
+            // note below, which only applies to line-range replace hunks.
+            extra_note
         } else {
             let flagged: Vec<String> = outcome
                 .results
@@ -1036,7 +1046,7 @@ fn insertion_hunk_for(
     c: &CandidateRow,
     position: calm_core::edit::InsertPosition,
     new_text: &str,
-) -> Result<calm_core::edit::HunkRequest, ErrorDetail> {
+) -> Result<(calm_core::edit::HunkRequest, Option<String>), ErrorDetail> {
     let full_path = resolve_repo_path(project_root, &c.path)?;
     let live = std::fs::read_to_string(&full_path).map_err(|e| {
         error_detail(
@@ -1063,8 +1073,34 @@ fn insertion_hunk_for(
             },
             Err(_) => (c.line_start as usize, c.line_end as usize),
         };
-    calm_core::edit::insertion_hunk(&live, line_start, line_end, position, new_text).ok_or_else(
-        || {
+    // Warn (2026-07-14, backlog B1): `Before` anchors at the symbol's own
+    // line_start, which never includes a leading doc comment (a separate
+    // tree-sitter sibling node -- see walk_symbols, crates/calm-core/src/
+    // indexer/parser.rs:587) -- so inserting "before" a documented symbol
+    // lands new_text BETWEEN the comment and the symbol, silently leaving the
+    // comment describing whatever was just inserted instead of its original
+    // target. Reuses the already-extracted `docstring` (no new text-scanning
+    // heuristic, no schema change) -- cheap and language-agnostic since doc
+    // extraction is already per-language in the indexer. The real fix (moving
+    // the anchor itself) needs a `doc_start_line`-style field and a schema
+    // migration -- deliberately deferred, see docs/plans/2026-07-14-calm-
+    // agent-experience-audit-and-backlog.md B4.
+    let sandwich_warning = if matches!(position, calm_core::edit::InsertPosition::Before)
+        && !c.docstring.trim().is_empty()
+    {
+        Some(format!(
+            "heads up — '{}' has a leading doc comment; position=\"before\" inserts between \
+             that comment and '{}', not above the comment, so the comment will end up \
+             describing the newly-inserted code instead. If you want the comment to stay with \
+             '{}', include your own comment in new_text, or use edit_lines to insert above the \
+             comment's own line.",
+            c.name, c.name, c.name
+        ))
+    } else {
+        None
+    };
+    let hunk = calm_core::edit::insertion_hunk(&live, line_start, line_end, position, new_text)
+        .ok_or_else(|| {
             error_detail(
                 "INVALID_RANGE",
                 &format!(
@@ -1073,8 +1109,8 @@ fn insertion_hunk_for(
                 ),
                 true,
             )
-        },
-    )
+        })?;
+    Ok((hunk, sandwich_warning))
 }
 
 /// Picks the live-parse occurrence of `name` whose start is nearest the

@@ -54,12 +54,28 @@ tool_name=$(jq -r '.tool_name // ""' <<<"$input")
 command=$(jq -r '.tool_input.command // ""' <<<"$input")
 file_path=$(jq -r '.tool_input.file_path // ""' <<<"$input")
 session_id=$(jq -r '.session_id // "unknown"' <<<"$input")
+# 2026-07-14: this script is now wired to BOTH PreToolUse and PostToolUse
+# (settings.json) for the Bash matcher — hook_event_name is the one common
+# field (per code.claude.com/docs/en/hooks) that tells the two apart. Read
+# by nudge()/nudge_or_tally() below so their emitted
+# hookSpecificOutput.hookEventName always matches the event actually being
+# answered, instead of the hardcoded "PreToolUse" they used before this was
+# a dual-event script.
+hook_event=$(jq -r '.hook_event_name // ""' <<<"$input")
 
 # --- session state (survives across PreToolUse calls within one session) ---
 # .calm/ is already gitignored (see .gitignore) so state files never
 # get committed; created defensively in case `ci init`/`ci serve` hasn't
 # run yet in this session.
-state_dir=".calm/.hook-state"
+# Override point for test-calm-nudge.sh (2026-07-14 eval-set prerequisite):
+# without this, the test harness fed synthetic tool_input payloads straight
+# into the SAME decisions.jsonl real sessions write to — verified live, 156 of
+# 612 real lines were test-*/-session-id fixtures, not organic traffic, and
+# that fraction only grows every time the suite runs (in CI or locally). A
+# future eval set sampling this log would need to already know to filter
+# `session_id` matching `^test-`; isolating the writes here removes the need
+# to filter after the fact at all.
+state_dir="${CALM_NUDGE_STATE_DIR:-.calm/.hook-state}"
 mkdir -p "$state_dir" 2>/dev/null || true
 state_file="$state_dir/${session_id}.json"
 # Opportunistic cleanup of stale state from old sessions — cheap, best-effort.
@@ -98,7 +114,21 @@ decision_detail=""
 # real sessions before ever flipping enforcement — never changes
 # permissionDecision itself.
 would_deny=""
+# The query/pattern/command a Grep or Bash call actually ran — 2026-07-14
+# eval-set prerequisite (docs/plans/2026-07-14-search-grep-steepest-hill-followups.md):
+# without this, decisions.jsonl's existing `file_path` field is ALWAYS null for
+# Grep/Bash (they key their tool_input as `pattern`/`path` or `command`, never
+# `file_path` — verified against real log output), which made it impossible to
+# reconstruct "what was this call actually looking for" for later hand-labeling.
+# Set by the Grep/Bash case branches below; left empty (logs as null) for every
+# other tool_name. Truncated in log_decision itself (not at the assignment
+# site) so every writer gets the cap for free, and capped short specifically to
+# keep decisions.jsonl from ballooning and to limit (not eliminate — a secret
+# in the first 200 chars of a Bash command would still land here) incidental
+# sensitive-content exposure in a log file kept outside git.
+decision_query=""
 log_decision() {
+  local query_snip="${decision_query:0:200}"
   jq -nc \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg session "$session_id" \
@@ -107,7 +137,8 @@ log_decision() {
     --arg detail "$decision_detail" \
     --arg file "$file_path" \
     --arg would_deny "$would_deny" \
-    '{ts: $ts, session_id: $session, tool_name: $tool, decision: $decision, detail: $detail, file_path: ($file | select(. != "") // null), would_deny: ($would_deny | select(. != "") // null)}' \
+    --arg query "$query_snip" \
+    '{ts: $ts, session_id: $session, tool_name: $tool, decision: $decision, detail: $detail, file_path: ($file | select(. != "") // null), would_deny: ($would_deny | select(. != "") // null), query: ($query | select(. != "") // null)}' \
     >>"$decision_log" 2>/dev/null || true
   if [ -f "$decision_log" ]; then
     lines=$(wc -l <"$decision_log" 2>/dev/null || echo 0)
@@ -381,16 +412,16 @@ nudge() {
   if [ "$count" -lt "$NUDGE_CAP" ]; then
     decision="nudge"
     decision_detail="$key"
-    jq -n --arg msg "$msg" \
-      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    jq -n --arg msg "$msg" --arg evt "${hook_event:-PreToolUse}" \
+      '{hookSpecificOutput: {hookEventName: $evt, additionalContext: $msg}}'
     exit 0
   fi
   shown=$((count + 1))
   if [ $((shown % TALLY_EVERY)) -eq 0 ]; then
     decision="nudge_repeat_tally"
     decision_detail="$key:count=$shown"
-    jq -n --arg msg "$msg" --arg n "$shown" \
-      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: ("This is occurrence #" + $n + " of the same situation this session, without a change in approach: " + $msg)}}'
+    jq -n --arg msg "$msg" --arg n "$shown" --arg evt "${hook_event:-PreToolUse}" \
+      '{hookSpecificOutput: {hookEventName: $evt, additionalContext: ("This is occurrence #" + $n + " of the same situation this session, without a change in approach: " + $msg)}}'
     exit 0
   fi
   decision="allow_nudge_capped"
@@ -411,16 +442,16 @@ nudge_or_tally() {
     save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
     decision="nudge"
     decision_detail="$key"
-    jq -n --arg msg "$msg" \
-      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    jq -n --arg msg "$msg" --arg evt "${hook_event:-PreToolUse}" \
+      '{hookSpecificOutput: {hookEventName: $evt, additionalContext: $msg}}'
     exit 0
   fi
   ne=$(jq -r '.native_explore // 0' <<<"$(cat "$state_file" 2>/dev/null || echo '{}')")
   if [ $((ne % TALLY_EVERY)) -eq 0 ] 2>/dev/null; then
     decision="tally"
     decision_detail="$key:native=$ne"
-    jq -n --arg msg "$(explore_tally)" \
-      '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
+    jq -n --arg msg "$(explore_tally)" --arg evt "${hook_event:-PreToolUse}" \
+      '{hookSpecificOutput: {hookEventName: $evt, additionalContext: $msg}}'
     exit 0
   fi
   decision="allow_nudge_capped"
@@ -588,6 +619,85 @@ resolve_git_target_root() {
   fi
 }
 
+# --- PostToolUse: just-in-time nudge grounded in the REAL result of a Bash
+# grep/rg/ag call, not a pre-call guess (2026-07-14 follow-up to the
+# "steepest hill" redesign — docs/plans/2026-07-14-search-grep-steepest-hill-followups.md,
+# "PostToolUse just-in-time nudge"). Built only after capturing and reading a
+# REAL payload from this exact repo/hook (.calm/.hook-state/posttooluse-grep-dump.jsonl,
+# via the still-wired posttooluse-discovery-dump.sh), not against the official
+# docs example alone — that example shows Bash's tool_response as a plain
+# string, but the real captured payload here is a structured object:
+# {stdout, stderr, interrupted, isImage, noOutputExpected,
+# [returnCodeInterpretation]}. Confirmed live: (a) PostToolUse fires
+# regardless of grep's own exit code (0 or 1) as long as the Bash tool call
+# itself doesn't error; (b) `returnCodeInterpretation: "No matches found"`
+# appears on at least some zero-match cases — a free, pre-labeled signal,
+# used here with an empty-stdout fallback for when it's absent; (c) explicit
+# `--color=always` leaks raw ANSI straight into stdout with no equivalent of
+# the native Grep tool's per-match `ansi_codes` flag — stripped defensively
+# below even though grep's own default (--color=auto) never colorizes into a
+# non-tty pipe in practice.
+#
+# The native `Grep` tool's own tool_response.matches[] schema (structured:
+# path/line_number/line_text/ansi_codes) is doc-derived only
+# (code.claude.com/docs/en/hooks) and was NOT live-verified — this harness has
+# no native Grep tool to call. So this function deliberately handles ONLY the
+# Bash path; a real Grep-tool PostToolUse event still just falls through to
+# posttooluse-discovery-dump.sh (still wired in settings.json) until a real
+# payload from an environment that has the tool confirms its shape too.
+#
+# Owns bump(native_explore) + the nudge for "multi-file/zero-match bash
+# grep" EXCLUSIVELY. The old PreToolUse Bash branch used to nudge on this
+# same condition pre-call (key "bash_grep", generic message, no result
+# grounding) — that branch is retired below (see its comment) specifically
+# so one real call is never nudged twice (once generic pre-call, once
+# grounded post-call) and native_explore is never double-counted for it.
+handle_post_tool_use() {
+  [ "$tool_name" = "Bash" ] || return 0
+  is_real_git_commit_or_push "$command" && return 0
+  command_targets_unindexed "$command" && return 0
+  grep -qE '\|[[:space:]]*(grep|rg|ag)\b' <<<"$command" && return 0
+  grep -qE '\b(grep|rg|ag)\b' <<<"$command" || return 0
+  if bash_grep_targets_single_file "$command"; then
+    decision_detail="post:bash_grep_single_file_silent"
+    return 0
+  fi
+
+  decision_query="$command"
+  local resp stdout_text rc_note file_count
+  resp=$(jq -c '.tool_response // {}' <<<"$input")
+  stdout_text=$(jq -r 'if type == "object" then (.stdout // "") else (. // "") end' <<<"$resp")
+  rc_note=$(jq -r 'if type == "object" then (.returnCodeInterpretation // "") else "" end' <<<"$resp")
+  # Strip ANSI before counting — see header comment (c).
+  stdout_text=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' <<<"$stdout_text")
+
+  bump native_explore
+  if [ "$rc_note" = "No matches found" ] || [ -z "$stdout_text" ]; then
+    decision_detail="post:bash_grep_zero_match"
+    nudge_or_tally bash_grep_post "CI available in this repo — that repo-wide Bash grep just matched nothing. A literal grep misses renamed/differently-worded symbols that mcp__calm__search(query, kind=\"hybrid\") or mcp__calm__locate can still find (AGENTS.md Stage 2).${TOOL_DISCOVERY_HINT}"
+    return 0
+  fi
+  file_count=$(awk -F: '{print $1}' <<<"$stdout_text" | sort -u | grep -c .)
+  if [ "${file_count:-0}" -ge 3 ]; then
+    decision_detail="post:bash_grep_multi_file=$file_count"
+    nudge_or_tally bash_grep_post "CI available in this repo — that Bash grep just matched across ${file_count} files. mcp__calm__search(query, kind=\"hybrid\"|\"grep\") returns all of them ranked in one call instead (AGENTS.md Stage 2).${TOOL_DISCOVERY_HINT}"
+  else
+    decision_detail="post:bash_grep_few_files=${file_count:-0}_silent"
+  fi
+}
+
+# PostToolUse events short-circuit here, before any of the PreToolUse-only
+# logic below (edit_context tracking, diff_impact gating, etc. all assume a
+# PreToolUse call's semantics — e.g. "block this" — which don't apply once
+# the tool has already run). handle_post_tool_use itself calls
+# nudge_or_tally, which exits the script directly when it emits a message;
+# the explicit `exit 0` here only covers the silent/no-op paths through it.
+if [ "$hook_event" = "PostToolUse" ]; then
+  decision="post_tool_use"
+  handle_post_tool_use
+  exit 0
+fi
+
 # Record write-relevant mcp__calm__* calls as they happen — recorded on
 # PreToolUse (before the call runs) since attempting the check is what
 # matters here, and PreToolUse is all that's needed to observe it.
@@ -707,6 +817,7 @@ case "$tool_name" in
   Grep)
     grep_path=$(jq -r '.tool_input.path // ""' <<<"$input")
     grep_pat=$(jq -r '.tool_input.pattern // ""' <<<"$input")
+    decision_query="$grep_pat"
     # Same ground-truth-first structure as Read above, now also gated on
     # whether CALM actually has leverage here (2026-07-14 redesign, see
     # "steepest hill" header block above): multi-file/repo-wide scope, or a
@@ -781,6 +892,7 @@ case "$tool_name" in
     fi
     ;;
   Bash)
+    decision_query="$command"
     if is_real_git_commit_or_push "$command"; then
       if [ "$needs_diff_impact" = "true" ]; then
         target_root=$(resolve_git_target_root "$command")
@@ -801,19 +913,17 @@ case "$tool_name" in
         # searching files — CALM search/locate can't replace it, and a
         # false nudge here erodes trust in every real one
     elif grep -qE '\b(grep|rg|ag)\b' <<<"$command"; then
-      # 2026-07-14 conditional-enforcement redesign (see "steepest hill"
-      # header block above): a single-existing-file, non-recursive grep is
-      # left silent — native genuinely has no CALM disadvantage there, and
-      # nudging it anyway is exactly the false-positive class that erodes
-      # trust in every other nudge. Pattern-shape (identifier vs regex)
-      # isn't checked here — too fragile to extract reliably from an
-      # arbitrary shell command string, unlike Grep's clean JSON `pattern`
-      # field above — so this only gates on file-count/recursion, which
-      # `bash_grep_targets_single_file` can determine robustly.
-      if ! bash_grep_targets_single_file "$command"; then
-        bump native_explore
-        nudge_or_tally bash_grep "CI available in this repo — prefer mcp__calm__search(query, kind=\"hybrid\"|\"grep\") or mcp__calm__locate over a standalone file grep via Bash (AGENTS.md Stage 2).${TOOL_DISCOVERY_HINT}"
-      fi
+      # 2026-07-14 PostToolUse follow-up: this branch used to nudge
+      # pre-call for any non-single-file bash grep (generic message, no
+      # result grounding). Retired in favor of handle_post_tool_use's
+      # bash_grep_post nudge, which fires AFTER the call with the REAL
+      # match count (or confirmed zero matches) instead of a guess — see
+      # handle_post_tool_use's header comment. Left silent here
+      # deliberately so one real call is never nudged twice (once
+      # generic pre-call, once grounded post-call); the single-file case
+      # stays silent for the same reason it always was (native genuinely
+      # has no CALM disadvantage there).
+      :
     elif grep -qE '\bfind\b.*-i?name\b' <<<"$command"; then
       bump native_explore
       nudge_or_tally bash_find "CI available in this repo — prefer mcp__calm__search(query, kind=\"file\") or mcp__calm__file_overview / mcp__calm__dependencies over find (AGENTS.md Stage 1-2).${TOOL_DISCOVERY_HINT}"

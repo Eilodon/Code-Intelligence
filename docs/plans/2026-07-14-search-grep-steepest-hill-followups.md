@@ -1,8 +1,47 @@
 ---
 title: Search/grep "steepest hill" — implemented fixes + honest follow-up scope
 date: 2026-07-14
-status: 3 of 5 recommendations implemented + tested; 2 documented, not built (reasons below)
+status: 5 of 5 recommendations now shipped — see "2026-07-14 follow-up session" below for what
+  changed on the 2 originally deferred (PostToolUse nudge partially built + live-verified;
+  eval-set prerequisite done)
 ---
+
+## 2026-07-14 follow-up session — update to the two "NOT implemented" items below
+
+**PostToolUse just-in-time nudge: built for the Bash-grep path, NOT the native `Grep` tool.**
+Discovery-first, as this doc's own "next step" said: wired a no-op dump hook
+(`.claude/hooks/posttooluse-discovery-dump.sh`, matcher `Grep|Bash`) before writing any parser.
+Found live that **this specific harness/session has no native `Grep` tool at all** (verified via
+tool discovery — only Bash/Read/Edit/Write are native here), so the dump could only ever capture
+real Bash-grep events, not native-Grep ones. Captured payload for Bash **contradicts the official
+docs example** (which shows `tool_response` as a plain string): the real shape here is
+`{stdout, stderr, interrupted, isImage, noOutputExpected, [returnCodeInterpretation]}` — a
+structured object. Built `handle_post_tool_use()` in `calm-nudge.sh` against this *live-verified*
+shape: nudges when a repo-wide/recursive Bash grep matches ≥3 files (names the real count) or 0
+files (`returnCodeInterpretation: "No matches found"` or empty stdout, both live-confirmed to still
+fire PostToolUse regardless of grep's own exit code), stays silent for 1-2 matches or a single-file
+target. The old PreToolUse `bash_grep` nudge (generic, pre-call) was retired in the same change —
+it would otherwise double-nudge the same real call now that Post covers it with better grounding;
+`nudge()`/`nudge_or_tally()` were also fixed to emit the real `hookEventName` (`PostToolUse` vs
+`PreToolUse`) instead of a hardcoded string, a latent bug this exposed. Live-verified end-to-end in
+this session (real recursive grep → real "matched across 5 files" nudge, no double-fire). Native
+`Grep` tool's tool_response (`{matches: [{path, line_number, line_text, ansi_codes}]}`, per
+code.claude.com/docs/en/hooks) remains **doc-derived only, not live-verified** — the discovery hook
+stays wired for it (matcher `Grep`) so the next real Claude Code CLI session that runs a native
+Grep call here captures it for real before that path gets built.
+
+**MCP-Bench-style labeled eval set: prerequisite shipped, hand-labeling still not (correctly) done
+today.** `log_decision()` now also writes a `query` field (truncated to 200 chars) — the actual
+Grep pattern or Bash command, previously unrecoverable since `file_path` is always `null` for both
+tool kinds (verified against real log data before fixing). Also fixed, found while doing this:
+`test-calm-nudge.sh` had no state-dir isolation and was writing its synthetic fixtures straight into
+the SAME `decisions.jsonl` real sessions append to — 156 of 612 real lines (25.5%) were test noise,
+not organic traffic, before this session's cleanup. Added `CALM_NUDGE_STATE_DIR` override + isolated
+the test suite's own runs to a `mktemp -d`, and one-time-filtered the existing log back to real
+traffic only (476 real lines, backup kept at `decisions.jsonl.bak-pretest-cleanup`). Hand-labeling
+itself is still correctly not done — real grep/find-shaped volume post-cleanup is only ~69 lines
+across 28 sessions, smaller than the 50-100 line sample this doc's own plan called for; needs more
+organic accumulation first, exactly as originally scoped below.
 
 ## Context
 

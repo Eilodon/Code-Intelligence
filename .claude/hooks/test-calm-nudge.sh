@@ -8,10 +8,18 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 session_id_test="test-$$"
-state_dir=".calm/.hook-state"
+# Isolated per-run state dir (2026-07-14 eval-set prerequisite): calm-nudge.sh
+# used to hardcode ".calm/.hook-state", so every run of this suite wrote its
+# synthetic fixture payloads straight into the SAME decisions.jsonl real
+# sessions append to — verified live: 156 of 612 real lines were test-$$
+# fixtures, not organic traffic, growing every time CI or a dev runs this
+# script. CALM_NUDGE_STATE_DIR overrides that hardcode so this suite's state
+# (including its decisions.jsonl writes) lands in a throwaway tmp dir instead.
+export CALM_NUDGE_STATE_DIR
+CALM_NUDGE_STATE_DIR=$(mktemp -d)
+state_dir="$CALM_NUDGE_STATE_DIR"
 state_file="$state_dir/${session_id_test}.json"
-rm -f "$state_file"
-cleanup() { rm -f "$state_file"; }
+cleanup() { rm -rf "$CALM_NUDGE_STATE_DIR"; }
 trap cleanup EXIT
 
 run_hook() {
@@ -111,6 +119,20 @@ run_hook_bash() {
     '{session_id: $session, tool_name: "Bash", tool_input: {command: $cmd}}' \
     | bash .claude/hooks/calm-nudge.sh
 }
+# $1=command $2=stdout $3=returnCodeInterpretation (optional). Shape matches
+# a REAL captured PostToolUse payload for Bash (2026-07-14,
+# .calm/.hook-state/posttooluse-grep-dump.jsonl), not the official docs
+# example (which shows tool_response as a plain string) — see
+# handle_post_tool_use's header comment in calm-nudge.sh for how this was
+# verified.
+run_hook_bash_post() {
+  jq -nc --arg session "$session_id_test" --arg cmd "$1" --arg out "${2:-}" --arg rc "${3:-}" \
+    '{session_id: $session, hook_event_name: "PostToolUse", tool_name: "Bash",
+      tool_input: {command: $cmd},
+      tool_response: ({stdout: $out, stderr: "", interrupted: false, isImage: false, noOutputExpected: false}
+        + (if $rc != "" then {returnCodeInterpretation: $rc} else {} end))}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
 run_hook_read_path() {
   jq -nc --arg session "$session_id_test" --arg path "$1" \
     '{session_id: $session, tool_name: "Read", tool_input: {file_path: $path}}' \
@@ -148,10 +170,52 @@ echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
 out=$(run_hook_bash 'grep -n "fn validate_syntax" crates/calm-core/src/edit.rs')
 is_silent "$out" || fail "expected silence for single-file Bash grep, got: $out"
 
-# 10. Bash grep with -r -> NUDGE (multi-file/repo-wide scope).
+# 10. Bash grep with -r, at PreToolUse -> SILENT now (2026-07-14 PostToolUse
+#     follow-up retired this branch's pre-call nudge in favor of
+#     handle_post_tool_use's result-grounded one, so the same real call is
+#     never nudged twice -- see that retirement's comment in calm-nudge.sh).
 out=$(run_hook_bash 'grep -rn "fn validate_syntax" crates/')
+is_silent "$out" || fail "expected silence at PreToolUse for recursive Bash grep (Post now owns this nudge), got: $out"
+
+# 10b. Same recursive grep, at PostToolUse, with a real multi-file stdout
+#      (3 files) -> NUDGE naming the actual count.
+out=$(run_hook_bash_post 'grep -rn "fn validate_syntax" crates/' \
+  "crates/a.rs:1:fn validate_syntax() {}
+crates/b.rs:2:fn validate_syntax_diff() {}
+crates/c.rs:3:fn validate_syntax_other() {}")
 echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
-  || fail "expected a nudge for recursive Bash grep, got: $out"
+  || fail "expected a PostToolUse nudge for a 3-file Bash grep match, got: $out"
+echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "3 files" \
+  || fail "expected the PostToolUse nudge to name the real file count (3), got: $out"
+echo "$out" | jq -e '.hookSpecificOutput.hookEventName == "PostToolUse"' >/dev/null 2>&1 \
+  || fail "expected hookEventName to be PostToolUse (not hardcoded PreToolUse), got: $out"
+
+# 10c. Recursive grep at PostToolUse, only 1 matched file -> SILENT (below
+#      the >=3-file leverage threshold).
+out=$(run_hook_bash_post 'grep -rn "fn validate_syntax" crates/' \
+  "crates/a.rs:1:fn validate_syntax() {}")
+is_silent "$out" || fail "expected silence for a 1-file PostToolUse Bash grep match, got: $out"
+
+# 10d. Recursive grep at PostToolUse, zero matches -> NUDGE toward
+#      search/locate (a literal grep can miss a renamed/reworded symbol a
+#      fuzzy/hybrid search would still find).
+out=$(run_hook_bash_post 'grep -rn "definitely_not_a_real_symbol_xyz" crates/' "" "No matches found")
+echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+  || fail "expected a PostToolUse nudge for a zero-match repo-wide Bash grep, got: $out"
+
+# 10e. Single-file Bash grep at PostToolUse -> SILENT regardless of match
+#      count (native genuinely has no CALM disadvantage there, same as Pre).
+out=$(run_hook_bash_post 'grep -n "fn validate_syntax" crates/calm-core/src/edit.rs' \
+  "crates/calm-core/src/edit.rs:1:fn validate_syntax() {}")
+is_silent "$out" || fail "expected silence for a single-file PostToolUse Bash grep, got: $out"
+
+# 10f. Piped grep at PostToolUse -> SILENT (filtering another command's
+#      stream, not a file search -- same guard as Pre).
+out=$(run_hook_bash_post 'cat crates/a.rs | grep foo' \
+  "crates/a.rs:1:foo
+crates/b.rs:2:foo
+crates/c.rs:3:foo")
+is_silent "$out" || fail "expected silence for a piped Bash grep at PostToolUse, got: $out"
 
 # 11. Deny messages also carry the tool-discovery hint -- edit_context is
 #     just as deferrable as search/locate, and a hard deny whose only

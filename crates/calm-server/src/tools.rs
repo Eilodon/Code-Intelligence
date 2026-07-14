@@ -424,12 +424,32 @@ fn ci_prompts() -> Vec<rmcp::model::Prompt> {
                     .with_required(true),
             ]),
         ),
+        // F6 (2026-07-14 audit-design, docs/superskills/specs/2026-07-14-calm-
+        // agent-experience-round2-fixes.md): the other 4 prompts above are all
+        // task-scoped (need a symbol/path/range argument) — none teaches "how
+        // do I use CALM at all", and AGENTS.md's auto-injection
+        // (session-start-agents-md.sh) is Claude-Code-specific, so any other
+        // MCP client connected to the same `calm serve` gets zero automatic
+        // onboarding today. No required argument by design: this is the one
+        // prompt meant to be reachable cold, before the caller knows any
+        // symbol/path/range to ask about.
+        rmcp::model::Prompt::new(
+            "calm_workflow",
+            Some(
+                "No-argument orientation: the full Stage 1-8 CALM tool workflow, condensed — what to call in what order, and which 2 checks are hard-enforced. Use this when starting fresh in an MCP client that doesn't auto-inject AGENTS.md, or mid-session as a refresher.",
+            ),
+            None,
+        ),
     ]
 }
 
 /// Text for one prompt's message, with `{name}` substituted into the
-/// template — kept as plain string building (no template engine) since
-/// there are exactly 3 prompts and each has exactly one argument.
+/// template -- kept as plain string building (no template engine) since
+/// each prompt's shape differs enough (0 or 1 argument, task-scoped vs a
+/// static reference like `calm_workflow`) that a template engine would add
+/// more indirection than it saves. Add a new prompt here AND in
+/// `ci_prompts` above -- `ci_prompts_lists_all_four_with_required_arguments`
+/// (now stale in name only, not assertion count) exercises both.
 fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Option<String> {
     let arg = |key: &str| -> String {
         arguments
@@ -481,6 +501,25 @@ fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Opt
                  Summarize: aggregate risk level, any hotspot/changed-file overlap, and whether fitness gates still pass — flag anything that needs a human reviewer before merge."
             ))
         }
+        // F6 (2026-07-14): no-argument orientation prompt -- see ci_prompts'
+        // own comment on why this exists (cross-client onboarding parity;
+        // AGENTS.md's SessionStart auto-injection is Claude-Code-only).
+        // Condensed, not a copy of AGENTS.md: names the tool per stage and
+        // the 2 hard-enforced checks, points to AGENTS.md for full detail
+        // rather than re-deriving every signal/edge-case bullet it documents.
+        "calm_workflow" => Some(
+            "CALM MCP tool workflow -- 8 stages, ~29 tools, `suggested_next` on every response tells you what to call next:\n\
+             1. Orient -- repo_overview() ALWAYS first, then hotspots()/fitness_report() as needed.\n\
+             2. Locate -- locate(query) (search+file_overview+symbol_info in 1 call) or search(query, kind=...).\n\
+             3. Inspect -- source(symbol) for a symbol-precise read, or understand(symbol) for locate+source+callers together.\n\
+             4. Trace -- callers(symbol), callees(symbol), path(from,to), dependencies(path).\n\
+             5. Pre-Edit -- edit_context(symbol): MANDATORY before touching any symbol, no exceptions for real code (a Markdown/text heading is the one exception -- never carries a blast radius to check).\n\
+             6. Edit -- edit_symbol(...)/edit_lines(...): CALM's own write path, hash-verified, risk-gated, reindexes immediately. Fall back to native Edit/Write only for a brand-new file or a path CALM doesn't index (dotdirs, target/, node_modules/, etc.).\n\
+             7. Verify -- diff_impact(staged=true) MANDATORY before any commit/push -- no exceptions.\n\
+             8. Recover -- session_context() after 10+ calls without progress; remember(topic, content)/recall(topic) for durable cross-session notes.\n\
+             Only steps 5 and 7 are hard-enforced (a hook denies the native equivalent without them, under Claude Code); the rest is strongly recommended but not blocking. Full detail, every edge case, and the preset/toolset reference: AGENTS.md at the project root."
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -922,15 +961,28 @@ mod tests {
     }
 
     #[test]
-    fn ci_prompts_lists_all_four_with_required_arguments() {
+    fn ci_prompts_lists_all_five_prompts_with_expected_argument_shape() {
         let prompts = ci_prompts();
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["review_symbol", "debug_symbol", "onboard_area", "review_pr"]
+            vec![
+                "review_symbol",
+                "debug_symbol",
+                "onboard_area",
+                "review_pr",
+                "calm_workflow"
+            ]
         );
         for p in &prompts {
             assert!(p.description.is_some(), "{}: missing description", p.name);
+            if p.name == "calm_workflow" {
+                assert!(
+                    p.arguments.is_none() || p.arguments.as_ref().unwrap().is_empty(),
+                    "calm_workflow: expected no arguments, it must be reachable with zero context"
+                );
+                continue;
+            }
             let args = p
                 .arguments
                 .as_ref()
@@ -938,6 +990,21 @@ mod tests {
             assert_eq!(args.len(), 1, "{}: expected exactly 1 argument", p.name);
             assert_eq!(args[0].required, Some(true));
         }
+    }
+
+    #[test]
+    fn render_prompt_calm_workflow_needs_no_argument_and_covers_the_hard_gates() {
+        let text = render_prompt("calm_workflow", &None).unwrap();
+        assert!(text.contains("edit_context"), "must name the pre-edit gate");
+        assert!(text.contains("diff_impact"), "must name the post-edit gate");
+        assert!(
+            text.contains("repo_overview"),
+            "must name the Stage 1 orient tool"
+        );
+        assert!(
+            text.contains("AGENTS.md"),
+            "must point to the full guide for detail"
+        );
     }
 
     #[test]

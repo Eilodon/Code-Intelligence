@@ -233,6 +233,7 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 | `debug_symbol` | `symbol` | `understand` → `callers(max_depth=3)` → check `test_files`/`dead_code_confidence` |
 | `onboard_area` | `path` | `repo_overview` → `file_overview`/`dependencies` → `hotspots` scoped to that path |
 | `review_pr` | `range` | `diff_impact(commits=range)` → `hotspots` (overlap check) → `fitness_report` → aggregate risk summary before merge |
+| `calm_workflow` | *(none)* | No-argument orientation to the full Stage 1-8 tool workflow — for a client that never auto-loads AGENTS.md, or a mid-session refresher |
 
 ## Fitness check — the CI gate
 

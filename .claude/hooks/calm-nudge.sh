@@ -104,6 +104,30 @@ nudge_counts=$(jq -c '.nudge_counts // {}' <<<"$state" 2>/dev/null || echo '{}')
 # line count each run so it can't grow unbounded.
 decision_log="$state_dir/decisions.jsonl"
 decision_log_cap=5000
+# F4 (2026-07-14 audit-design fix): a real Claude Code session_id is always
+# a UUIDv4 -- verified against 6 real sessions in this repo's own
+# decisions.jsonl before writing this check. CALM_NUDGE_STATE_DIR already
+# isolates the automated test suite (test-calm-nudge.sh) into its own temp
+# dir, so it's excluded here. What it does NOT cover: ad-hoc manual
+# invocations during development (piping synthetic JSON straight to this
+# script to verify one behavior, bypassing test-calm-nudge.sh entirely) --
+# those fall through to the DEFAULT state_dir and, before this fix, wrote
+# straight into the same decisions.jsonl real sessions use. Verified live:
+# 12 of 17 distinct session_id values in this repo's real log were exactly
+# this class of contamination ("audit-test", "manual-test-1303174",
+# "b2-verify-854976" -- note the last one has no "test" substring at all, so
+# a denylist on session_id shape would have missed it; this is a positive
+# allowlist instead, which a new ad-hoc naming scheme can't silently evade).
+# Routes to a SEPARATE file rather than dropping the line entirely --
+# manual/test decisions are still useful to inspect locally, just not mixed
+# into the log real-session analysis (e.g. a future eval set, see B3/F3)
+# should be able to trust as "real traffic only".
+is_real_session_id() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+if [ -z "${CALM_NUDGE_STATE_DIR:-}" ] && ! is_real_session_id "$session_id"; then
+  decision_log="$state_dir/decisions.jsonl.manual"
+fi
 decision="allow"
 decision_detail=""
 # Shadow-mode signal (2026-07-14): set to a nudge key (e.g. "read_native")
@@ -549,6 +573,35 @@ is_clearly_non_code_file() {
   esac
 }
 
+# F2-revised (2026-07-14 audit-design fix): deliberately NARROWER than
+# is_clearly_non_code_file above -- this gates the Edit/Write hard-DENY
+# (blast-radius ceremony), not the Grep/search advisory nudge, so it needs a
+# provable-safe justification, not just "not real code". Proven against
+# crates/calm-core/src/graph/hub.rs::update_is_hub_flags: its hub query
+# source is `WHERE caller_count >= 1 OR coreness > 0`, and a Markdown
+# heading symbol (`kind='heading'`, see
+# crates/calm-core/src/indexer/parser.rs's markdown extraction) never gets a
+# call-graph edge, so caller_count/coreness are always 0 -- is_hub is
+# provably always false for prose. That proof does NOT extend to
+# .yml/.json/.toml/.lock: a broken CI workflow YAML or a broken Cargo.lock
+# has real operational blast radius CALM's call graph simply doesn't model,
+# which is a different risk shape from "a doc heading nobody calls" --
+# is_clearly_non_code_file's broader denylist is the wrong proxy for THIS
+# gate specifically (audit-design Failure Mode 2, see
+# docs/superskills/specs/2026-07-14-calm-agent-experience-round2-fixes.md).
+# Kept as its own function rather than folding into is_clearly_non_code_file
+# so the two concerns can't silently drift back together if either list
+# changes later -- see that function's own doc comment for why it needs to
+# stay a denylist for its purpose too.
+is_prose_file() {
+  case "$1" in
+    *.md | *.txt)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 # True if `p` sits under a directory `calm`'s indexer categorically never
 # descends into, so a nudge toward index-backed tools (source/file_overview/
 # locate/search's symbol-aware kinds) would be actively wrong — file_overview
@@ -940,7 +993,19 @@ case "$tool_name" in
     # what the amnesty heuristic would have guessed (2026-07-14 B3 audit).
     if is_indexed_file "$file_path"; then
       if ! file_has_edit_context "$file_path"; then
-        deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum.${TOOL_DISCOVERY_HINT}"
+        # F2-revised (2026-07-14 audit-design fix): a prose file (.md/.txt)
+        # never has a real blast radius to review (see is_prose_file's doc
+        # comment — hub.rs proves caller_count/coreness are always 0 for a
+        # Markdown heading), so the mandatory hard-deny ceremony downgrades
+        # to an advisory nudge here instead. Deliberately NOT
+        # is_clearly_non_code_file (which also matches .yml/.json/.toml/
+        # .lock — files that CAN carry real operational blast radius CALM's
+        # call graph doesn't model) — see is_prose_file's own doc comment.
+        if is_prose_file "$file_path"; then
+          nudge edit_prose_no_context "RECOMMENDED per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a heading in $file_path before editing it. Not mandatory here: Markdown/text headings never carry call-graph edges, so edit_context's blast-radius check is always trivially empty for prose (is_hub is provably always false for a doc heading). Also consider mcp__calm__edit_lines (AGENTS.md Stage 6) instead of this native Edit.${TOOL_DISCOVERY_HINT}"
+        else
+          deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) for a symbol in $file_path before editing it, never skip (especially if is_hub). edit_context was already called this session for other file(s), but not this one — each file needs its own call before its first native Edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum.${TOOL_DISCOVERY_HINT}"
+        fi
       fi
     elif is_definitely_unindexed_path "$file_path"; then
       : # CALM never indexes this path (dotdir/build-artifact) — edit_context

@@ -29,14 +29,23 @@ const PLATFORM_PACKAGES = {
   'linux-x64': '@eilodon/calm-mcp-linux-x64',
   'linux-arm64': '@eilodon/calm-mcp-linux-arm64',
   'darwin-arm64': '@eilodon/calm-mcp-darwin-arm64',
+  'darwin-x64': '@eilodon/calm-mcp-darwin-x64',
+  'win32-x64': '@eilodon/calm-mcp-win32-x64',
 };
+
+// Windows binaries need the .exe suffix to be directly spawnable — every
+// other supported platform ships the bare `calm` name (see each platform
+// package's `files` field in its own package.json).
+function binaryName() {
+  return process.platform === 'win32' ? 'calm.exe' : 'calm';
+}
 
 function resolveBinary() {
   const pkgName = PLATFORM_PACKAGES[`${process.platform}-${process.arch}`];
   if (!pkgName) return null;
   try {
     const pkgJsonPath = require.resolve(`${pkgName}/package.json`);
-    return path.join(path.dirname(pkgJsonPath), 'calm');
+    return path.join(path.dirname(pkgJsonPath), binaryName());
   } catch {
     return null;
   }
@@ -67,6 +76,10 @@ child.on('error', (err) => {
 // shutdown, WAL checkpoint included, gets a chance to finish before this
 // wrapper process disappears too.
 let killTimer = null;
+// SIGHUP has no real meaning on Windows and Node's docs note POSIX signal
+// delivery there is best-effort in general — this loop still registers all
+// three for parity with the POSIX platforms; Ctrl+C (SIGINT) is the one
+// guaranteed to actually fire on win32.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
     child.kill(sig);

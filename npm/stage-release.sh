@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Populates each npm/calm-mcp-<platform>/calm binary from a tagged GitHub
-# Release — same verified-download approach as scripts/install.sh, just
-# targeting all 3 platforms instead of the caller's own — and bumps every
+# Populates each npm/calm-mcp-<platform>/calm(.exe) binary from a tagged
+# GitHub Release — same verified-download approach as scripts/install.sh, just
+# targeting all 5 platforms instead of the caller's own — and bumps every
 # package.json under npm/ to that tag's version. Doesn't publish anything;
 # see npm/README.md for the manual `npm publish` steps that come after.
 #
@@ -18,8 +18,8 @@ BASE_URL="https://github.com/${REPO}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # package dir name -> release target triple
-targets_pkg=(calm-mcp-linux-x64 calm-mcp-linux-arm64 calm-mcp-darwin-arm64)
-targets_triple=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin)
+targets_pkg=(calm-mcp-linux-x64 calm-mcp-linux-arm64 calm-mcp-darwin-arm64 calm-mcp-darwin-x64 calm-mcp-win32-x64)
+targets_triple=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc)
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -35,9 +35,17 @@ for i in "${!targets_pkg[@]}"; do
   curl -fsSL -o "${tmp_dir}/${asset}" "${BASE_URL}/releases/download/${tag}/${asset}"
   (cd "$tmp_dir" && grep " ${asset}\$" SHA256SUMS | sha256sum -c -)
 
-  tar -xzf "${tmp_dir}/${asset}" -C "$tmp_dir" calm
-  mv "${tmp_dir}/calm" "${here}/${pkg}/calm"
-  chmod +x "${here}/${pkg}/calm"
+  # Windows binaries are packaged as calm.exe inside the tarball (see
+  # release.yml's Package step) — every other target ships the bare `calm`
+  # name.
+  case "$target" in
+    *-windows-*) bin_name="calm.exe" ;;
+    *) bin_name="calm" ;;
+  esac
+
+  tar -xzf "${tmp_dir}/${asset}" -C "$tmp_dir" "$bin_name"
+  mv "${tmp_dir}/${bin_name}" "${here}/${pkg}/${bin_name}"
+  chmod +x "${here}/${pkg}/${bin_name}"
 done
 
 for pkg_json in "${here}"/calm-mcp-*/package.json "${here}/calm-mcp/package.json"; do
@@ -55,4 +63,6 @@ echo "Staged ${tag} (version ${version}). Publish in this order (see npm/README.
 echo "  cd npm/calm-mcp-linux-x64    && npm publish --access public"
 echo "  cd npm/calm-mcp-linux-arm64  && npm publish --access public"
 echo "  cd npm/calm-mcp-darwin-arm64 && npm publish --access public"
+echo "  cd npm/calm-mcp-darwin-x64   && npm publish --access public"
+echo "  cd npm/calm-mcp-win32-x64    && npm publish --access public"
 echo "  cd npm/calm-mcp              && npm publish --access public"

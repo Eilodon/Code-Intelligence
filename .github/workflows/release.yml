@@ -24,6 +24,23 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             cross: false
+          # Cross-compiled FROM the same arm64 macos-14 runner as the entry
+          # above, not a native macos-15-intel job — GitHub's only remaining
+          # x64 Mac label, itself scheduled for removal Fall 2027 (see
+          # .github/workflows/macos-x64-build-experiment.yml's header comment
+          # for the full reasoning + probe that validated this works).
+          - target: x86_64-apple-darwin
+            os: macos-14
+            cross: false
+          # Native build on a real Windows runner, not `cross` (which needs
+          # a Linux/Docker host) — validated by
+          # .github/workflows/windows-build-experiment.yml's 2026-07-15
+          # probe run: every C dependency (bundled SQLite, ~24 tree-sitter
+          # grammars, onig via the tokenizers crate) compiles clean under
+          # MSVC.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -43,12 +60,21 @@ jobs:
         # `-i.bak` (suffix glued to the flag, no space) is the one `sed -i`
         # spelling both GNU sed (Linux runners) and BSD sed (macOS runner)
         # accept the same way — a bare `-i` is GNU-only and errors on BSD.
+        # `shell: bash` is required here: windows-latest's default `run:`
+        # shell is `pwsh`, which doesn't understand this sed/bash syntax —
+        # every other runner already defaults to bash, so this is a no-op
+        # there.
+        shell: bash
         run: |
           sed -i.bak "s/^version = \".*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
           rm -f Cargo.toml.bak
 
       # `cross` runs the build in a container that already has the C
-      # cross-toolchain tree-sitter / stack-graphs / rusqlite need.
+      # cross-toolchain tree-sitter / stack-graphs / rusqlite need. Only the
+      # two Linux/musl entries opt into this (`cross: true`) — both macOS
+      # entries and the Windows entry build natively on their own runner via
+      # "Build (native)" below instead, since none of them are Linux hosts
+      # `cross` (which shells out to Docker) can run on.
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked
@@ -61,10 +87,20 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --bin calm --target ${{ matrix.target }}
 
+      # `shell: bash` for the same reason as "Set crate version from tag"
+      # above — this step's conditional + `tar`/`dirname` syntax needs a
+      # real POSIX shell, not windows-latest's default pwsh. Windows ships
+      # `tar` (bsdtar) and `bash` (Git Bash) out of the box on GitHub-hosted
+      # runners, so no extra tooling install is needed.
       - name: Package
+        shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/calm"
-          tar -czf "calm-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" calm
+          bin_name="calm"
+          case "${{ matrix.target }}" in
+            *-windows-*) bin_name="calm.exe" ;;
+          esac
+          bin="target/${{ matrix.target }}/release/${bin_name}"
+          tar -czf "calm-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" "$bin_name"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -199,7 +235,7 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
 
-      # Downloads all 3 platform binaries from THIS tag's release + stamps
+      # Downloads all 5 platform binaries from THIS tag's release + stamps
       # every package.json under npm/ (wrapper's optionalDependencies pins
       # included) to the tag version — fixing any wrapper/platform version
       # skew automatically at publish time.
@@ -210,7 +246,7 @@ jobs:
       # already resolvable the instant anyone installs it (npm/README.md).
       - name: Publish platform packages, then the wrapper
         run: |
-          for pkg in calm-mcp-linux-x64 calm-mcp-linux-arm64 calm-mcp-darwin-arm64 calm-mcp; do
+          for pkg in calm-mcp-linux-x64 calm-mcp-linux-arm64 calm-mcp-darwin-arm64 calm-mcp-darwin-x64 calm-mcp-win32-x64 calm-mcp; do
             ( cd "npm/$pkg" && npm publish --access public )
           done
 

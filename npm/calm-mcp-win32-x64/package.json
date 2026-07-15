@@ -1,0 +1,20 @@
+{
+  "name": "@eilodon/calm-mcp-win32-x64",
+  "version": "0.2.0",
+  "description": "Prebuilt calm (CALM MCP) binary for win32-x64 (Windows) — platform package for @eilodon/calm-mcp, not meant to be installed directly",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eilodon/CALM.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "calm.exe"
+  ],
+  "homepage": "https://github.com/Eilodon/CALM"
+}

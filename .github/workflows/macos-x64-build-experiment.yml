@@ -1,0 +1,95 @@
+name: macOS x64 build experiment (probe, not release)
+
+# Manual-only feasibility probe for x86_64-apple-darwin (Intel Mac) support —
+# NOT wired into release.yml's matrix yet. Companion to
+# windows-build-experiment.yml: same "prove it empirically before promoting"
+# posture (see docs/superskills/specs/2026-07-13-one-command-install-any-environment.md
+# §6: "Windows — probe chưa green thì đừng hứa" applies equally here).
+#
+# Deliberately does NOT use a native x64 runner. GitHub retired the Intel
+# `macos-13` image (2025-12-04); the only x64 label left is `macos-15-intel`,
+# itself scheduled for full removal in Fall 2027 (github.blog/changelog/
+# 2025-09-19-github-actions-macos-13-runner-image-is-closing-down,
+# actions/runner-images#13045). Riding that clock would mean re-doing this
+# migration again in ~13 months. Instead this cross-compiles
+# x86_64-apple-darwin FROM the same `macos-14` (Apple Silicon) runner
+# release.yml already uses natively for aarch64-apple-darwin — Xcode's
+# `clang` is a universal compiler (ships both arches' headers/libs in one
+# SDK, unlike targeting Linux from macOS which needs a separate osxcross
+# toolchain), so `cargo build --target x86_64-apple-darwin` needs no extra
+# SDK download, just `rustup target add`. This is the standard pattern for
+# Rust projects shipping both Darwin architectures from Apple Silicon CI.
+#
+# Real unknown this answers empirically: whether every C dependency's
+# build script (`cc` crate — rusqlite `bundled`, oniguruma via `onig_sys`
+# behind `tokenizers`, ~24 tree-sitter grammar crates) correctly cross-arches
+# under `cc-rs`'s Apple-target handling instead of silently building for the
+# host arch. windows-build-experiment.yml's own first real run (2026-07-15)
+# found every one of those same C deps compiles clean under MSVC — the only
+# failure there was a missing `#[cfg(unix)]` gate in calm's own code, not a
+# toolchain problem — so the prior expectation here is "probably fine," but
+# untested until this runs. Run with:
+#   gh workflow run macos-x64-build-experiment.yml
+# If this goes green, promote x86_64-apple-darwin into release.yml's matrix
+# as a `cross: false` entry on the existing `macos-14` job (NOT a new
+# `macos-15-intel` job — see above) and add an
+# @eilodon/calm-mcp-darwin-x64 npm platform package (see docs/mcp-client-setup.md
+# and npm/README.md for the existing pattern the 3 shipped platforms follow).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-apple-darwin
+
+      # Default features on purpose (embeddings, tier0-5, scip-overlay) —
+      # same reasoning as windows-build-experiment.yml: this is the actual
+      # shape a release binary would ship, not a stripped-down build that
+      # could pass while the real target fails.
+      - name: Build (release, default features, cross-compiled from arm64 host)
+        run: cargo build --release --bin calm --target x86_64-apple-darwin
+
+      # The runner itself is Apple Silicon, so *running* the x64 binary here
+      # (as opposed to just building it) needs Rosetta 2 — real Intel Macs
+      # in the wild need no such thing, this step only exists because the CI
+      # host happens to be the "wrong" arch for its own smoke test.
+      # `softwareupdate --install-rosetta` is idempotent (no-ops if already
+      # present) and is the documented way to guarantee it on a GitHub-hosted
+      # arm64 runner.
+      - name: Ensure Rosetta 2 is available (only needed to smoke-test the x64 binary on this arm64 host)
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Smoke test — binary runs and reports the right version
+        run: |
+          bin="target/x86_64-apple-darwin/release/calm"
+          file "$bin"
+          "$bin" --version
+
+      # `calm serve` without `--listen` is the path every non-daemon MCP
+      # client actually uses — same scope as the Windows probe's equivalent
+      # step. The daemon (`--listen`/`calm connect`) path is Unix-domain-
+      # socket based and works identically on Intel vs Apple Silicon macOS
+      # (both are `cfg(unix)`), so it isn't a cross-arch unknown the way the
+      # C-dependency build step above is — not re-probed here.
+      - name: "Smoke test — plain `calm serve` starts and exits cleanly"
+        run: |
+          bin="target/x86_64-apple-darwin/release/calm"
+          "$bin" serve --project-root . --db-path "${TMPDIR:-/tmp}/calm-macos-x64-probe.db" &
+          pid=$!
+          sleep 8
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "calm serve exited early instead of staying up" >&2
+            exit 1
+          fi
+          kill -TERM "$pid"
+          wait "$pid" || true

@@ -15,12 +15,16 @@
 #   CI_INSTALL_VERSION  release tag to install, e.g. "v0.2.0" or "0.2.0"
 #                       (default: latest release)
 #
-# Only 3 platforms have a prebuilt binary today — the same matrix
+# 5 platforms have a prebuilt binary today — the same matrix
 # .github/workflows/release.yml builds: x86_64/aarch64 Linux (musl,
-# statically linked, so no glibc version to match) and aarch64 (Apple
-# Silicon) macOS. Anything else (Windows, x86_64/Intel macOS) has nothing
-# to fetch here — clone the repo and `cargo build --release --bin calm`
-# instead (see README.md's Quick Start).
+# statically linked, so no glibc version to match), aarch64/x86_64
+# (Apple Silicon/Intel) macOS, and x86_64 Windows (MSVC). Anything else
+# has nothing to fetch here — clone the repo and
+# `cargo build --release --bin calm` instead (see README.md's Quick
+# Start). Windows note: this is a POSIX `sh` script, so it only runs
+# under a shell that provides one (Git Bash, MSYS2, Cygwin, WSL) — native
+# PowerShell/cmd can't execute it at all, so `npx @eilodon/calm-mcp` is
+# the more direct path for a plain Windows install.
 set -eu
 
 REPO="Eilodon/CALM"
@@ -43,8 +47,15 @@ case "$os" in
     ;;
   Darwin)
     case "$arch" in
-      arm64) target="aarch64-apple-darwin" ;;
-      *) die "no prebuilt binary for macOS/${arch} (only Apple Silicon is supported today) — clone the repo and run 'cargo build --release --bin calm' instead" ;;
+      arm64)  target="aarch64-apple-darwin" ;;
+      x86_64) target="x86_64-apple-darwin" ;;
+      *) die "no prebuilt binary for macOS/${arch} — clone the repo and run 'cargo build --release --bin calm' instead" ;;
+    esac
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    case "$arch" in
+      x86_64) target="x86_64-pc-windows-msvc" ;;
+      *) die "no prebuilt binary for Windows/${arch} — clone the repo and run 'cargo build --release --bin calm' instead" ;;
     esac
     ;;
   *)
@@ -90,15 +101,23 @@ else
   die "neither sha256sum nor shasum found — cannot verify download integrity"
 fi
 
-tar -xzf "${tmp_dir}/${asset_name}" -C "$tmp_dir" calm
-chmod +x "${tmp_dir}/calm"
+# Windows binaries are packaged as calm.exe inside the tarball (see
+# release.yml's Package step); every other target ships the bare `calm`
+# name.
+case "$target" in
+  *-windows-*) bin_name="calm.exe" ;;
+  *) bin_name="calm" ;;
+esac
 
-"${tmp_dir}/calm" --version >/dev/null 2>&1 || die "downloaded binary failed to run — aborting install"
+tar -xzf "${tmp_dir}/${asset_name}" -C "$tmp_dir" "$bin_name"
+chmod +x "${tmp_dir}/${bin_name}"
+
+"${tmp_dir}/${bin_name}" --version >/dev/null 2>&1 || die "downloaded binary failed to run — aborting install"
 
 mkdir -p "$INSTALL_DIR"
-mv "${tmp_dir}/calm" "${INSTALL_DIR}/calm"
+mv "${tmp_dir}/${bin_name}" "${INSTALL_DIR}/${bin_name}"
 
-log "installed calm ${tag} to ${INSTALL_DIR}/calm"
+log "installed calm ${tag} to ${INSTALL_DIR}/${bin_name}"
 
 case ":$PATH:" in
   *":${INSTALL_DIR}:"*) ;;

@@ -1079,7 +1079,22 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
     // permissive default this one used instead of `0700`. Found via
     // `daemon_calm_dir_and_socket_have_restrictive_permissions`
     // (`crates/calm-cli/tests/daemon_integration.rs`), not by inspection.
+    #[cfg(unix)]
     calm_server::daemon::create_calm_dir(&calm_dir)?;
+    // Windows: this function only runs on the `--listen` match arm in
+    // `main()` above, and `--listen` itself immediately bails with
+    // "only supported on Unix" the moment `Commands::Serve` is actually
+    // handled — so on non-Unix this is a dead-but-still-compiled path,
+    // never real daemon work. `calm_server::daemon` doesn't exist on
+    // non-Unix (`#[cfg(unix)] pub mod daemon;`, lib.rs) so it can't call
+    // the atomic-0700 helper above; plain `create_dir_all` is enough for
+    // a directory about to be abandoned anyway. Found via the
+    // windows-build-experiment.yml probe (2026-07-15 first run): every C
+    // dependency (bundled SQLite, ~24 tree-sitter grammars, onig via the
+    // tokenizers crate) compiled clean under MSVC — this missing cfg-gate
+    // was the ONLY compile error blocking a Windows build.
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&calm_dir)?;
 
     use tracing_subscriber::prelude::*;
 

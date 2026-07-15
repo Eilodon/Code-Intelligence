@@ -581,15 +581,143 @@ pub(crate) struct PerLanguageOverlayStatus {
     pub(crate) lang: String,
     #[serde(flatten)]
     pub(crate) status: ScipOverlayStatusOutput,
+    /// One-line install command for this language's external SCIP indexer,
+    /// present only when `status.available == false`. Turns "raw data, not
+    /// a verdict" (see `HealthSummary::weak_cross_reference_languages`'s own
+    /// doc comment) into something actionable instead of requiring the
+    /// reader to already know each provider's install story from memory —
+    /// 2026-07-15 UX audit finding: `available: false` alone gives no path
+    /// forward. `None` when `available == true` (nothing to suggest) — a
+    /// missing hint is never itself a signal that nothing can be done, see
+    /// `scip_install_hint`'s own doc comment for the "no entry yet" case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) install_hint: Option<String>,
 }
 
 #[cfg(feature = "scip-overlay")]
 impl PerLanguageOverlayStatus {
     fn new(lang: &str, status: calm_core::scip::OverlayStatus) -> Self {
+        let install_hint = if status.available {
+            None
+        } else {
+            scip_install_hint(lang)
+        };
         Self {
             lang: lang.to_string(),
             status: ScipOverlayStatusOutput::from(status),
+            install_hint,
         }
+    }
+}
+
+/// One-line install command per SCIP provider, for `PerLanguageOverlayStatus::
+/// install_hint`. Kept as plain strings rather than derived from
+/// `calm_core::scip::runner`'s `resolve_binary` functions, because *search*
+/// order (PATH/rustup/`$GOBIN`/...) and *install* recommendation are
+/// different questions — e.g. python/javascript never need a separate
+/// install step at all (bootstrap via `npx` the moment Node/npm are on
+/// PATH), which no `resolve_binary` function encodes.
+///
+/// Verified for real (2026-07-15), not guessed: go/java/csharp/php/ruby/c
+/// all installed and ran against a real binary via these exact commands (see
+/// `.github/workflows/scip-nightly.yml`, one job per language) in the same
+/// audit that added this function; rust's `rustup component add` is the
+/// standard upstream install path. Returns `None` for any `lang` not listed
+/// here — not an error, just "no one-line install story written yet",
+/// mirroring `install_hint`'s own doc comment on why absence isn't a signal.
+#[cfg(feature = "scip-overlay")]
+fn scip_install_hint(lang: &str) -> Option<String> {
+    let hint = match lang {
+        "rust" => "rustup component add rust-analyzer",
+        "go" => "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
+        "python" => {
+            "install Node.js/npm — scip-python bootstraps itself via `npx` once they're on PATH"
+        }
+        "javascript" => {
+            "install Node.js/npm — scip-typescript bootstraps itself via `npx` once they're on PATH"
+        }
+        "java" => {
+            "install via coursier: `cs bootstrap com.sourcegraph:scip-java_2.13:<version> -o \
+             scip-java` (needs a JDK + Maven/Gradle already on PATH) — also covers Kotlin in \
+             mixed Java/Kotlin projects"
+        }
+        "csharp" => "dotnet tool install --global scip-dotnet",
+        "php" => "composer global require davidrjenni/scip-php",
+        "ruby" => {
+            "download the platform binary from \
+             https://github.com/sourcegraph/scip-ruby/releases/latest (the `gem install \
+             scip-ruby` wrapper does not run standalone)"
+        }
+        "c" => {
+            "download the platform binary from \
+             https://github.com/sourcegraph/scip-clang/releases/latest — also needs a \
+             compile_commands.json at the project root"
+        }
+        _ => return None,
+    };
+    Some(hint.to_string())
+}
+
+#[cfg(all(test, feature = "scip-overlay"))]
+mod scip_install_hint_tests {
+    use super::*;
+
+    #[test]
+    fn install_hint_is_none_when_available() {
+        let status = calm_core::scip::OverlayStatus {
+            available: true,
+            up_to_date: true,
+            last_match_rate: None,
+            last_inserted: None,
+            last_run_unix: None,
+        };
+        let out = PerLanguageOverlayStatus::new("go", status);
+        assert_eq!(
+            out.install_hint, None,
+            "an available provider has nothing to suggest installing"
+        );
+    }
+
+    #[test]
+    fn install_hint_gives_a_real_command_for_every_known_provider_when_unavailable() {
+        let status = calm_core::scip::OverlayStatus {
+            available: false,
+            up_to_date: false,
+            last_match_rate: None,
+            last_inserted: None,
+            last_run_unix: None,
+        };
+        for lang in [
+            "rust",
+            "go",
+            "python",
+            "javascript",
+            "java",
+            "csharp",
+            "php",
+            "ruby",
+            "c",
+        ] {
+            let out = PerLanguageOverlayStatus::new(lang, status.clone());
+            assert!(
+                out.install_hint.is_some(),
+                "expected an install hint for {lang}, got None"
+            );
+        }
+    }
+
+    #[test]
+    fn install_hint_is_none_for_an_unknown_language_even_when_unavailable() {
+        let status = calm_core::scip::OverlayStatus {
+            available: false,
+            up_to_date: false,
+            last_match_rate: None,
+            last_inserted: None,
+            last_run_unix: None,
+        };
+        assert_eq!(scip_install_hint("cobol"), None);
+        let out = PerLanguageOverlayStatus::new("cobol", status);
+        assert_eq!(out.install_hint, None);
     }
 }
 

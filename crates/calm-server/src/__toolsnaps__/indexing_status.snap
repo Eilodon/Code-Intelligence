@@ -114,6 +114,13 @@
               "string",
               "null"
             ]
+          },
+          "install_hint": {
+            "description": "One-line install command for this language's external SCIP indexer,\npresent only when `status.available == false`. Turns \"raw data, not\na verdict\" (see `HealthSummary::weak_cross_reference_languages`'s own\ndoc comment) into something actionable instead of requiring the\nreader to already know each provider's install story from memory —\n2026-07-15 UX audit finding: `available: false` alone gives no path\nforward. `None` when `available == true` (nothing to suggest) — a\nmissing hint is never itself a signal that nothing can be done, see\n`scip_install_hint`'s own doc comment for the \"no entry yet\" case.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

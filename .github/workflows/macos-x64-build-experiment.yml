@@ -47,6 +47,14 @@ on:
 jobs:
   probe:
     runs-on: macos-14
+    # Safety net after the 2026-07-15 run: the SIGTERM smoke test below never
+    # confirmed the process actually exited (its blind `wait "$pid"` had no
+    # bound) and the job ran until GitHub's default 360-minute ceiling force-
+    # cancelled it — 6 hours of macos-14 runner time for what should have been
+    # a ~20-second step. This caps the whole job so a repeat of that failure
+    # mode costs minutes, not hours, regardless of what the step-level fix
+    # below does or doesn't catch.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -98,4 +106,24 @@ jobs:
             exit 1
           fi
           kill -TERM "$pid"
-          wait "$pid" || true
+          # Bounded poll, NOT a blind `wait "$pid"` — the 2026-07-15 run used
+          # a blind wait here and the process never observably reacted to
+          # SIGTERM (no "Received SIGTERM" ever appeared in its own log), so
+          # the step silently hung until GitHub's 360-minute job ceiling
+          # force-cancelled the whole run. This version fails loudly at 15s
+          # instead of hanging for hours — whether that means SIGTERM
+          # genuinely isn't reaching the process on this target, or is a
+          # cross-arch Rosetta signal-delivery quirk, is still open; either
+          # way this is a graceful-shutdown-on-this-target finding, not a
+          # build/run feasibility blocker (see the C-dependency-cross-arch
+          # scope note on the step above).
+          for _ in $(seq 1 15); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "calm serve exited within 15s of SIGTERM"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "calm serve did NOT exit within 15s of SIGTERM — force-killing and failing" >&2
+          kill -KILL "$pid" 2>/dev/null || true
+          exit 1

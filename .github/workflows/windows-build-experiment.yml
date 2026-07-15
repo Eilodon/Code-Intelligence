@@ -21,6 +21,12 @@ on:
 jobs:
   probe:
     runs-on: windows-latest
+    # Safety net added after the companion macos-x64-build-experiment.yml
+    # probe hung for ~6 hours on an unbounded smoke-test wait until GitHub's
+    # default 360-minute ceiling force-cancelled it (2026-07-15). This job's
+    # own smoke test uses Stop-Process -Force with no blocking wait, so it
+    # wasn't at risk the same way — this cap is just defense in depth.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

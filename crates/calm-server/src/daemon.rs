@@ -2,8 +2,8 @@
 //!
 //! Runs one long-lived process that serves many concurrent `calm connect`
 //! forwarders against one shared `CalmServer` + one background indexer/
-//! watcher/embedder, instead of today's default (one full `calm serve`
-//! process per MCP client connection). Unix-only — the accept loop uses
+//! watcher/embedder, instead of one full `calm serve` process per MCP
+//! client connection. Unix-only — the accept loop uses
 //! `tokio::net::UnixListener`, which doesn't exist on non-Unix targets;
 //! callers (`calm-cli`) gate `--listen`/`calm connect` behind `cfg(unix)`
 //! and fall back to plain `calm serve` (stdio) everywhere else.
@@ -12,9 +12,12 @@
 //! (`IDLE_CHECK_INTERVAL`/`IDLE_CHECKS_BEFORE_SHUTDOWN` below, gated on indexing/embed status too,
 //! not just connection count) and version-handshake *enforcement* (`DaemonMeta::is_current`,
 //! `try_connect_current` below — a stale build gets SIGTERMed and respawned, not just detected).
-//! Opt-in only — `calm serve`'s default stdio behavior is completely unchanged by this module's
-//! existence, and this daemon path isn't yet the default entry point for the npm/plugin
-//! distribution (`scripts/mcp-launcher.sh` still execs plain `calm serve`).
+//! `calm serve`'s own default stdio behavior (invoked directly, no `--listen`) is unchanged by
+//! this module's existence. But as of 2026-07-11 this daemon path IS the default entry point for
+//! the npm/plugin distribution: `scripts/mcp-launcher.sh` defaults to `calm connect` whenever both
+//! hold — Unix, and zero extra args were passed to the launcher — falling back to plain
+//! `calm serve` otherwise, or when `CI_MCP_LAUNCHER_NO_DAEMON=1` opts out explicitly. See
+//! `docs/adr/0005-daemon-forwarder-shared-process.md`'s "Update 2026-07-11" section.
 
 use std::path::{Path, PathBuf};
 

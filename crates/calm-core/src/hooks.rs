@@ -124,10 +124,7 @@ pub fn write_hooks_mode_file(calm_dir: &Path, mode: HooksMode, written_by: &str)
         "schema={HOOKS_MODE_SCHEMA}\nmode={mode}\nwritten_by={written_by}\nwritten_at={written_at}\n"
     );
     let path = hooks_mode_path(calm_dir);
-    let tmp_path = calm_dir.join(format!(
-        "hooks.mode.tmp.{}",
-        std::process::id()
-    ));
+    let tmp_path = calm_dir.join(format!("hooks.mode.tmp.{}", std::process::id()));
     std::fs::write(&tmp_path, contents)
         .with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, &path)
@@ -161,7 +158,11 @@ fn hooks_settings_block() -> serde_json::Value {
 }
 
 fn block_command(block: &serde_json::Value) -> Option<&str> {
-    block.get("hooks")?.as_array()?.iter().find_map(|h| h.get("command")?.as_str())
+    block
+        .get("hooks")?
+        .as_array()?
+        .iter()
+        .find_map(|h| h.get("command")?.as_str())
 }
 
 /// Merges CALM's hook block into `.claude/settings.json`'s
@@ -189,21 +190,29 @@ pub fn write_hooks_settings_block(path: &Path) -> Result<&'static str> {
         serde_json::json!({})
     };
 
-    let root_obj = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("existing file's top level isn't a JSON object — leaving it untouched"))?;
+    let root_obj = root.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("existing file's top level isn't a JSON object — leaving it untouched")
+    })?;
     let hooks_obj = root_obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("existing \"hooks\" field isn't a JSON object — leaving it untouched"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("existing \"hooks\" field isn't a JSON object — leaving it untouched")
+        })?;
     let pre = hooks_obj
         .entry("PreToolUse")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("existing \"hooks.PreToolUse\" field isn't a JSON array — leaving it untouched"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "existing \"hooks.PreToolUse\" field isn't a JSON array — leaving it untouched"
+            )
+        })?;
 
-    let already_wired = pre.iter().any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND));
+    let already_wired = pre
+        .iter()
+        .any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND));
     if already_wired {
         return Ok("up to date");
     }
@@ -309,10 +318,10 @@ pub fn check_hooks_status(project_root: &Path) -> HooksStatus {
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| {
-            v.get("hooks")?
-                .get("PreToolUse")?
-                .as_array()
-                .map(|arr| arr.iter().any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND)))
+            v.get("hooks")?.get("PreToolUse")?.as_array().map(|arr| {
+                arr.iter()
+                    .any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND))
+            })
         })
         .unwrap_or(false);
     let script_present = project_root.join(HOOKS_SCRIPT_REL_PATH).is_file();
@@ -388,7 +397,11 @@ mod tests {
     #[test]
     fn trailing_whitespace_and_crlf_still_parse() {
         let dir = tmp_dir();
-        std::fs::write(dir.path().join("hooks.mode"), "schema=1 \r\nmode=enforce \r\n").unwrap();
+        std::fs::write(
+            dir.path().join("hooks.mode"),
+            "schema=1 \r\nmode=enforce \r\n",
+        )
+        .unwrap();
         assert_eq!(read_hooks_mode_file(dir.path()), HooksMode::Enforce);
     }
 
@@ -467,13 +480,18 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["permissions"]["allow"][0], "Bash(ls:*)");
-        assert_eq!(v["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "echo bye");
+        assert_eq!(
+            v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "echo bye"
+        );
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
-        assert!(v["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["matcher"] == "SomeOtherTool"));
+        assert!(
+            v["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["matcher"] == "SomeOtherTool")
+        );
     }
 
     #[test]
@@ -490,7 +508,10 @@ mod tests {
     fn removing_block_from_absent_file_is_a_clean_noop() {
         let dir = tmp_dir();
         let path = dir.path().join(".claude/settings.json");
-        assert_eq!(remove_hooks_settings_block(&path).unwrap(), "nothing to remove");
+        assert_eq!(
+            remove_hooks_settings_block(&path).unwrap(),
+            "nothing to remove"
+        );
     }
 
     #[test]
@@ -521,7 +542,10 @@ mod tests {
         let path = dir.path().join(".claude/settings.json");
         write_hooks_settings_block(&path).unwrap();
         assert_eq!(remove_hooks_settings_block(&path).unwrap(), "removed");
-        assert_eq!(remove_hooks_settings_block(&path).unwrap(), "nothing to remove");
+        assert_eq!(
+            remove_hooks_settings_block(&path).unwrap(),
+            "nothing to remove"
+        );
     }
 
     // --- FM2: status cross-check ---

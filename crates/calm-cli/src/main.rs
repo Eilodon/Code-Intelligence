@@ -948,7 +948,7 @@ fn write_agents_md_block(root: &std::path::Path, force: bool) -> Result<&'static
 /// just ran.
 fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
     use calm_core::hooks::{
-        self, HooksMode, CLAUDE_SETTINGS_REL_PATH, HOOKS_SCRIPT, HOOKS_SCRIPT_REL_PATH,
+        self, CLAUDE_SETTINGS_REL_PATH, HOOKS_SCRIPT, HOOKS_SCRIPT_REL_PATH, HooksMode,
     };
 
     let mode = HooksMode::parse(mode_str).ok_or_else(|| {
@@ -972,11 +972,22 @@ fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
             false
         };
         println!("hooks: {previous_mode} -> off");
-        println!("  .calm/hooks.mode: {}", if mode_removed { "removed" } else { "was already absent" });
+        println!(
+            "  .calm/hooks.mode: {}",
+            if mode_removed {
+                "removed"
+            } else {
+                "was already absent"
+            }
+        );
         println!("  {CLAUDE_SETTINGS_REL_PATH}: {block_action}");
         println!(
             "  {HOOKS_SCRIPT_REL_PATH}: {}",
-            if script_removed { "removed" } else { "was already absent" }
+            if script_removed {
+                "removed"
+            } else {
+                "was already absent"
+            }
         );
         return Ok(());
     }

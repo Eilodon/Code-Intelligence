@@ -3,4 +3,16 @@
   <groupId>com.example</groupId>
   <artifactId>multilang</artifactId>
   <version>1.0</version>
+  <!-- Without an explicit source/target, Maven 3.8.x's super-POM default
+       (maven-compiler-plugin 3.1) targets Java 5 — which JDK 21 (the
+       version ubuntu-latest GitHub Actions runners and this project's own
+       scip-toolbox Containerfile both use) refuses outright: "Source
+       option 5 is no longer supported. Use 8 or later." Confirmed live
+       2026-07-15 building Containerfile.scip-toolbox — `scip-java index`
+       failed on this exact fixture with that exact error before this fix.
+       17 is a safe modern LTS floor with headroom below JDK 21. -->
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+  </properties>
 </project>

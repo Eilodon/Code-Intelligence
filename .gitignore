@@ -20,6 +20,13 @@ crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/.gradle/
 crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/build/
 crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/index.scip
 
+# Same shape, Maven side: `mvn compile`'s own `target/` plus `scip-java
+# index`'s output, left behind when java_overlay_upgrades_a_real_edge_*
+# runs against multi_lang_workspace/java (verified live 2026-07-15 building
+# Containerfile.scip-toolbox).
+crates/calm-core/tests/fixtures/multi_lang_workspace/java/target/
+crates/calm-core/tests/fixtures/multi_lang_workspace/java/index.scip
+
 # Index database (per-project, generated)
 .calm/
 *.db

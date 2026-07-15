@@ -1811,4 +1811,99 @@ mod tests {
         let _ = std::fs::remove_file(fixture.join("composer.lock"));
         let _ = std::fs::remove_file(fixture.join("index.scip"));
     }
+
+    /// Live integration: real `scip-clang` against `multi_lang_workspace/c`
+    /// (P3.1). Unlike every other provider's live test above, `provider::CLANG`
+    /// had never actually been run against a real binary anywhere — the
+    /// session that scaffolded it hit a hard sandbox egress block on GitHub
+    /// Releases and had no Bazel to build from source (see `provider::CLANG`'s
+    /// own doc comment). Verified for real before writing this test: a real
+    /// `sourcegraph/scip-clang` release binary downloads fine on an
+    /// unrestricted runner (`releases/latest/download/scip-clang-x86_64-linux`),
+    /// its `--compdb-path`/`--index-output-path`/`-j` flags match
+    /// `clang_build_command` exactly (that function's doc comment can drop
+    /// its "not confirmed" caveat now), and it indexed the checked-in
+    /// `tests/fixtures/multi_lang_workspace/c` fixture correctly — with one
+    /// real bug found along the way: `scip-clang` hard-requires an *absolute*
+    /// `directory` field in `compile_commands.json` ("expected absolute path
+    /// for `directory` key but found '.'"), which the checked-in fixture (a
+    /// relative `"."`, fine for every other consumer of that file) does not
+    /// satisfy. A real `compile_commands.json` from CMake/`bear` always
+    /// carries an absolute `directory` already, so this isn't a CALM-side
+    /// gap — but a checked-in fixture can't hardcode one absolute path that
+    /// works on every machine/CI runner either. Fix: copy the fixture's
+    /// sources into a `tempfile::tempdir()` and write a fresh
+    /// `compile_commands.json` there with that tempdir's own canonicalized
+    /// path, instead of running in place the way every other language's test
+    /// above does — the checked-in fixture directory itself is left
+    /// untouched. Ignored by default — needs a `scip-clang` binary on `PATH`
+    /// (this repo has no `actions/setup-*` step for it; `scip-nightly.yml`
+    /// downloads the release asset directly, same shape as this test's own
+    /// manual verification).
+    #[test]
+    #[ignore]
+    fn clang_overlay_upgrades_a_real_edge_on_the_c_fixture() {
+        let src_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/c");
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = tmp.path().canonicalize().unwrap();
+        for name in ["main.c", "helper.c", "helper.h"] {
+            std::fs::copy(src_fixture.join(name), fixture.join(name)).unwrap();
+        }
+        // `directory` must be absolute — see the doc comment above for why
+        // the checked-in fixture's own `"."` doesn't survive a real
+        // `scip-clang` run, unlike every other consumer of that file.
+        std::fs::write(
+            fixture.join("compile_commands.json"),
+            format!(
+                r#"[
+  {{
+    "directory": {dir:?},
+    "command": "cc -c main.c -o main.o",
+    "file": "main.c"
+  }},
+  {{
+    "directory": {dir:?},
+    "command": "cc -c helper.c -o helper.o",
+    "file": "helper.c"
+  }}
+]
+"#,
+                dir = fixture.display()
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let clang = crate::config::ClangConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+            lsp: crate::config::LspConfig::default(),
+        };
+        let stats = run_clang_overlay_and_log(&conn, &fixture, &clang).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal"
+        );
+        let conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.c::main' \
+                   AND to_symbol = 'helper.c::greet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "formal");
+    }
 }

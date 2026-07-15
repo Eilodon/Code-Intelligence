@@ -4,46 +4,109 @@ name: SCIP overlay (nightly)
 # skips on every push/PR (`#[ignore]`d — they need a heavy binary installed
 # and are too slow/flaky to gate merges on). See the 8-language plan doc's
 # P0.5: docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md
+#
+# One job per provider, deliberately NOT a single monolithic job — audited
+# 2026-07-15 after discovering the previous single-job shape meant one
+# provider's install failure (scip-php, blocked by a Composer security
+# advisory since 2026-07-09) skipped `cargo test -- --ignored` entirely, so
+# scip-go/scip-java/scip-dotnet got zero fresh CI evidence too even on days
+# their own installs succeeded (`git log`/`gh run view` on this file's
+# history confirms Rust is the only provider with a real green run in this
+# workflow's history, 2026-07-08). Splitting into independent jobs means a
+# broken provider only ever costs that provider's own signal.
 on:
   schedule:
     - cron: "0 3 * * *" # 03:00 UTC daily
   workflow_dispatch: {}
 
 jobs:
-  scip-overlay-nightly:
+  # `go`/`node`/`npm`/JDK/Maven/Gradle/.NET SDK/PHP+Composer are all
+  # preinstalled on the `ubuntu-latest` runner image
+  # (github.com/actions/runner-images) — no `actions/setup-*` step needed for
+  # any of them, so nothing new to SHA-pin per job beyond what was already
+  # pinned below.
+
+  scip-rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rust-analyzer
-
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-rust
+      - name: Run real-indexer integration test (rust-analyzer scip)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            overlay_upgrades_a_real_edge_on_the_fixture
 
-      # `go` and `node`/`npm` are preinstalled on the `ubuntu-latest` runner
-      # image (github.com/actions/runner-images) — no `actions/setup-*` step
-      # needed for either, so nothing new to SHA-pin here. `scip-go` (P2.1)
-      # is a real `go install`; `scip-python` (P2.4) and `scip-typescript`
-      # (P3.2) run through `npx` on demand (see `runner.rs`'s
-      # `python_resolve_binary`/`js_resolve_binary`) and need no separate
-      # install step at all — only network access to the npm registry, which
-      # this runner already has.
+  scip-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-go
       - name: Install scip-go
         run: go install github.com/scip-code/scip-go/cmd/scip-go@latest
+      - name: Run real-indexer integration tests (scip-go)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture \
+            go_workspace_overlay_upgrades_edges_in_both_member_modules
 
-      # JDK 21 + Maven + Gradle are all preinstalled on the `ubuntu-latest`
-      # runner image (github.com/actions/runner-images) — no `actions/setup-*`
-      # step needed. `scip-java` (P2.2) has no standalone-binary release the
-      # way `scip-go`/rust-analyzer do; its docs recommend `cs bootstrap`
-      # (coursier) or the `sourcegraph/scip-java` Docker image, neither of
-      # which is preinstalled here either. This step instead does what `cs
-      # bootstrap` does under the hood — resolve the `com.sourcegraph:
-      # scip-java_2.13` Maven Central artifact's full runtime classpath via
-      # Maven (already on `PATH`, needs no `coursier` install of its own) and
-      # wrap it in a launcher script — verified for real in the session that
-      # added this step (see the 8-language plan's P2.2). Bump SCIP_JAVA_VERSION
-      # when a newer release is verified the same way.
+  # `scip-python` runs through `npx` on demand (see `runner.rs`'s
+  # `python_resolve_binary`) and needs no separate install step — only
+  # network access to the npm registry, which this runner already has.
+  scip-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-python
+      - name: Run real-indexer integration test (scip-python via npx)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture
+
+  # `scip-typescript` (covers JS+TS) also runs through `npx` on demand (see
+  # `runner.rs`'s `js_resolve_binary`) — same no-install-step shape as Python.
+  scip-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-js
+      - name: Run real-indexer integration test (scip-typescript via npx)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            js_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture
+
+  scip-java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-java
+
+      # `scip-java` has no standalone-binary release the way `scip-go`/
+      # rust-analyzer do; its docs recommend `cs bootstrap` (coursier) or the
+      # `sourcegraph/scip-java` Docker image, neither of which is preinstalled
+      # here either. This step instead does what `cs bootstrap` does under
+      # the hood — resolve the `com.sourcegraph:scip-java_2.13` Maven Central
+      # artifact's full runtime classpath via Maven (already on `PATH`, needs
+      # no `coursier` install of its own) and wrap it in a launcher script —
+      # verified for real in the session that added this step (see the
+      # 8-language plan's P2.2). Bump SCIP_JAVA_VERSION when a newer release
+      # is verified the same way.
       - name: Install scip-java
         run: |
           set -euo pipefail
@@ -77,54 +140,173 @@ jobs:
           EOF
           chmod +x "$HOME/.local/bin/scip-java"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run real-indexer integration test (scip-java)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            java_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture
 
-      # .NET SDK is preinstalled on the `ubuntu-latest` runner image
-      # (github.com/actions/runner-images ships several SDK versions) — no
-      # separate `actions/setup-dotnet` step needed, matching the JDK/Go/Node
-      # comment above. `scip-dotnet` (P2.3) is a real NuGet-published
-      # `dotnet tool`, confirmed by installing and running it for real in the
-      # session that added this step (see the 8-language plan's P2.3) — no
-      # bespoke Maven-style bootstrap needed the way `scip-java` above is.
+      # Kotlin (`kotlin_overlay_upgrades_ambiguous_smart_cast_calls_on_the_
+      # multi_lang_fixture`) piggybacks this same `scip-java` provider but
+      # additionally needs a Gradle new enough for the Kotlin Gradle plugin
+      # (`kotlin("jvm") version "1.9.22"` needs Gradle 8.x; this runner image's
+      # system `gradle`, like the sandbox that wrote the test, may be too
+      # old) — deliberately not wired into this job yet. Add a
+      # `gradle/actions/setup-gradle` step + the test's own name to the
+      # filter above once that's verified for real on a runner, rather than
+      # guessing the version requirement is satisfied.
+
+  scip-csharp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-csharp
+
+      # `scip-dotnet` is a real NuGet-published `dotnet tool`, confirmed by
+      # installing and running it for real in the session that added this
+      # step (see the 8-language plan's P2.3) — no bespoke Maven-style
+      # bootstrap needed the way `scip-java` above is.
       - name: Install scip-dotnet
         run: |
           set -euo pipefail
           dotnet tool install --global scip-dotnet
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Run real-indexer integration test (scip-dotnet)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            csharp_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture
 
-      # PHP + Composer are preinstalled on the `ubuntu-latest` runner image.
-      # `scip-php` (P2.5) is a real Packagist package (`davidrjenni/scip-php`)
-      # confirmed by actually installing and running it for real in the
-      # session that added this step (see the 8-language plan's P2.5).
-      # Installed as a Composer *global* dependency (distinct from a
-      # project-local `vendor/bin/scip-php`, which `php_resolve_binary` tries
-      # first) so it's on `PATH` for whichever fixture the ignored tests
-      # point at.
-      - name: Install scip-php
+  scip-php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-php
+
+      # NOT installed via `composer global/project require` — that pulls
+      # Packagist's `v0.0.2` (2023-04-23, the only tagged release, confirmed
+      # via `repo.packagist.org/p2/davidrjenni/scip-php.json`), which has two
+      # real, independent problems verified 2026-07-15:
+      #
+      # 1. Composer 2.9's `audit.block-insecure` refuses it outright: v0.0.2
+      #    requires `google/protobuf ^3.22`, entirely covered by advisory
+      #    PKSA-tcfz-w4fm-hhk9 (= GHSA-p2gh-cfq4-4wjc = CVE-2026-6409, a
+      #    protobuf-decode DoS, fixed upstream in protobuf >=4.33.6).
+      # 2. Even bypassing that (tried both `composer global require` and the
+      #    README's own documented `composer require --dev` + `vendor/bin/
+      #    scip-php` — both fail identically): v0.0.2 crashes with
+      #    `RuntimeException: Invalid scip-php vendor directory`, a known bug
+      #    (github.com/davidrjenni/scip-php#235, 3 independent users hit it)
+      #    already fixed upstream by PR #797 (merged 2026-03-28) — but that
+      #    fix has never been cut into a Packagist release or rebuilt into
+      #    the `davidrjenni/scip-php` Docker Hub image either (confirmed live
+      #    — pulled `:latest`, its bundled `Composer.php` still has no `$cwd`
+      #    fallback, i.e. still pre-#797). Reported upstream:
+      #    github.com/davidrjenni/scip-php/issues/862, asking for a release —
+      #    not yet acted on as of this comment.
+      #
+      # Both problems disappear at once by installing straight from `main`
+      # at a pinned commit instead of from Packagist: `main`'s own
+      # `composer.json` already requires `google/protobuf ^5.34` (nowhere
+      # near the advisory range — problem 1 gone, no `policy.advisories.
+      # ignore-id` needed at all) and it carries PR #797's fix (problem 2
+      # gone). Verified end-to-end 2026-07-15 on a plain `ubuntu:24.04`
+      # container (same distro `ubuntu-latest` runners use): clone, `composer
+      # install --no-dev`, run against a real fixture, real `Helper#greet()`
+      # occurrence in the resulting `.scip` file, zero advisory prompts.
+      # Pinned to an exact commit (not floating `main`) for the same reason
+      # every Action below is SHA-pinned — reproducible, and immune to a
+      # future upstream commit breaking this job in some unrelated way.
+      # Bump `SCIP_PHP_COMMIT` by hand once upstream cuts a real release
+      # (then switch this back to a normal Packagist install).
+      - name: Install scip-php (from source, pinned past-#797 commit — see comment above)
         run: |
           set -euo pipefail
-          composer global require davidrjenni/scip-php
-          echo "$(composer global config bin-dir --absolute)" >> "$GITHUB_PATH"
+          SCIP_PHP_COMMIT=71a5b117ec4c5dd2af302e363410e604e5df309e
+          git clone https://github.com/davidrjenni/scip-php "$RUNNER_TEMP/scip-php-src"
+          git -C "$RUNNER_TEMP/scip-php-src" checkout --quiet "$SCIP_PHP_COMMIT"
+          composer install --no-interaction --no-dev --working-dir="$RUNNER_TEMP/scip-php-src"
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/scip-php" <<EOF
+          #!/usr/bin/env bash
+          exec php "$RUNNER_TEMP/scip-php-src/bin/scip-php" "\$@"
+          EOF
+          chmod +x "$HOME/.local/bin/scip-php"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run real-indexer integration test (scip-php)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            php_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture
 
-      # scip-clang (P3.1) is deliberately NOT installed here. This session's
-      # own sandbox could not obtain a real `scip-clang` binary at all —
-      # prebuilt binaries are published as GitHub Release assets, and this
-      # environment's egress policy returns a hard 403 for both
-      # `api.github.com` and `github.com/*/releases/*` (confirmed via the
-      # proxy's own status endpoint, a real policy denial, not a transient
-      # failure); building from source needs Bazel, not available here
-      # either. `provider::CLANG` (`crates/calm-core/src/scip/provider.rs`)
-      # is therefore scaffolding validated by unit tests only — there is no
-      # `#[ignore]`d live-binary integration test for this provider the way
-      # every other one above has, so installing a binary here wouldn't add
-      # any real coverage yet regardless. A genuine GitHub Actions runner has
-      # unrestricted internet access and could plausibly `curl` a release
-      # asset from https://github.com/sourcegraph/scip-clang/releases
-      # directly, but writing that step blind — never having verified the
-      # download URL, that the binary actually runs, or that a real
-      # `compile_commands.json` fixture resolves through it — would be
-      # untested CI surface pretending to be tested. Add this step for real,
-      # alongside the matching `#[ignore]`d test, once a future session can
-      # verify the whole path end to end the way every step above was
-      # earned.
-      - name: Run real-indexer integration tests
-        run: cargo test --workspace -- --ignored
+  scip-ruby:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-ruby
+
+      # `scip-ruby` (Sourcegraph's fork of Sorbet) publishes a `gem install
+      # scip-ruby`, but its installed `bin/scip-ruby` is a thin RubyGems
+      # wrapper that hard-requires `BUNDLE_GEMFILE` and refuses to run
+      # standalone (`ruby_resolve_binary`'s doc comment in `runner.rs`) — so
+      # `php_resolve_binary`-style PATH lookup only works against the
+      # README's other install method, a raw platform binary. Added here for
+      # the first time (2026-07-15) — never previously wired into this
+      # workflow despite the provider shipping 2026-07-11 — verified for
+      # real before writing this step: this exact URL 200s and the binary
+      # runs standalone (`scip-ruby --version`) on an unrestricted runner.
+      # Only x86_64 Linux / arm64 macOS have prebuilt binaries; this job's
+      # `ubuntu-latest` runner is x86_64 Linux.
+      - name: Install scip-ruby
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/scip-ruby" \
+            "https://github.com/sourcegraph/scip-ruby/releases/latest/download/scip-ruby-x86_64-linux"
+          chmod +x "$RUNNER_TEMP/scip-ruby"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Run real-indexer integration test (scip-ruby)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            ruby_overlay_upgrades_ambiguous_case_when_calls_on_the_multi_lang_fixture
+
+  scip-clang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: scip-clang
+
+      # `provider::CLANG` had never been live-verified anywhere before
+      # 2026-07-15 — the session that scaffolded it hit a hard sandbox
+      # egress block on GitHub Releases and had no Bazel to build from
+      # source. Verified for real before adding this step: a genuine
+      # `ubuntu-latest` runner has unrestricted internet access (unlike that
+      # sandbox), this URL 200s, `--compdb-path`/`--index-output-path`/`-j`
+      # match `clang_build_command` exactly, and it indexes the checked-in
+      # `multi_lang_workspace/c` fixture correctly (see the new
+      # `clang_overlay_upgrades_a_real_edge_on_the_c_fixture` test's own doc
+      # comment in `scip/mod.rs` for a real bug found along the way:
+      # `scip-clang` requires an absolute `directory` in
+      # `compile_commands.json`, which that test works around in a tempdir
+      # copy rather than the checked-in fixture itself). Only x86_64 Linux /
+      # arm64 macOS have prebuilt binaries, matching `clang_platform_
+      # supported`'s own gate in `runner.rs`.
+      - name: Install scip-clang
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/scip-clang" \
+            "https://github.com/sourcegraph/scip-clang/releases/latest/download/scip-clang-x86_64-linux"
+          chmod +x "$RUNNER_TEMP/scip-clang"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Run real-indexer integration test (scip-clang)
+        run: |
+          cargo test -p calm-core --features scip-overlay -- --ignored \
+            clang_overlay_upgrades_a_real_edge_on_the_c_fixture

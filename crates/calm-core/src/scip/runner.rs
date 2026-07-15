@@ -804,13 +804,17 @@ pub fn find_compile_commands(root: &Path) -> Option<PathBuf> {
 }
 
 /// `scip-clang --compdb-path {compdb} --index-output-path {out} -j {n}`
-/// (flag names per `scip-clang`'s published CLI usage text — **not**
-/// confirmed against a real binary in this sandbox, same caveat as
-/// `clang_resolve_binary`'s doc comment). `-j` is capped at 8 rather than
-/// left unbounded or tied to `available_parallelism()` uncapped: an
-/// indexer running inside `calm`'s own background watcher shouldn't be
-/// free to claim every core on a large CI/dev box the way a foreground
-/// `ninja -j$(nproc)` build reasonably would.
+/// (flag names per `scip-clang`'s published CLI usage text — **confirmed
+/// against a real `scip-clang 0.4.0` binary 2026-07-15**, see
+/// `clang_overlay_upgrades_a_real_edge_on_the_c_fixture` in `scip/mod.rs`;
+/// this doc comment previously carried a "not confirmed in this sandbox"
+/// caveat, same as `clang_resolve_binary`'s below — both are now stale in
+/// the direction of "it works", left here as history rather than silently
+/// dropped). `-j` is capped at 8 rather than left unbounded or tied to
+/// `available_parallelism()` uncapped: an indexer running inside `calm`'s
+/// own background watcher shouldn't be free to claim every core on a large
+/// CI/dev box the way a foreground `ninja -j$(nproc)` build reasonably
+/// would.
 pub fn clang_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
     let compdb =
         find_compile_commands(root).unwrap_or_else(|| root.join("__no_compile_commands_found__"));

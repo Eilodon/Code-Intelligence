@@ -6,8 +6,8 @@
 //! 9 entries exist today: `RUST`, `GO` (P2.1), `PYTHON` (P2.4), `TYPESCRIPT`
 //! (P3.2, covers JS+TS), `JAVA` (P2.2, also covers Kotlin via a `dirty_langs`
 //! piggyback — see its own doc comment), `CSHARP` (P2.3), `PHP` (P2.5),
-//! `RUBY` (Phase D.1, 2026-07-11), and `CLANG` (P3.1, scaffold-only — see
-//! its own doc comment). Fields sketched
+//! `RUBY` (Phase D.1, 2026-07-11), and `CLANG` (P3.1, live-verified
+//! 2026-07-15 — see its own doc comment for what changed). Fields sketched
 //! in the plan's P0.4 design for multi-root marker-file discovery, prereq
 //! gating, and refresh policy are still deliberately NOT here — `ScipProvider`
 //! itself stays single-root/single-output on purpose. Go's `go.work`
@@ -25,29 +25,52 @@
 //!
 //! **Live-verification history is uneven across these 9 — "the code exists"
 //! and "confirmed working right now" are two different claims, don't conflate
-//! them** (audited 2026-07-10, `RUBY` added 2026-07-11). `GO`, `JAVA`,
-//! `CSHARP`, and `PHP` were each manually verified live-passing exactly once,
-//! by the session that implemented them, against a real indexer binary with
-//! a real toolchain (see
+//! them** (originally audited 2026-07-10, re-audited 2026-07-15 — the
+//! 07-10 pass is what first found the `PHP`/CI-coverage gaps described
+//! below; the 07-15 pass fixed what it safely could and corrected one of
+//! its own stale claims in the process, see the `PHP` paragraph). `GO`,
+//! `JAVA`, and `CSHARP` were each manually verified live-passing exactly
+//! once, by the session that implemented them, against a real indexer
+//! binary with a real toolchain (see
 //! `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §5's
 //! table for the exact fixture results and match rates — e.g. Go 0.67,
-//! Java 1.00). None of that has been *continuously* re-verified since,
-//! though: `RUST` is the only provider with a real green run in GitHub
-//! Actions CI history (`.github/workflows/scip-nightly.yml`, run
-//! 2026-07-08) — every nightly run new enough to include the other
-//! providers either predates the relevant commit or failed before reaching
-//! the test step. `PHP`'s own `scip-php` install is currently, actively
-//! broken in CI as of that audit: Composer refuses `davidrjenni/scip-php`
-//! because its `google/protobuf` dependency range is blocked by security
-//! advisory PKSA-tcfz-w4fm-hhk9 (see the pinned-version workaround in
-//! `scip-nightly.yml`). `PYTHON` and `TYPESCRIPT` were independently
-//! re-confirmed live-passing by hand in a plain dev sandbox during the same
-//! 2026-07-10 audit (both run through `npx` with no extra toolchain install,
-//! so friction — and therefore real-world reach — is far lower than
-//! Go/Java/C#/PHP, which all need a locally installed toolchain). `RUBY`
-//! was live end-to-end verified on 2026-07-11, the day it was added.
-//! `CLANG` has no live-verification path at all, ever, by design — see its
-//! own doc comment below for the two independent blockers.
+//! Java 1.00) — none of that has been *continuously* re-verified since.
+//! All 9 providers now have their own independent job in `.github/
+//! workflows/scip-nightly.yml` (restructured 2026-07-15 from one monolithic
+//! job — see that file's own top comment for why: the old shape meant one
+//! provider's install failure skipped the test step for every other
+//! provider too, so a green `scip-go`/`scip-java`/`scip-dotnet` install day
+//! still produced zero fresh test evidence for any of them). `PHP` was the
+//! last one fixed, same day, and **not** with a security-posture workaround
+//! in the end: Packagist's only `scip-php` release (v0.0.2, 2023) has two
+//! independent problems — a Composer advisory block on its `google/protobuf`
+//! range (PKSA-tcfz-w4fm-hhk9), and a separate `RuntimeException: Invalid
+//! scip-php vendor directory` crash
+//! (github.com/davidrjenni/scip-php/issues/235) that's already fixed
+//! upstream (PR #797, merged 2026-03-28) but never cut into a release or
+//! rebuilt into the `davidrjenni/scip-php` Docker image either — confirmed
+//! live by pulling `:latest` and finding its bundled `Composer.php` still
+//! pre-#797. Reported: github.com/davidrjenni/scip-php/issues/862. Both
+//! problems disappear installing from that post-fix commit directly instead
+//! of Packagist: `main`'s own `composer.json` already requires a patched
+//! `google/protobuf` range, so the advisory question doesn't even arise —
+//! see `.github/workflows/scip-nightly.yml`'s `scip-php` job for the pinned
+//! commit and full writeup. (An earlier version of this comment claimed a
+//! "pinned-version workaround" already existed in that file when it didn't
+//! — verified against real `git log` before writing that correction, and
+//! now actually true.)
+//! `PYTHON` and `TYPESCRIPT` run through `npx` with no extra toolchain
+//! install, so friction — and therefore real-world reach — is far lower
+//! than Go/Java/C#/PHP, which all need a locally installed toolchain.
+//! `CLANG` had no live-verification path at all before 2026-07-15 (two
+//! independent blockers in whatever sandbox last tried — see its own doc
+//! comment's history) — confirmed for real that day on an unrestricted
+//! runner: a real `scip-clang` release binary downloads and runs, its CLI
+//! flags match `clang_build_command` exactly, and it indexes the checked-in
+//! C fixture correctly (one real bug found and worked around: `scip-clang`
+//! requires an absolute `directory` field in `compile_commands.json`, which
+//! the checked-in fixture's relative `"."` doesn't satisfy — see
+//! `clang_overlay_upgrades_a_real_edge_on_the_c_fixture` in `scip/mod.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -522,21 +545,24 @@ fn ruby_gemfile_lock_hash(root: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The 8th entry in the table (Phase 3 / P3.1) — **scaffolding only, no
-/// live verification**, unlike every other provider in this table. Two
-/// independent blockers made `scip-clang` unobtainable in this sandbox:
-/// prebuilt binaries are published as GitHub Release assets, and this
-/// environment's egress policy returns a hard 403 for both
-/// `api.github.com` and `github.com/*/releases/*` (confirmed via the
-/// proxy's own status endpoint — a real policy denial, not a transient
-/// network failure); building from source requires Bazel, and only
-/// `bazel-bootstrap` is apt-installable here, which itself requires
-/// building Bazel from source first. Neither path is realistic inside one
-/// session, so this entry follows the plan's own P3.1 spec exactly
-/// (`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §P3.1)
-/// but has unit tests only — no `#[ignore]`d live-binary integration test
-/// exists for this provider the way `csharp_overlay_upgrades_a_real_edge_*`/
-/// `php_overlay_upgrades_a_real_edge_*` do for C#/PHP.
+/// The 8th entry in the table (Phase 3 / P3.1). **Live-verified 2026-07-15**
+/// (previously scaffolding-only, no live verification, unlike every other
+/// provider in this table — the session that scaffolded it hit two
+/// independent blockers: prebuilt binaries are published as GitHub Release
+/// assets and that sandbox's egress policy returned a hard 403 for both
+/// `api.github.com` and `github.com/*/releases/*`; building from source
+/// needs Bazel, and only `bazel-bootstrap` was apt-installable there, which
+/// itself needs building Bazel from source first). Neither blocker applies
+/// on a genuine GitHub Actions runner or an unrestricted dev sandbox: a real
+/// `sourcegraph/scip-clang` release binary downloads fine
+/// (`releases/latest/download/scip-clang-x86_64-linux`), its
+/// `--compdb-path`/`--index-output-path`/`-j` flags match
+/// `clang_build_command` below exactly, and it indexes a real fixture
+/// correctly — see `clang_overlay_upgrades_a_real_edge_on_the_c_fixture`
+/// (`scip/mod.rs`) and its own doc comment for the one real bug found along
+/// the way (`compile_commands.json`'s `directory` field must be absolute).
+/// `.github/workflows/scip-nightly.yml`'s `scip-clang` job installs the same
+/// binary the same way for continuous coverage.
 ///
 /// Deliberate cut from the plan's literal `ClangConfig { scip: ScipConfig,
 /// compile_commands: Option<String> }` shape: `ClangConfig` below carries

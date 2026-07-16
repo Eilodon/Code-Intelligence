@@ -21,6 +21,8 @@
   "optionalDependencies": {
     "@eilodon/calm-mcp-linux-x64": "0.2.0",
     "@eilodon/calm-mcp-linux-arm64": "0.2.0",
-    "@eilodon/calm-mcp-darwin-arm64": "0.2.0"
+    "@eilodon/calm-mcp-darwin-arm64": "0.2.0",
+    "@eilodon/calm-mcp-darwin-x64": "0.2.0",
+    "@eilodon/calm-mcp-win32-x64": "0.2.0"
   }
 }

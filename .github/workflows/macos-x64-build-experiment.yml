@@ -1,0 +1,140 @@
+name: macOS x64 build experiment (probe, not release)
+
+# Manual-only feasibility probe for x86_64-apple-darwin (Intel Mac) support —
+# NOT wired into release.yml's matrix yet. Companion to
+# windows-build-experiment.yml: same "prove it empirically before promoting"
+# posture (see docs/superskills/specs/2026-07-13-one-command-install-any-environment.md
+# §6: "Windows — probe chưa green thì đừng hứa" applies equally here).
+#
+# Deliberately does NOT use a native x64 runner. GitHub retired the Intel
+# `macos-13` image (2025-12-04); the only x64 label left is `macos-15-intel`,
+# itself scheduled for full removal in Fall 2027 (github.blog/changelog/
+# 2025-09-19-github-actions-macos-13-runner-image-is-closing-down,
+# actions/runner-images#13045). Riding that clock would mean re-doing this
+# migration again in ~13 months. Instead this cross-compiles
+# x86_64-apple-darwin FROM the same `macos-14` (Apple Silicon) runner
+# release.yml already uses natively for aarch64-apple-darwin — Xcode's
+# `clang` is a universal compiler (ships both arches' headers/libs in one
+# SDK, unlike targeting Linux from macOS which needs a separate osxcross
+# toolchain), so `cargo build --target x86_64-apple-darwin` needs no extra
+# SDK download, just `rustup target add`. This is the standard pattern for
+# Rust projects shipping both Darwin architectures from Apple Silicon CI.
+#
+# Real unknown this answers empirically: whether every C dependency's
+# build script (`cc` crate — rusqlite `bundled`, oniguruma via `onig_sys`
+# behind `tokenizers`, ~24 tree-sitter grammar crates) correctly cross-arches
+# under `cc-rs`'s Apple-target handling instead of silently building for the
+# host arch. windows-build-experiment.yml's own first real run (2026-07-15)
+# found every one of those same C deps compiles clean under MSVC — the only
+# failure there was a missing `#[cfg(unix)]` gate in calm's own code, not a
+# toolchain problem — so the prior expectation here is "probably fine," but
+# untested until this runs. Run with:
+#   gh workflow run macos-x64-build-experiment.yml
+#
+# RESULT (2026-07-15, run #29437245454): the C-dependency cross-arch question
+# above is answered — build succeeds, the binary runs correctly under
+# Rosetta, and a real `calm serve` session fully indexes this repo (3372
+# symbols, 6390 code chunks, SCIP overlays) with no cross-arch anomalies.
+# x86_64-apple-darwin's build/run feasibility is proven; promoted into
+# release.yml's matrix on that basis (`cross: false` on the existing
+# `macos-14` job, NOT a new `macos-15-intel` job — see above) alongside an
+# @eilodon/calm-mcp-darwin-x64 npm platform package.
+#
+# OPEN, SEPARATE FINDING: the SIGTERM smoke test below did not observe the
+# process exit within 15s of SIGTERM in two consecutive runs, with no
+# "Received SIGTERM" ever appearing in its own log — i.e. graceful shutdown
+# time on this exact CI environment is unconfirmed, not merely slow. Because
+# this exercises the same `#[cfg(unix)]` SIGTERM-handling code path already
+# shipping in the aarch64-apple-darwin binary (lib.rs `bootstrap`), this is
+# either a Rosetta/cross-arch-specific signal-delivery quirk of this CI
+# runner, or a pre-existing macOS-wide gap unrelated to x64 specifically —
+# not yet disambiguated. Does not block build/run distribution above; does
+# block treating graceful-shutdown-under-SIGTERM as verified on macOS.
+# Follow-up: reproduce on real Apple hardware (native, no Rosetta) before
+# closing this out.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-14
+    # Safety net after the 2026-07-15 run: the SIGTERM smoke test below never
+    # confirmed the process actually exited (its blind `wait "$pid"` had no
+    # bound) and the job ran until GitHub's default 360-minute ceiling force-
+    # cancelled it — 6 hours of macos-14 runner time for what should have been
+    # a ~20-second step. This caps the whole job so a repeat of that failure
+    # mode costs minutes, not hours, regardless of what the step-level fix
+    # below does or doesn't catch.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-apple-darwin
+
+      # Default features on purpose (embeddings, tier0-5, scip-overlay) —
+      # same reasoning as windows-build-experiment.yml: this is the actual
+      # shape a release binary would ship, not a stripped-down build that
+      # could pass while the real target fails.
+      - name: Build (release, default features, cross-compiled from arm64 host)
+        run: cargo build --release --bin calm --target x86_64-apple-darwin
+
+      # The runner itself is Apple Silicon, so *running* the x64 binary here
+      # (as opposed to just building it) needs Rosetta 2 — real Intel Macs
+      # in the wild need no such thing, this step only exists because the CI
+      # host happens to be the "wrong" arch for its own smoke test.
+      # `softwareupdate --install-rosetta` is idempotent (no-ops if already
+      # present) and is the documented way to guarantee it on a GitHub-hosted
+      # arm64 runner.
+      - name: Ensure Rosetta 2 is available (only needed to smoke-test the x64 binary on this arm64 host)
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Smoke test — binary runs and reports the right version
+        run: |
+          bin="target/x86_64-apple-darwin/release/calm"
+          file "$bin"
+          "$bin" --version
+
+      # `calm serve` without `--listen` is the path every non-daemon MCP
+      # client actually uses — same scope as the Windows probe's equivalent
+      # step. The daemon (`--listen`/`calm connect`) path is Unix-domain-
+      # socket based and works identically on Intel vs Apple Silicon macOS
+      # (both are `cfg(unix)`), so it isn't a cross-arch unknown the way the
+      # C-dependency build step above is — not re-probed here.
+      - name: "Smoke test — plain `calm serve` starts and exits cleanly"
+        run: |
+          bin="target/x86_64-apple-darwin/release/calm"
+          "$bin" serve --project-root . --db-path "${TMPDIR:-/tmp}/calm-macos-x64-probe.db" &
+          pid=$!
+          sleep 8
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "calm serve exited early instead of staying up" >&2
+            exit 1
+          fi
+          kill -TERM "$pid"
+          # Bounded poll, NOT a blind `wait "$pid"` — the 2026-07-15 run used
+          # a blind wait here and the process never observably reacted to
+          # SIGTERM (no "Received SIGTERM" ever appeared in its own log), so
+          # the step silently hung until GitHub's 360-minute job ceiling
+          # force-cancelled the whole run. This version fails loudly at 15s
+          # instead of hanging for hours — whether that means SIGTERM
+          # genuinely isn't reaching the process on this target, or is a
+          # cross-arch Rosetta signal-delivery quirk, is still open; either
+          # way this is a graceful-shutdown-on-this-target finding, not a
+          # build/run feasibility blocker (see the C-dependency-cross-arch
+          # scope note on the step above).
+          for _ in $(seq 1 15); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "calm serve exited within 15s of SIGTERM"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "calm serve did NOT exit within 15s of SIGTERM — force-killing and failing" >&2
+          kill -KILL "$pid" 2>/dev/null || true
+          exit 1

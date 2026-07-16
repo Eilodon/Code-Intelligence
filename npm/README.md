@@ -42,7 +42,7 @@ the GitHub Release for a tag (stage-release.sh downloads from it, so the
 release must already exist):
 
 ```bash
-npm/stage-release.sh v0.2.0     # downloads all 3 platform binaries + bumps
+npm/stage-release.sh v0.2.0     # downloads all 5 platform binaries + bumps
                                  # every package.json under npm/ to 0.2.0
 ```
 
@@ -54,6 +54,8 @@ installs the wrapper right after can already resolve its
 cd npm/calm-mcp-linux-x64    && npm publish --access public && cd -
 cd npm/calm-mcp-linux-arm64  && npm publish --access public && cd -
 cd npm/calm-mcp-darwin-arm64 && npm publish --access public && cd -
+cd npm/calm-mcp-darwin-x64   && npm publish --access public && cd -
+cd npm/calm-mcp-win32-x64    && npm publish --access public && cd -
 cd npm/calm-mcp              && npm publish --access public && cd -
 ```
 

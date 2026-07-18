@@ -5910,7 +5910,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: None,
@@ -5943,7 +5943,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some("deadbeefdeadbeef".into()),
@@ -5975,7 +5975,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6223,7 +6223,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6263,7 +6263,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6355,7 +6355,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn diff_impact_notes_build_check_reminder_for_rust_file() {
         let (dir, server) = test_server("diff_impact_build_note_rust");
@@ -6369,7 +6368,9 @@ mod tests {
         ));
         let v = jv(output);
         assert!(v.get("error").is_none(), "{v}");
-        let note = v["note"].as_str().expect("note should be present for a .rs diff");
+        let note = v["note"]
+            .as_str()
+            .expect("note should be present for a .rs diff");
         assert!(
             note.contains("build or test suite"),
             "expected a build/test reminder, got: {note}"
@@ -6409,7 +6410,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6451,7 +6452,7 @@ mod tests {
             EditLinesParams {
                 path: traversal_path,
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 1,
                     end_line: 1,
                     expected_hash: Some("irrelevant".into()),
@@ -6495,7 +6496,7 @@ mod tests {
             EditLinesParams {
                 path: "link.txt".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 1,
                     end_line: 1,
                     expected_hash: Some("irrelevant".into()),
@@ -6540,7 +6541,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6572,7 +6573,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6593,7 +6594,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6611,7 +6612,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6664,7 +6665,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6684,7 +6685,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6739,7 +6740,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
-                    old_text: None,
+                        old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash),
@@ -6772,14 +6773,14 @@ mod tests {
                 path: "m.py".into(),
                 edits: vec![
                     EditHunkParam {
-                    old_text: None,
+                        old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash_a),
                         new_text: "    return 10\n".into(),
                     },
                     EditHunkParam {
-                    old_text: None,
+                        old_text: None,
                         start_line: 6,
                         end_line: 6,
                         expected_hash: Some(hash_b),
@@ -7505,7 +7506,7 @@ mod tests {
             EditLinesParams {
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: None,
@@ -7541,7 +7542,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
-                old_text: None,
+                    old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -8368,7 +8369,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
-                    old_text: None,
+                        old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash.clone()),
@@ -8390,7 +8391,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
-                    old_text: None,
+                        old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash),

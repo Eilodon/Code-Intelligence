@@ -557,7 +557,9 @@ async fn main() -> Result<()> {
                 let calm_dir = root.join(".calm");
                 let mode = calm_core::hooks::read_hooks_mode_file(&calm_dir);
                 if mode == calm_core::hooks::HooksMode::Off {
-                    println!("hooks: off — nothing to fix (run `calm init --hooks=nudge|enforce` to turn it on)\n");
+                    println!(
+                        "hooks: off — nothing to fix (run `calm init --hooks=nudge|enforce` to turn it on)\n"
+                    );
                 } else if let Err(e) = apply_hooks_flag(&root, mode.as_str()) {
                     println!("hooks: --fix failed: {e}\n");
                 } else {
@@ -792,8 +794,7 @@ async fn main() -> Result<()> {
         }
         Commands::HooksCheck { project_root } => {
             let root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-            let code =
-                calm_core::hooks_check::run(std::io::stdin(), std::io::stderr(), &root);
+            let code = calm_core::hooks_check::run(std::io::stdin(), std::io::stderr(), &root);
             std::process::exit(code);
         }
     }

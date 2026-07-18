@@ -92,9 +92,19 @@ fn state_file_path(calm_dir: &Path, session_id: &str) -> PathBuf {
     // UUID, made explicit here rather than assumed).
     let safe: String = session_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe = if safe.is_empty() { "unknown".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    };
     state_dir(calm_dir).join(format!("{safe}.json"))
 }
 
@@ -117,7 +127,11 @@ impl StateLock {
         let lock_dir = state_file.with_extension("json.lockdir");
         for _ in 0..20 {
             match std::fs::create_dir(&lock_dir) {
-                Ok(()) => return StateLock { dir: Some(lock_dir) },
+                Ok(()) => {
+                    return StateLock {
+                        dir: Some(lock_dir),
+                    };
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -184,7 +198,8 @@ fn resolve_symbol_path(calm_dir: &Path, symbol: &str) -> Option<String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(500))
+        .ok()?;
     conn.execute_batch("PRAGMA query_only = ON;").ok()?;
     let mut stmt = conn
         .prepare("SELECT path FROM symbols WHERE name = ?1")
@@ -331,7 +346,10 @@ pub fn run<R: std::io::Read, W: std::io::Write>(
     match evaluate(&payload, project_root) {
         Decision::Allow => 0,
         Decision::Nudge(msg) => {
-            let _ = writeln!(stderr, "[CALM hooks: nudge — advisory only, never blocks] {msg}");
+            let _ = writeln!(
+                stderr,
+                "[CALM hooks: nudge — advisory only, never blocks] {msg}"
+            );
             0
         }
         Decision::Deny(msg) => {
@@ -593,7 +611,8 @@ mod tests {
     fn run_deny_path_returns_exit_2_and_writes_stderr() {
         let dir = tmp_project();
         set_mode(dir.path(), HooksMode::Enforce);
-        let json = r#"{"tool_name":"Edit","session_id":"s1","tool_input":{"file_path":"src/main.rs"}}"#;
+        let json =
+            r#"{"tool_name":"Edit","session_id":"s1","tool_input":{"file_path":"src/main.rs"}}"#;
         let mut stderr = Vec::new();
         let code = run(json.as_bytes(), &mut stderr, dir.path());
         assert_eq!(code, 2);
@@ -604,7 +623,8 @@ mod tests {
     fn run_allow_path_returns_exit_0_and_writes_nothing() {
         let dir = tmp_project();
         // Off mode (no hooks.mode file written).
-        let json = r#"{"tool_name":"Edit","session_id":"s1","tool_input":{"file_path":"src/main.rs"}}"#;
+        let json =
+            r#"{"tool_name":"Edit","session_id":"s1","tool_input":{"file_path":"src/main.rs"}}"#;
         let mut stderr = Vec::new();
         let code = run(json.as_bytes(), &mut stderr, dir.path());
         assert_eq!(code, 0);

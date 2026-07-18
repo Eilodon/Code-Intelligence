@@ -367,7 +367,6 @@ pub fn compute_aggregate_risk<T: AffectedSymbolFacts>(
         .to_string()
 }
 
-
 /// Extensions with one unambiguous, near-universal "does this still build"
 /// command a CI pipeline would run (`cargo build`/`test`, `go build`/`test`,
 /// `tsc --noEmit`). Deliberately narrow — NOT the full parser language list
@@ -613,10 +612,11 @@ mod tests {
         assert_eq!(result, "high");
     }
 
-
     #[test]
     fn any_compile_checkable_file_true_for_rust_go_and_typescript() {
-        assert!(any_compile_checkable_file(&["crates/calm-core/src/lib.rs".to_string()]));
+        assert!(any_compile_checkable_file(&[
+            "crates/calm-core/src/lib.rs".to_string()
+        ]));
         assert!(any_compile_checkable_file(&["cmd/main.go".to_string()]));
         assert!(any_compile_checkable_file(&["src/app.tsx".to_string()]));
         assert!(any_compile_checkable_file(&[

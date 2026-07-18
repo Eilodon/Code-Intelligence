@@ -70,7 +70,11 @@ impl CalmServer {
                         // whenever any hunk in `p.edits` has `old_text` set.
                         let live_ref = live.as_deref().expect("live read done above");
                         match calm_core::edit::find_and_replace_hunk(
-                            live_ref, start, end, &old_text, &h.new_text,
+                            live_ref,
+                            start,
+                            end,
+                            &old_text,
+                            &h.new_text,
                         ) {
                             Ok(hunk) => hunks.push(hunk),
                             Err(calm_core::edit::MatchOutcome::NotFound) => {
@@ -634,13 +638,14 @@ impl CalmServer {
             });
         }
         let new_content = outcome.new_content.expect("all_applied implies Some");
-        let dogfood_note = calm_core::is_own_running_binary_source(&self.project_root, path).then(|| {
-            "this edit touched crates/ Rust source that IS the binary currently serving this \
+        let dogfood_note =
+            calm_core::is_own_running_binary_source(&self.project_root, path).then(|| {
+                "this edit touched crates/ Rust source that IS the binary currently serving this \
              MCP session — the running daemon will not reflect it until it's rebuilt and \
              reconnected (the file on disk is correct now, this session's live tool behavior \
              just won't show the change yet)"
-                .to_string()
-        });
+                    .to_string()
+            });
 
         let ext = std::path::Path::new(path)
             .extension()
@@ -1064,9 +1069,9 @@ impl CalmServer {
                             Some(d) => Some(format!(
                                 "edit applied but could not re-query touched symbols. {d}"
                             )),
-                            None => Some(
-                                "edit applied but could not re-query touched symbols".into(),
-                            ),
+                            None => {
+                                Some("edit applied but could not re-query touched symbols".into())
+                            }
                         },
                         suggested_next: None,
                     });

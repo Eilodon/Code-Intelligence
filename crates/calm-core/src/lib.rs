@@ -81,7 +81,6 @@ mod tests {
         assert!(!super::BUILD_INFO.is_empty());
     }
 
-
     #[test]
     fn build_source_root_is_never_empty() {
         assert!(!super::BUILD_SOURCE_ROOT.is_empty());

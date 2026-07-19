@@ -12,6 +12,14 @@
       "registryType": "npm",
       "identifier": "@eilodon/calm-mcp",
       "version": "0.2.0",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve",
+          "valueHint": "subcommand",
+          "description": "Required: the calm binary prints help and exits without the serve subcommand — a client that drops this gets a dead server at MCP handshake."
+        }
+      ],
       "transport": {
         "type": "stdio"
       }

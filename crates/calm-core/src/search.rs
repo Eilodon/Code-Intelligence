@@ -605,7 +605,11 @@ fn symbol_semantic_results(
     qvec: &[f32],
     limit: usize,
 ) -> rusqlite::Result<Vec<SearchResult>> {
-    let hits = crate::embedding::knn(conn, qvec, limit)?;
+    // Fetch one extra hit beyond `limit` — `knn` returns at most `k` rows,
+    // so asking for exactly `limit` makes it impossible for a caller to
+    // tell "exactly limit matches" apart from "more exist" (the same
+    // off-by-one search_text/search_file had — see their fix comments).
+    let hits = crate::embedding::knn(conn, qvec, limit + 1)?;
     let mut stmt = conn.prepare(
         "SELECT qualified_name, name, path, line_start, line_end, kind, is_test FROM symbols WHERE id = ?1",
     )?;
@@ -642,7 +646,10 @@ fn chunk_semantic_results(
     qvec: &[f32],
     limit: usize,
 ) -> rusqlite::Result<Vec<SearchResult>> {
-    let hits = crate::embedding::knn_chunks(conn, qvec, limit)?;
+    // See symbol_semantic_results' comment: over-fetch by 1 so truncation
+    // can be detected accurately by callers instead of always appearing
+    // "truncated" whenever the count happens to equal `limit` exactly.
+    let hits = crate::embedding::knn_chunks(conn, qvec, limit + 1)?;
     let mut results = Vec::with_capacity(hits.len());
     for (chunk_id, dist) in &hits {
         if let Some(mut r) = chunk_hit_to_result(conn, *chunk_id)? {
@@ -772,9 +779,11 @@ fn search_semantic(
     // that only matches vocabulary used *inside* its body.
     let sym_results = symbol_semantic_results(conn, &qvec, limit)?;
     let chunk_results = chunk_semantic_results(conn, &qvec, limit)?;
-    let truncated = sym_results.len() >= limit || chunk_results.len() >= limit;
+    // Both sources over-fetch by 1 (see their own comments) — `> limit`,
+    // not `>= limit`, is the correct "more exist beyond this page" check.
+    let truncated = sym_results.len() > limit || chunk_results.len() > limit;
 
-    let results = match (sym_results.is_empty(), chunk_results.is_empty()) {
+    let mut results = match (sym_results.is_empty(), chunk_results.is_empty()) {
         (true, true) => Vec::new(),
         (false, true) => sym_results,
         (true, false) => chunk_results,
@@ -788,6 +797,10 @@ fn search_semantic(
             "semantic",
         ),
     };
+    // rrf_merge_n already caps its own output to `limit`; this only bites
+    // the two direct-passthrough branches above, which can carry the extra
+    // over-fetched row.
+    results.truncate(limit);
 
     Ok(SearchOutput {
         results,
@@ -852,13 +865,18 @@ pub fn search_similar(
         r.score = 1.0 - dist;
         r.match_type = "similar_chunk".to_string();
         results.push(r);
-        if results.len() >= limit {
+        // Collect one past `limit` (already-fetched, in-memory candidates —
+        // no extra query cost) so truncation can be detected accurately
+        // instead of firing whenever the count happens to equal `limit`.
+        if results.len() > limit {
             break;
         }
     }
 
+    let truncated = results.len() > limit;
+    results.truncate(limit);
     Ok(SearchOutput {
-        truncated: results.len() >= limit,
+        truncated,
         degraded: false,
         note: None,
         results,
@@ -902,8 +920,12 @@ fn search_hybrid(
         });
     }
 
+    // sym_results/chunk_results over-fetch by 1 (see symbol_semantic_results'
+    // comment) so `> limit`, not `>= limit`, correctly signals "more exist"
+    // instead of firing whenever the count happens to equal `limit` exactly.
+    // fts_output.truncated is already correct (search_symbol over-fetches too).
     let truncated =
-        fts_output.truncated || sym_results.len() >= limit || chunk_results.len() >= limit;
+        fts_output.truncated || sym_results.len() > limit || chunk_results.len() > limit;
 
     // True 3-way RRF: FTS, Layer-1 symbol-semantic, and Layer-2 chunk-semantic
     // each contribute their own rank-based score for a given result, summed —
@@ -1874,6 +1896,69 @@ mod tests {
             output.results[0].line_start,
             Some(1),
             "the closer window, not the farther one"
+        );
+    }
+
+    #[test]
+    fn search_similar_truncated_flag_is_accurate() {
+        // Same off-by-one class as the search_text/search_file regressions:
+        // the old `results.len() >= limit` broke the accumulation loop the
+        // instant it reached `limit`, so it could never tell "exactly limit
+        // real matches" apart from "more exist beyond the page".
+        let conn = setup_db_with_symbols();
+        crate::embedding::create_chunk_embedding_table(&conn, 3).unwrap();
+
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/main.py', 10, 14, 'a', 'src/main.py::get_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let anchor_id: i64 = conn
+            .query_row(
+                "SELECT id FROM code_chunks WHERE line_start = 10",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::embedding::store_chunk_embedding(&conn, anchor_id, &[1.0, 0.0, 0.0]).unwrap();
+
+        // 3 distinct, unrelated gap chunks (no symbol_qn) — none excluded by
+        // the anchor/same-symbol filters, each gets a distinct path:line
+        // fallback qualified_name so dedup doesn't collapse them.
+        let vectors: [[f32; 3]; 3] = [[0.9, 0.1, 0.0], [0.85, 0.15, 0.0], [0.8, 0.2, 0.0]];
+        for (i, vec) in vectors.iter().enumerate() {
+            let line = 20 + (i as i64) * 10;
+            conn.execute(
+                "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+                 VALUES ('src/utils.py', ?1, ?1, 'x', NULL, 'h')",
+                rusqlite::params![line],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM code_chunks WHERE line_start = ?1",
+                    [line],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::embedding::store_chunk_embedding(&conn, id, vec).unwrap();
+        }
+
+        // limit == exact number of real (post-filter) candidates -> not truncated.
+        let exact = search_similar(&conn, "src/main.py", 12, 3).unwrap();
+        assert_eq!(exact.results.len(), 3);
+        assert!(
+            !exact.truncated,
+            "exactly `limit` real matches with no more beyond it must not be reported as truncated"
+        );
+
+        // limit < number of real candidates -> truncated.
+        let capped = search_similar(&conn, "src/main.py", 12, 2).unwrap();
+        assert_eq!(capped.results.len(), 2);
+        assert!(
+            capped.truncated,
+            "more real matches than `limit` must be reported as truncated"
         );
     }
     #[test]

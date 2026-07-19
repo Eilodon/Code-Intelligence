@@ -321,11 +321,15 @@ async fn main() -> Result<()> {
             tracing::info!("Indexing complete: {file_count} files, {symbol_count} symbols");
             println!("Indexed {file_count} files, {symbol_count} symbols.");
 
+            // Config loaded once up front — previously each of the 10 blocks
+            // below re-read + re-parsed config.json independently via
+            // load_config(...).unwrap_or_default(), silently discarding a
+            // malformed config 10x over; load_config_or_warn logs once instead.
+            let config = calm_core::config::load_config_or_warn(&root);
+
             // Semantic embeddings — active when `semantic_search.enabled: true` in
             // config.json and compiled with `--features embeddings`.
-            let semantic = calm_core::config::load_config(&root)
-                .map(|c| c.semantic_search)
-                .unwrap_or_default();
+            let semantic = &config.semantic_search;
             if semantic.enabled {
                 print!("Building semantic index...");
                 std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -384,11 +388,9 @@ async fn main() -> Result<()> {
                     stats.match_rate
                 );
             } else {
-                let rust_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.rust)
-                    .unwrap_or_default();
+                let rust_cfg = &config.rust;
                 let dirty = calm_core::scip::rust_source_dirty_keys(&conn);
-                match calm_core::scip::run_overlay(&conn, &root, &rust_cfg, &dirty) {
+                match calm_core::scip::run_overlay(&conn, &root, rust_cfg, &dirty) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -408,10 +410,8 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                 }
 
-                let go_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.go)
-                    .unwrap_or_default();
-                match calm_core::scip::run_go_overlay_and_log(&conn, &root, &go_cfg) {
+                let go_cfg = &config.go;
+                match calm_core::scip::run_go_overlay_and_log(&conn, &root, go_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -424,10 +424,8 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("SCIP overlay (go) error (base graph intact): {e}"),
                 }
 
-                let python_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.python)
-                    .unwrap_or_default();
-                match calm_core::scip::run_python_overlay_and_log(&conn, &root, &python_cfg) {
+                let python_cfg = &config.python;
+                match calm_core::scip::run_python_overlay_and_log(&conn, &root, python_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -442,10 +440,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let js_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.js)
-                    .unwrap_or_default();
-                match calm_core::scip::run_js_overlay_and_log(&conn, &root, &js_cfg) {
+                let js_cfg = &config.js;
+                match calm_core::scip::run_js_overlay_and_log(&conn, &root, js_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -460,10 +456,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let java_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.java)
-                    .unwrap_or_default();
-                match calm_core::scip::run_java_overlay_and_log(&conn, &root, &java_cfg) {
+                let java_cfg = &config.java;
+                match calm_core::scip::run_java_overlay_and_log(&conn, &root, java_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -478,10 +472,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let csharp_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.csharp)
-                    .unwrap_or_default();
-                match calm_core::scip::run_csharp_overlay_and_log(&conn, &root, &csharp_cfg) {
+                let csharp_cfg = &config.csharp;
+                match calm_core::scip::run_csharp_overlay_and_log(&conn, &root, csharp_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -496,10 +488,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let php_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.php)
-                    .unwrap_or_default();
-                match calm_core::scip::run_php_overlay_and_log(&conn, &root, &php_cfg) {
+                let php_cfg = &config.php;
+                match calm_core::scip::run_php_overlay_and_log(&conn, &root, php_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -514,10 +504,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let clang_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.clang)
-                    .unwrap_or_default();
-                match calm_core::scip::run_clang_overlay_and_log(&conn, &root, &clang_cfg) {
+                let clang_cfg = &config.clang;
+                match calm_core::scip::run_clang_overlay_and_log(&conn, &root, clang_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -532,10 +520,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let ruby_cfg = calm_core::config::load_config(&root)
-                    .map(|c| c.ruby)
-                    .unwrap_or_default();
-                match calm_core::scip::run_ruby_overlay_and_log(&conn, &root, &ruby_cfg) {
+                let ruby_cfg = &config.ruby;
+                match calm_core::scip::run_ruby_overlay_and_log(&conn, &root, ruby_cfg) {
                     Ok(stats)
                         if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
                     {
@@ -575,14 +561,21 @@ async fn main() -> Result<()> {
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db_path = calm_server::default_db_path(&root);
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
             let thresholds = calm_core::fitness::load_thresholds(config.as_deref())?;
             let boundary_rules = calm_core::fitness::load_boundary_rules(config.as_deref())?;
             let config_drift_doc_paths =
                 calm_core::fitness::load_config_drift_doc_paths(config.as_deref())?;
 
-            let conn = calm_core::db::conn::open_writer(&db_path)
-                .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
+            // Propagate (not swallow) an open failure — silently falling back to
+            // an ephemeral in-memory DB here made `calm fitness-check` report a
+            // misleading PASS against zero symbols on any real infra error (e.g.
+            // a locked/corrupted index.db), with no signal why. Matches the
+            // policy on `Serve`'s own load_config(&root)? above.
+            let conn = calm_core::db::conn::open_writer(&db_path)?;
             calm_core::db::schema::init_db(&conn)?;
 
             let coverage = calm_core::analysis::coverage::load_coverage(&root);
@@ -662,7 +655,7 @@ async fn main() -> Result<()> {
             let root = std::fs::canonicalize(&project_root)?;
             let db_path = calm_server::default_db_path(&root);
             let conn = calm_core::db::conn::open_writer(&db_path)?;
-            let config = calm_core::config::load_config(&root).unwrap_or_default();
+            let config = calm_core::config::load_config_or_warn(&root);
             let results =
                 calm_core::scip::refresh_language(&conn, &root, &config, lang.as_deref())?;
             for (lang, stats) in &results {

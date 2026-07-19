@@ -176,8 +176,8 @@ impl CalmServer {
     /// whole `(mtime, Config)` pair in one atomic `write_ok()` — never
     /// mutates the cached `Config` in place, so a concurrent `read_ok()`
     /// can never observe a torn pair. Behavior is otherwise identical to
-    /// `calm_core::config::load_config(&self.project_root).unwrap_or_default()`
-    /// (same file, same defaulting), just cached.
+    /// `calm_core::config::load_config_or_warn(&self.project_root)` (same
+    /// file, same defaulting, same on-error log), just cached.
     pub(crate) fn config(&self) -> calm_core::config::Config {
         let current_mtime = calm_core::config::config_mtime(&self.project_root);
         if let Some((cached_mtime, cfg)) = self.config_cache.read_ok().as_ref()
@@ -185,7 +185,7 @@ impl CalmServer {
         {
             return cfg.clone();
         }
-        let cfg = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+        let cfg = calm_core::config::load_config_or_warn(&self.project_root);
         // Root-cause fix for the F10 calibration bug: a local config.json/
         // .calm/config.json override previously shadowed Config::default()
         // with zero visibility, so a stale forgotten override file could

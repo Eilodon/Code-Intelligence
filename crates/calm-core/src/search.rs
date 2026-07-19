@@ -248,6 +248,12 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
     // its docstring. Still doesn't cover function bodies, imports, or
     // non-code files — that's what kind="grep" is for (search_grep, above).
     let fts_query = format!("{{docstring signature}} : {raw_query}");
+    // Fetch one extra row beyond `limit` so `truncated` can tell "exactly
+    // `limit` results, no more" apart from "more results exist beyond the
+    // page" — LIMIT ?2 alone would always return at most `limit` rows,
+    // making a `>= limit` truncation check spuriously true whenever the
+    // result count happens to equal `limit`.
+    let fetch_limit = (limit + 1) as i64;
 
     let mut stmt = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
@@ -259,7 +265,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
          LIMIT ?2",
     )?;
 
-    let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+    let rows = stmt.query_map(rusqlite::params![fts_query, fetch_limit], |row| {
         Ok(RawRow {
             qualified_name: row.get(0)?,
             name: row.get(1)?,
@@ -277,7 +283,8 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
         results.push(row?.into_result("text"));
     }
 
-    let truncated = results.len() >= limit;
+    let truncated = results.len() > limit;
+    results.truncate(limit);
     Ok(SearchOutput {
         results,
         truncated,
@@ -296,7 +303,15 @@ fn looks_like_glob(query: &str) -> bool {
 }
 
 fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<SearchOutput> {
-    let results = if looks_like_glob(query) {
+    // Fetch one extra match beyond `limit` in both branches so `truncated`
+    // can distinguish "exactly `limit` matches, no more" from "more exist
+    // beyond the page" — matching search_symbol's over-fetch-then-truncate
+    // approach instead of the previous `>= limit` check, which was always
+    // true-or-false-wrong since neither branch below could ever return
+    // more than `limit` rows on its own.
+    let fetch_limit = limit + 1;
+
+    let mut results = if looks_like_glob(query) {
         let Ok(matcher) = globset::Glob::new(query).map(|g| g.compile_matcher()) else {
             // Invalid glob syntax — degrade to zero results rather than erroring
             // the whole tool call; the caller sees an empty result set and can
@@ -317,7 +332,7 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             if matcher.is_match(&path) {
                 matched.push(path);
             }
-            if matched.len() >= limit {
+            if matched.len() >= fetch_limit {
                 break;
             }
         }
@@ -331,7 +346,7 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
              ORDER BY fi.path
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+        let rows = stmt.query_map(rusqlite::params![pattern, fetch_limit as i64], |row| {
             row.get::<_, String>(0)
         })?;
         let mut matched = Vec::new();
@@ -341,7 +356,8 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
         matched
     };
 
-    let truncated = results.len() >= limit;
+    let truncated = results.len() > limit;
+    results.truncate(limit);
     let results = results
         .into_iter()
         .map(|path| SearchResult {
@@ -1171,6 +1187,32 @@ mod tests {
     }
 
     #[test]
+    fn test_search_text_truncated_flag_is_accurate() {
+        // Regression coverage: search_text used to SELECT ... LIMIT <limit>
+        // directly, so results.len() could never exceed limit — checking
+        // `results.len() >= limit` then made `truncated` spuriously true
+        // whenever the result count happened to equal limit exactly, even
+        // with no further results beyond the page.
+        let conn = setup_db_with_symbols();
+        // "database" appears in both get_user's and update_user's docstring.
+        let exact =
+            search(&conn, "database", SearchKind::Text, 2, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(exact.results.len(), 2);
+        assert!(
+            !exact.truncated,
+            "exactly `limit` results with no more beyond it must not be reported as truncated"
+        );
+
+        let capped =
+            search(&conn, "database", SearchKind::Text, 1, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(capped.results.len(), 1);
+        assert!(
+            capped.truncated,
+            "fewer results returned than actually match must be reported as truncated"
+        );
+    }
+
+    #[test]
     fn test_search_text_does_not_match_name_only() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -1257,6 +1299,32 @@ mod tests {
         let output = search(&conn, "helper", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(output.results.len(), 1);
         assert_eq!(output.results[0].path, "src/helper.ts");
+    }
+
+    #[test]
+    fn test_search_file_truncated_flag_is_accurate() {
+        // Same off-by-one class as test_search_text_truncated_flag_is_accurate,
+        // covering both the LIKE branch and the glob branch of search_file.
+        let conn = setup_db_with_symbols();
+
+        // LIKE branch: "src/" matches all 3 indexed files.
+        let exact = search(&conn, "src/", SearchKind::File, 3, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(exact.results.len(), 3);
+        assert!(!exact.truncated, "LIKE branch: exact count must not be truncated");
+
+        let capped = search(&conn, "src/", SearchKind::File, 2, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(capped.results.len(), 2);
+        assert!(capped.truncated, "LIKE branch: more matches than limit must be truncated");
+
+        // Glob branch: "*.py" matches src/main.py and src/utils.py.
+        let exact_glob = search(&conn, "*.py", SearchKind::File, 2, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(exact_glob.results.len(), 2);
+        assert!(!exact_glob.truncated, "glob branch: exact count must not be truncated");
+
+        let capped_glob =
+            search(&conn, "*.py", SearchKind::File, 1, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(capped_glob.results.len(), 1);
+        assert!(capped_glob.truncated, "glob branch: more matches than limit must be truncated");
     }
 
     #[test]

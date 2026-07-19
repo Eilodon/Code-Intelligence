@@ -1635,7 +1635,7 @@ pub fn run_indexing_pipeline_cancellable(
 ) -> rusqlite::Result<PipelineOutcome> {
     use crate::types::IndexingPhase;
 
-    let config = crate::config::load_config(project_root).unwrap_or_default();
+    let config = crate::config::load_config_or_warn(project_root);
     let entry_point_patterns = config.entry_points;
     let ignore_patterns = config.ignore;
 
@@ -1912,7 +1912,7 @@ pub fn reindex_changed_cancellable(
     project_root: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> rusqlite::Result<ReindexOutcome> {
-    let config = crate::config::load_config(project_root).unwrap_or_default();
+    let config = crate::config::load_config_or_warn(project_root);
     let entry_point_patterns = config.entry_points;
     let ignore_patterns = config.ignore;
 
@@ -2101,7 +2101,7 @@ pub fn reindex_paths(
 ) -> rusqlite::Result<ReindexSummary> {
     use rusqlite::OptionalExtension;
 
-    let config = crate::config::load_config(project_root).unwrap_or_default();
+    let config = crate::config::load_config_or_warn(project_root);
 
     let formal = cached_formal_resolver();
 

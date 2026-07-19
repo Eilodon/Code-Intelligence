@@ -15,10 +15,20 @@
 //! read, which is what `calm-hooks.sh` itself also limits itself to.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::hooks::{HooksMode, read_hooks_mode_file};
+
+/// Mirrors `calm-hooks.sh`'s own git-commit/push detection — a
+/// word-bounded match, not a bare substring — so the native and POSIX
+/// hook paths agree on what counts as a commit/push command. See
+/// `calm-hooks.sh`'s `Bash)` case (assets/hooks/calm-hooks.sh:272) for
+/// the reference this is ported from.
+static GIT_COMMIT_PUSH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|[;&|]|\s)git\s+(commit|push)(\s|$)").unwrap());
 
 /// Raw JSON payload Claude Code feeds a hook on stdin. Every field is
 /// optional/defaulted — a payload missing fields this dispatch doesn't
@@ -298,7 +308,7 @@ pub fn evaluate(payload: &HookPayload, project_root: &Path) -> Decision {
         }
         "Bash" => {
             let cmd = &payload.tool_input.command;
-            let is_commit_push = cmd.contains("git commit") || cmd.contains("git push");
+            let is_commit_push = GIT_COMMIT_PUSH_RE.is_match(cmd);
             if !is_commit_push {
                 return Decision::Allow;
             }
@@ -583,6 +593,70 @@ mod tests {
             dir.path(),
         );
         assert_eq!(out, Decision::Allow);
+    }
+
+    #[test]
+    fn git_commit_detection_uses_word_boundary_not_bare_substring() {
+        // Regression coverage for the ADR-1 audit finding: the old
+        // `cmd.contains("git commit") || cmd.contains("git push")` check
+        // both under- and over-fired relative to calm-hooks.sh's own
+        // word-bounded regex. Each case below is one of the divergent
+        // rows from that audit's verification table.
+        let dir = tmp_project();
+        set_mode(dir.path(), HooksMode::Enforce);
+
+        let trips = |command: &str| -> bool {
+            evaluate(
+                &payload("mcp__calm__edit_lines", ToolInput::default(), "s1"),
+                dir.path(),
+            );
+            let out = evaluate(
+                &payload(
+                    "Bash",
+                    ToolInput {
+                        command: command.to_string(),
+                        ..Default::default()
+                    },
+                    "s1",
+                ),
+                dir.path(),
+            );
+            matches!(out, Decision::Deny(_))
+        };
+
+        // Previously bypassed the gate entirely (tab / double-space
+        // around "commit" defeated the bare `contains("git commit")`).
+        assert!(
+            trips("git\tcommit -m x"),
+            "tab-separated git commit must still trip the gate"
+        );
+        assert!(
+            trips("git  commit -m x"),
+            "double-space git commit must still trip the gate"
+        );
+
+        // Previously false-denied (substring matched inside an unrelated
+        // or non-committing command).
+        assert!(
+            !trips("git commit-graph write"),
+            "git commit-graph is real git maintenance, not a commit, and must not trip"
+        );
+        assert!(
+            !trips("legit commit of code"),
+            "the word 'commit' alone must not trip"
+        );
+        assert!(
+            !trips("digit push test"),
+            "the word 'push' alone must not trip"
+        );
+        assert!(
+            !trips(r#"echo "later: git commit""#),
+            "a quoted mention of git commit must not trip"
+        );
+
+        // Still trips on the common, unambiguous case.
+        assert!(trips("git commit -m test"));
+        assert!(trips("git push origin main"));
     }
 
     #[test]

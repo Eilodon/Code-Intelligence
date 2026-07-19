@@ -752,6 +752,27 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
     }
 }
 
+/// Same as `load_config(project_root).unwrap_or_default()`, but logs why a
+/// load fell back to defaults instead of failing silently — a malformed
+/// `config.json` (JSON syntax error, unknown preset) during an incremental
+/// reindex would otherwise silently re-enable every default (ignore
+/// patterns, entry points, hub thresholds, ...) with no signal to the user
+/// that their config was never actually read. See `LspConfig::default`'s
+/// doc comment above for a previous instance of this same silent-fallback
+/// hazard.
+pub fn load_config_or_warn(project_root: &Path) -> Config {
+    match load_config(project_root) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(
+                "failed to load config for {}, falling back to defaults: {e}",
+                project_root.display()
+            );
+            Config::default()
+        }
+    }
+}
+
 /// Syntactic-only check: does `preset` look like either a legacy bare
 /// name or a comma-composed toolset spec? A single unrecognized bare
 /// token (the common typo case — `"preset": "flul"`) is still rejected

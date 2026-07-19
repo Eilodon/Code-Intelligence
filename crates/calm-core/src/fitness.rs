@@ -448,9 +448,7 @@ pub fn run_fitness_check(
 ) -> rusqlite::Result<FitnessCheckResult> {
     let metrics = collect_metrics(conn, project_root, coverage)?;
     let boundary_violations = check_boundaries(conn, boundary_rules)?;
-    let ignore_patterns = crate::config::load_config(project_root)
-        .map(|c| c.ignore)
-        .unwrap_or_default();
+    let ignore_patterns = crate::config::load_config_or_warn(project_root).ignore;
     let config_drift = check_config_drift(project_root, config_drift_doc_paths, &ignore_patterns);
     let mut checks = Vec::new();
 

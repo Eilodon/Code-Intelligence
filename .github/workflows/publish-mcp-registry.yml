@@ -6,9 +6,13 @@ name: Publish to MCP Registry
 #      Registry automatically. The registry validates that the npm package
 #      at `version` already exists, which is why it's chained *after*
 #      npm-publish, never racing it.
-#   2. workflow_dispatch — kept for manual re-pushes (e.g. re-registering a
-#      version whose metadata changed) without cutting a new release. Run
-#      with: gh workflow run publish-mcp-registry.yml -f version=0.2.0
+#   2. workflow_dispatch — kept for manually publishing a version the release
+#      train missed (e.g. the train failed after npm-publish). Run with:
+#      gh workflow run publish-mcp-registry.yml -f version=0.2.0
+#      NOTE: the registry rejects an already-registered version outright
+#      ("cannot publish duplicate version" — verified live 2026-07-19), so a
+#      server.json metadata fix can only ship with the NEXT version's publish,
+#      never as a re-push of an existing one.
 # Either accepts the version with or without a leading `v` (the release
 # train passes the raw tag, e.g. `v0.2.0`); the job strips it.
 on:

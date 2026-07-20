@@ -827,7 +827,14 @@ impl CalmServer {
             None => "skipped_unrecognized_language",
         };
 
-        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, uncertain_zero_caller, pre_touched) = {
+        let (
+            risk,
+            hub_hit,
+            hub_kind,
+            bridge_downgrade_eligible,
+            uncertain_zero_caller,
+            pre_touched,
+        ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
@@ -861,7 +868,14 @@ impl CalmServer {
                         .map(|t| t.qualified_name.clone())
                         .collect::<Vec<_>>(),
                 );
-            (risk, hub_hit, hub_kind, eligible, uncertain_zero_caller, touched)
+            (
+                risk,
+                hub_hit,
+                hub_kind,
+                eligible,
+                uncertain_zero_caller,
+                touched,
+            )
         };
         if hub_hit || risk.as_deref() == Some("high") || uncertain_zero_caller.is_some() {
             let why = if hub_hit {
@@ -1683,9 +1697,11 @@ fn compute_touch_risk(
                     coverage,
                     &row.kind,
                 );
-            if let Some(reason) =
-                classify_uncertain_zero_caller(row.is_entry_point, row.is_test, dead_code_confidence)
-            {
+            if let Some(reason) = classify_uncertain_zero_caller(
+                row.is_entry_point,
+                row.is_test,
+                dead_code_confidence,
+            ) {
                 let stronger = uncertain_zero_caller.is_none_or(|cur| {
                     uncertain_zero_caller_strength(reason) > uncertain_zero_caller_strength(cur)
                 });
@@ -1702,7 +1718,13 @@ fn compute_touch_risk(
         });
     }
     let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
-    (risk, hub_hit, strongest_hub_kind, uncertain_zero_caller, touched)
+    (
+        risk,
+        hub_hit,
+        strongest_hub_kind,
+        uncertain_zero_caller,
+        touched,
+    )
 }
 
 /// Plan 3 §3.3 (F10): true iff every caller edge (`call_edges.to_symbol`)

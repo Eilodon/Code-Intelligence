@@ -2098,10 +2098,8 @@ mod tests {
 
     #[test]
     fn callers_zero_usage_caveat_distinguishes_entry_point_from_generic() {
-        let dir = std::env::temp_dir().join(format!(
-            "ci_callers_entry_point_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ci_callers_entry_point_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
@@ -6718,9 +6716,8 @@ mod tests {
         // is_hub=false -> risk="low") when it's actually the opposite.
         let (dir, server) = test_server("edit_confirm_gate_entry_point");
         std::fs::write(dir.join("a.py"), "def mcp_tool_handler():\n    return 1\n").unwrap();
-        let hash =
-            calm_core::edit::range_checksum("def mcp_tool_handler():\n    return 1\n", 2, 2)
-                .unwrap();
+        let hash = calm_core::edit::range_checksum("def mcp_tool_handler():\n    return 1\n", 2, 2)
+            .unwrap();
 
         {
             let conn = server.db();
@@ -6824,7 +6821,9 @@ mod tests {
                     new_text: "    return 2\n".into(),
                 }],
                 confirm: true,
-                reason: Some("checked -- entry point, no confirmed callers, dispatched externally".into()),
+                reason: Some(
+                    "checked -- entry point, no confirmed callers, dispatched externally".into(),
+                ),
             },
         ));
         let v = jv(with_all);

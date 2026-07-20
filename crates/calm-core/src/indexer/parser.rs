@@ -3164,7 +3164,6 @@ def run():
         assert!(!find(&symbols, "baz").is_entry_point);
     }
 
-
     /// Regression: a small set of purely-cosmetic/compiler-directive
     /// attributes must NOT trigger the broad "has an attribute macro"
     /// entry-point signal — they don't imply anything invokes the function

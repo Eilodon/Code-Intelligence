@@ -241,7 +241,7 @@ impl CalmServer {
                 );
             if confirmed_caller_count == 0
                 && risk == "low"
-                && matches!(dead_code_confidence, "none" | "low")
+                && zero_caller_count_is_uncertain(dead_code_confidence)
             {
                 risk = "medium".to_string();
             }

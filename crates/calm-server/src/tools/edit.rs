@@ -827,7 +827,7 @@ impl CalmServer {
             None => "skipped_unrecognized_language",
         };
 
-        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, pre_touched) = {
+        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, uncertain_zero_caller, pre_touched) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
@@ -836,16 +836,23 @@ impl CalmServer {
                 .iter()
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
-            let (risk, hub_hit, hub_kind, touched) = compute_touch_risk(&conn, path, &ranges);
+            let coverage = self.coverage.read_ok();
+            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched) =
+                compute_touch_risk(&conn, path, &ranges, &coverage);
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
             // below — but ONLY if every touched hub's caller edges are all
             // resolved/formal confidence (see all_caller_edges_confident's
             // doc comment for why textual/ambiguous callers disqualify it
             // regardless of hub_kind: the true blast radius can exceed the
-            // counted caller_count).
+            // counted caller_count). Never eligible when
+            // `uncertain_zero_caller` is set -- that signal means the real
+            // caller is invisible to the graph entirely (or the coverage/
+            // dead-code heuristic disagrees it's safe), not just under-
+            // confident about a caller edge that does exist.
             let eligible = hub_kind.as_deref() == Some("bridge")
                 && risk.as_deref() != Some("high")
+                && uncertain_zero_caller.is_none()
                 && all_caller_edges_confident(
                     &conn,
                     &touched
@@ -854,11 +861,23 @@ impl CalmServer {
                         .map(|t| t.qualified_name.clone())
                         .collect::<Vec<_>>(),
                 );
-            (risk, hub_hit, hub_kind, eligible, touched)
+            (risk, hub_hit, hub_kind, eligible, uncertain_zero_caller, touched)
         };
-        if hub_hit || risk.as_deref() == Some("high") {
+        if hub_hit || risk.as_deref() == Some("high") || uncertain_zero_caller.is_some() {
             let why = if hub_hit {
                 "a hub symbol (is_hub=true)".to_string()
+            } else if let Some(reason) = uncertain_zero_caller {
+                match reason {
+                    UncertainZeroCallerReason::EntryPoint => {
+                        "a zero-confirmed-caller entry point (e.g. an rmcp #[tool(name = \"...\")] MCP handler, main, a trait-dispatch protocol method, a bodyless trait method declaration, or similar framework/macro/language dispatch -- the real invocation isn't visible to the static call graph, so a low caller_count can't be trusted as low blast radius)".to_string()
+                    }
+                    UncertainZeroCallerReason::TestOnly => {
+                        "a zero-confirmed-caller test-only symbol (only the test harness discovers and runs it by convention/reflection, not a literal call site -- editing it risks silently breaking test coverage the static call graph can't see)".to_string()
+                    }
+                    UncertainZeroCallerReason::LowConfidence => {
+                        "a zero-confirmed-caller symbol the dead-code heuristic isn't confident is safe to treat as unused (e.g. runtime coverage shows it executing despite no static callers) -- treat the zero caller_count as inconclusive, not proof of low blast radius".to_string()
+                    }
+                }
             } else {
                 "a high-risk symbol (>10 callers)".to_string()
             };
@@ -1242,7 +1261,8 @@ impl CalmServer {
                 .iter()
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
-            let (_, _, _, touched) = compute_touch_risk(&conn, path, &new_ranges);
+            let coverage = self.coverage.read_ok();
+            let (_, _, _, _, touched) = compute_touch_risk(&conn, path, &new_ranges, &coverage);
             touched
         };
 
@@ -1488,6 +1508,26 @@ fn fingerprint_edit_symbol(p: &EditSymbolParams) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// One `symbols` row overlapping an edit's touched ranges — enough fields
+/// to compute both the raw caller_count/hub risk tier and (when
+/// `caller_count == 0`) the same `is_entry_point`-aware dead-code signal
+/// `edit_context`'s advisory risk assessment already uses, so
+/// `compute_touch_risk`'s hard write-gate can see it too.
+struct OverlappingSymbolRow {
+    qualified_name: String,
+    caller_count: i64,
+    is_hub: bool,
+    hub_kind: Option<String>,
+    line_start: i64,
+    line_end: i64,
+    is_entry_point: bool,
+    is_test: bool,
+    language: String,
+    name: String,
+    signature: String,
+    kind: String,
+}
+
 /// Symbols in `path` whose `[line_start, line_end]` overlaps any of `ranges`
 /// — shared by the pre-write risk gate (against original ranges) and the
 /// post-write response (against the edited ranges' new positions).
@@ -1495,31 +1535,38 @@ fn symbols_overlapping_ranges(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
-) -> Vec<(String, i64, bool, Option<String>)> {
+) -> Vec<OverlappingSymbolRow> {
     let mut stmt = match conn.prepare(
-        "SELECT qualified_name, caller_count, is_hub, hub_kind, line_start, line_end FROM symbols WHERE path = ?1",
+        "SELECT qualified_name, caller_count, is_hub, hub_kind, line_start, line_end, \
+         is_entry_point, is_test, language, name, signature, kind \
+         FROM symbols WHERE path = ?1",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
     stmt.query_map(rusqlite::params![path], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)? != 0,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-        ))
+        Ok(OverlappingSymbolRow {
+            qualified_name: row.get(0)?,
+            caller_count: row.get(1)?,
+            is_hub: row.get::<_, i64>(2)? != 0,
+            hub_kind: row.get(3)?,
+            line_start: row.get(4)?,
+            line_end: row.get(5)?,
+            is_entry_point: row.get::<_, i64>(6)? != 0,
+            is_test: row.get::<_, i64>(7)? != 0,
+            language: row.get(8)?,
+            name: row.get(9)?,
+            signature: row.get(10)?,
+            kind: row.get(11)?,
+        })
     })
     .map(|it| {
         it.filter_map(|r| r.ok())
-            .filter(|(_, _, _, _, line_start, line_end)| {
+            .filter(|r| {
                 ranges
                     .iter()
-                    .any(|&(rs, re)| !(*line_end < rs || *line_start > re))
+                    .any(|&(rs, re)| !(r.line_end < rs || r.line_start > re))
             })
-            .map(|(qn, callers, is_hub, hub_kind, _, _)| (qn, callers, is_hub, hub_kind))
             .collect()
     })
     .unwrap_or_default()
@@ -1549,25 +1596,65 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// is a hub, `Some("bridge")` only when every touched hub is bridge-only,
 /// and `Some("degree")`/`Some("both")` if any touched hub is stronger than
 /// bridge-only (see `hub_kind_strength`).
+/// `(risk_level, hub_hit, strongest_hub_kind, entry_point_uncertain,
+/// touched_symbols)` for whatever symbols in `path` overlap `ranges`.
+/// `risk_level` is `None` when nothing overlaps (editing dead space
+/// between symbols, or a file with no parsed symbols at all — Cargo.toml,
+/// docs) — that's not an error, just nothing to gate on.
+/// `strongest_hub_kind` is `None` when nothing touched is a hub,
+/// `Some("bridge")` only when every touched hub is bridge-only, and
+/// `Some("degree")`/`Some("both")` if any touched hub is stronger than
+/// bridge-only (see `hub_kind_strength`). `entry_point_uncertain` is `true`
+/// when a touched symbol has `caller_count == 0` AND the same dead-code
+/// heuristic `edit_context` uses disagrees it looks safely removable —
+/// `is_entry_point` (a framework/macro-registered handler, e.g. an rmcp
+/// `#[tool(name = "...")]` MCP method) is the primary trigger, since its
+/// real caller is invisible to the static call graph by construction, so
+/// `caller_count == 0` can't be read as "safe" the way it can for an
+/// ordinary non-entry-point symbol.
+/// `(risk_level, hub_hit, strongest_hub_kind, uncertain_zero_caller,
+/// touched_symbols)` for whatever symbols in `path` overlap `ranges`.
+/// `risk_level` is `None` when nothing overlaps (editing dead space
+/// between symbols, or a file with no parsed symbols at all — Cargo.toml,
+/// docs) — that's not an error, just nothing to gate on.
+/// `strongest_hub_kind` is `None` when nothing touched is a hub,
+/// `Some("bridge")` only when every touched hub is bridge-only, and
+/// `Some("degree")`/`Some("both")` if any touched hub is stronger than
+/// bridge-only (see `hub_kind_strength`). `uncertain_zero_caller` is
+/// `Some(reason)` when a touched **function or method** has
+/// `caller_count == 0` AND the same dead-code heuristic `edit_context`
+/// uses disagrees it looks safely removable — see
+/// `classify_uncertain_zero_caller` for what `reason` distinguishes.
+/// Deliberately gated on `kind` being `"function"`/`"method"`:
+/// `compute_dead_code_confidence` returns `"none"` for every other kind
+/// (the dead-code question isn't well-formed for a struct/enum/etc. — see
+/// its own doc comment: "confirmed: 100% of this repo's own struct
+/// symbols have caller_count=0") — that `"none"` is a vacuous "not
+/// applicable", not a "confirmed safe" signal, so counting it here would
+/// force the full write gate on nearly every struct/enum edit in this
+/// codebase for no real reason.
 fn compute_touch_risk(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
+    coverage: &calm_core::analysis::coverage::CoverageData,
 ) -> (
     Option<String>,
     bool,
     Option<String>,
+    Option<UncertainZeroCallerReason>,
     Vec<TouchedSymbolOutput>,
 ) {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
     let mut strongest_hub_kind: Option<String> = None;
+    let mut uncertain_zero_caller: Option<UncertainZeroCallerReason> = None;
     let mut touched = Vec::with_capacity(rows.len());
-    for (qualified_name, caller_count, is_hub, hub_kind) in rows {
-        max_callers = max_callers.max(caller_count);
-        hub_hit |= is_hub;
-        if let Some(k) = &hub_kind {
+    for row in rows {
+        max_callers = max_callers.max(row.caller_count);
+        hub_hit |= row.is_hub;
+        if let Some(k) = &row.hub_kind {
             let stronger = strongest_hub_kind
                 .as_deref()
                 .is_none_or(|cur| hub_kind_strength(k) > hub_kind_strength(cur));
@@ -1575,15 +1662,47 @@ fn compute_touch_risk(
                 strongest_hub_kind = Some(k.clone());
             }
         }
+        if row.caller_count == 0 && matches!(row.kind.as_str(), "function" | "method") {
+            let is_private = calm_core::analysis::dead_code::is_private_symbol(
+                &row.language,
+                &row.name,
+                &row.signature,
+            );
+            let scope_clear =
+                calm_core::analysis::dead_code::scope_clear_for_language(&row.language);
+            let (dead_code_confidence, _) =
+                calm_core::analysis::dead_code::compute_dead_code_confidence(
+                    path,
+                    row.line_start,
+                    row.line_end,
+                    row.caller_count,
+                    row.is_entry_point,
+                    row.is_test,
+                    is_private,
+                    scope_clear,
+                    coverage,
+                    &row.kind,
+                );
+            if let Some(reason) =
+                classify_uncertain_zero_caller(row.is_entry_point, row.is_test, dead_code_confidence)
+            {
+                let stronger = uncertain_zero_caller.is_none_or(|cur| {
+                    uncertain_zero_caller_strength(reason) > uncertain_zero_caller_strength(cur)
+                });
+                if stronger {
+                    uncertain_zero_caller = Some(reason);
+                }
+            }
+        }
         touched.push(TouchedSymbolOutput {
-            qualified_name,
-            caller_count,
-            is_hub,
-            hub_kind,
+            qualified_name: row.qualified_name,
+            caller_count: row.caller_count,
+            is_hub: row.is_hub,
+            hub_kind: row.hub_kind,
         });
     }
     let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
-    (risk, hub_hit, strongest_hub_kind, touched)
+    (risk, hub_hit, strongest_hub_kind, uncertain_zero_caller, touched)
 }
 
 /// Plan 3 §3.3 (F10): true iff every caller edge (`call_edges.to_symbol`)

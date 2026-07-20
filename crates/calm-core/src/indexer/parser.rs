@@ -866,6 +866,36 @@ fn member_is_pub_for_container_inheritance(language: &str, signature: &str) -> b
 /// `walk_symbols`; empty for Python/Go, which don't have this gap — Python
 /// already checks a class-level-vs-member-level distinction differently via
 /// dunder methods, and Go has no class/decorator concept at all).
+/// Whether `node` is a Rust trait method DECLARATION with no body (a
+/// `function_signature_item`, e.g. `fn bar(&self);` inside `trait Foo { .. }`)
+/// rather than an `extern "C" { fn baz(); }` FFI declaration --
+/// tree-sitter-rust uses the identical node kind for both (confirmed via
+/// `tree.root_node().to_sexp()`: both sit directly under a
+/// `declaration_list`), so the grandparent (`trait_item` vs
+/// `foreign_mod_item`) is the only syntactic signal that tells them apart.
+/// A trait method declaration can never itself be a call target -- Rust
+/// dispatch always resolves through a concrete `impl`, never the trait's
+/// own signature -- so caller_count=0 on it is permanent and structural,
+/// the same category as `main` or a trait-dispatch name, regardless of how
+/// many times its concrete implementations are actually called. An FFI
+/// declaration is different: `unsafe { baz() }` produces a real call edge
+/// to it directly, so it must NOT get this treatment or a genuinely-unused
+/// binding would silently lose its real dead-code signal.
+fn is_rust_trait_method_declaration(node: tree_sitter::Node) -> bool {
+    node.kind() == "function_signature_item"
+        && node
+            .parent()
+            .and_then(|p| p.parent())
+            .is_some_and(|gp| gp.kind() == "trait_item")
+}
+
+/// Per-language entry-point convention: known framework decorators/attributes,
+/// `main`/`init` functions, `export default`, and — for Rust/Java/TS/JS — a
+/// public member inheriting the same signal from its enclosing container's
+/// own decorator/annotation (`container_decorators`, propagated by
+/// `walk_symbols`; empty for Python/Go, which don't have this gap — Python
+/// already checks a class-level-vs-member-level distinction differently via
+/// dunder methods, and Go has no class/decorator concept at all).
 fn detect_entry_point(
     node: tree_sitter::Node,
     source: &str,
@@ -941,6 +971,7 @@ fn detect_entry_point(
             ];
             name == "main"
                 || TRAIT_DISPATCH_NAMES.contains(&name)
+                || is_rust_trait_method_declaration(node)
                 || decorators.iter().any(|d| rust_attr_is_dispatch_signal(d))
                 || (member_is_pub_for_container_inheritance(language, signature)
                     && container_decorators
@@ -3087,6 +3118,52 @@ def run():
         assert!(find(&symbols, "repo_overview").is_entry_point);
         assert!(!find(&symbols, "helper").is_entry_point);
     }
+
+    /// Regression: a bodyless trait method declaration (`fn bar(&self);`
+    /// inside `trait Foo { .. }`) can never itself be a call target --
+    /// Rust dispatch always resolves through a concrete `impl`, never the
+    /// trait's own signature -- so a name-based call-graph will always
+    /// give it caller_count=0 regardless of how many times its concrete
+    /// implementations are actually called. Confirmed live on this repo's
+    /// own `RwLockExt::read_ok`/`LockExt::lock_ok`
+    /// (crates/calm-server/src/sync_ext.rs): the trait declaration reported
+    /// dead_code_confidence "high" while its impl (a separate symbol, same
+    /// bare name) had 13 real callers.
+    #[test]
+    fn test_rust_entry_point_trait_method_declaration_without_body() {
+        let code = "trait Foo {\n    fn bar(&self);\n}\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(find(&symbols, "bar").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    /// Boundary: a trait method WITH a default body parses as an ordinary
+    /// `function_item` (identical node kind to an impl method), not
+    /// `function_signature_item` -- it can be called directly (via the
+    /// default, if not overridden), so it must NOT get the same blanket
+    /// entry-point treatment as a bodyless declaration.
+    #[test]
+    fn test_rust_trait_default_body_method_is_not_entry_point_via_this_rule() {
+        let code = "trait Foo {\n    fn bar(&self) {}\n}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(!find(&symbols, "bar").is_entry_point);
+    }
+
+    /// Boundary: tree-sitter-rust reuses the exact same
+    /// `function_signature_item` node kind for `extern "C" { fn baz(); }`
+    /// FFI declarations as it does for trait method declarations -- only
+    /// the grandparent node differs (`foreign_mod_item` vs `trait_item`,
+    /// confirmed via `to_sexp()`). An FFI declaration genuinely can have
+    /// real Rust-side callers (`unsafe { baz() }`), so it must NOT be swept
+    /// into the same always-entry-point treatment, or a truly-unused FFI
+    /// binding would silently lose its real dead-code signal.
+    #[test]
+    fn test_rust_extern_ffi_declaration_is_not_entry_point_via_trait_rule() {
+        let code = "extern \"C\" {\n    fn baz();\n}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(!find(&symbols, "baz").is_entry_point);
+    }
+
 
     /// Regression: a small set of purely-cosmetic/compiler-directive
     /// attributes must NOT trigger the broad "has an attribute macro"

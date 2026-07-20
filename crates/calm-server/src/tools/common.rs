@@ -1141,6 +1141,34 @@ impl Caveat {
         }
     }
 
+    /// Same "zero direct callers" situation as `no_direct_usage`, but for a
+    /// symbol the parser already flagged `is_entry_point` at index time
+    /// (`detect_entry_point`/`rust_attr_is_dispatch_signal` and their
+    /// per-language equivalents — `main`, a trait-dispatch protocol method,
+    /// a decorator/annotation-registered handler, or a macro-attribute
+    /// dispatch target such as an rmcp `#[tool(name = "...")]` MCP handler).
+    /// For these, zero static callers isn't a "maybe dead, maybe hidden"
+    /// judgment call — it's the expected, permanent shape: the real
+    /// invocation happens through a mechanism (framework dispatch table,
+    /// operator/protocol sugar, decorator registration) that never appears
+    /// as a literal call-site token in source, so no amount of indexing —
+    /// tree-sitter or a compiler-grade SCIP overlay alike — can ever
+    /// populate this count. Distinct wording from `no_direct_usage` so a
+    /// caller doesn't read this as a dead-code hint to chase down.
+    pub(crate) fn entry_point_dispatch(symbol: &str) -> Self {
+        Caveat {
+            class: "entry_point_dispatch",
+            message: format!(
+                "'{symbol}' has zero direct callers in the index, but is flagged as a \
+                 language/framework entry point (e.g. an rmcp #[tool(...)] MCP handler, \
+                 `main`, a trait-dispatch protocol method, a decorator/annotation-registered \
+                 handler, or similar). Its real invocation happens through a mechanism \
+                 CALM's static call graph can't lexically capture — a near-zero caller_count \
+                 here is expected by design, not a dead-code signal."
+            ),
+        }
+    }
+
     /// Some, but not all, of a `symbols_batch` call's requested
     /// `qualified_names` matched nothing in the index. Names the first
     /// few missing ids so the caller doesn't have to diff the request
@@ -2044,6 +2072,80 @@ pub(crate) fn risk_level_from_caller_count(caller_count: i64) -> &'static str {
         "medium"
     } else {
         "low"
+    }
+}
+
+/// Whether `caller_count == 0` on a risk-relevant symbol should be treated
+/// as an opaque/uncertain signal rather than genuine low-blast-radius
+/// usage: true when the dead-code heuristic (`is_entry_point`/`is_test`/
+/// coverage-aware `compute_dead_code_confidence`) disagrees this symbol
+/// looks safely removable. Shared by `edit_context`'s advisory risk
+/// escalation and `compute_touch_risk`'s hard write-gate so the two
+/// independent consumers of `caller_count` can't silently drift apart the
+/// way `risk_level_from_caller_count`'s three former copies once did (see
+/// its own docstring) — confirmed live: before this was wired into
+/// `compute_touch_risk`, editing a real zero-caller `#[tool(name = "...")]`
+/// MCP handler via `edit_lines`/`edit_symbol` bypassed the mandatory
+/// confirm/edit_context gate entirely, because `is_hub`/raw `caller_count`
+/// alone can't see the framework dispatch that's its actual caller.
+pub(crate) fn zero_caller_count_is_uncertain(dead_code_confidence: &str) -> bool {
+    matches!(dead_code_confidence, "none" | "low")
+}
+
+/// Why a touched symbol's `caller_count == 0` shouldn't be read as "safe to
+/// edit without a closer look" — see `zero_caller_count_is_uncertain`. Kept
+/// distinct from that boolean so a denial message can name the actual
+/// cause instead of defaulting to "entry point" even when the real trigger
+/// was `is_test` or a borderline coverage/scope call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UncertainZeroCallerReason {
+    /// `is_entry_point`: real invocation is a framework/macro/language
+    /// dispatch mechanism (rmcp `#[tool]`, `main`, a trait-dispatch name, a
+    /// bodyless trait method declaration, ...) invisible to the static
+    /// call graph — `caller_count == 0` here is permanent and structural.
+    EntryPoint,
+    /// `is_test` (and not also an entry point): the test harness discovers
+    /// and runs it by convention/reflection, not a literal call site.
+    /// Same static-graph blind spot as `EntryPoint`, different cause and
+    /// consequence — nothing external depends on it, so the risk on edit
+    /// is to test coverage silently breaking, not production blast radius.
+    TestOnly,
+    /// Neither of the above, but `compute_dead_code_confidence` still came
+    /// back `"none"`/`"low"` for a function/method (e.g. runtime coverage
+    /// shows it executing despite no static callers). A genuine but
+    /// unlabeled "this doesn't look confidently safe" signal.
+    LowConfidence,
+}
+
+/// Classifies *why* `dead_code_confidence` disagreed a zero-caller
+/// function/method looks safely removable, or returns `None` if it
+/// didn't (`zero_caller_count_is_uncertain` was false). `is_entry_point`
+/// takes priority over `is_test` when — in principle — both were somehow
+/// true at once, since it's the stronger, more specific signal.
+pub(crate) fn classify_uncertain_zero_caller(
+    is_entry_point: bool,
+    is_test: bool,
+    dead_code_confidence: &str,
+) -> Option<UncertainZeroCallerReason> {
+    if !zero_caller_count_is_uncertain(dead_code_confidence) {
+        return None;
+    }
+    Some(if is_entry_point {
+        UncertainZeroCallerReason::EntryPoint
+    } else if is_test {
+        UncertainZeroCallerReason::TestOnly
+    } else {
+        UncertainZeroCallerReason::LowConfidence
+    })
+}
+
+/// Priority ordering when multiple touched symbols disagree on why —
+/// mirrors `hub_kind_strength`'s "pick the strongest signal found" shape.
+pub(crate) fn uncertain_zero_caller_strength(reason: UncertainZeroCallerReason) -> u8 {
+    match reason {
+        UncertainZeroCallerReason::EntryPoint => 2,
+        UncertainZeroCallerReason::TestOnly => 1,
+        UncertainZeroCallerReason::LowConfidence => 0,
     }
 }
 

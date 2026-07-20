@@ -183,6 +183,13 @@ struct SessionLog {
     session_started_at: String,
     /// See `EditContextReview`. Keyed by qualified_name.
     edit_context_reviewed: std::collections::HashMap<String, EditContextReview>,
+    /// Hub edits a human already vetoed via elicitation this session, keyed
+    /// by `(path, hunk-content fingerprint)` — content-hash keyed on purpose
+    /// (NOT path alone): the same path with changed hunks is a different
+    /// question and must re-ask, while an agent retry-looping the identical
+    /// edit gets an immediate cached USER_DECLINED instead of re-harassing
+    /// the human (audit-design L7).
+    elicit_declined: std::collections::HashSet<(String, String)>,
 }
 
 impl Default for SessionLog {
@@ -195,6 +202,7 @@ impl Default for SessionLog {
             last_progress_at: 0,
             session_started_at: utc_now_iso8601(),
             edit_context_reviewed: std::collections::HashMap::new(),
+            elicit_declined: std::collections::HashSet::new(),
         }
     }
 }
@@ -724,12 +732,12 @@ mod tests {
         );
         assert_has_fields(
             "edit_lines",
-            CalmServer::edit_lines_tool_attr(),
+            CalmServer::edit_lines_tool_tool_attr(),
             &["path", "edits", "confirm"],
         );
         assert_has_fields(
             "edit_symbol",
-            CalmServer::edit_symbol_tool_attr(),
+            CalmServer::edit_symbol_tool_tool_attr(),
             &["symbol", "new_text"],
         );
         assert_has_fields(
@@ -6629,6 +6637,117 @@ mod tests {
             "def helper():\n    return 2\n"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Elicitation human-veto gate (docs/superskills/specs/
+    // 2026-07-20-calm-elicitation-hub-edit-confirm.md): the Ask gate may
+    // only fire AFTER the full machine gate passes, and only on hub touches.
+    #[test]
+    fn edit_lines_flow_ask_gate_returns_sentinel_only_after_machine_gate_passes() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("edit_elicit_sentinel");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let params = |reason: &str| EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash.clone()),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some(reason.into()),
+        };
+
+        // Machine gate NOT yet passed (edit_context never ran): Ask mode
+        // must surface the machine refusal, not the sentinel — the human is
+        // never asked to compensate for an agent that skipped its review.
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params("looks fine"), ElicitGate::Ask, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["error"]["code"], "EDIT_CONTEXT_REQUIRED", "response: {v}");
+        assert!(ask.is_none());
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        // Full machine gate + Ask → sentinel, ask context filled, nothing
+        // written (the veto happens BEFORE the disk write, holding no locks).
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(
+            &params("checked -- helper has no confirmed callers"),
+            ElicitGate::Ask,
+            &mut ask,
+        );
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["error"]["code"], "ELICITATION_PENDING", "response: {v}");
+        assert!(ask.is_some(), "sentinel must carry the question context");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+
+        // Approved → the same call writes.
+        let out = server.edit_lines_flow(
+            &params("checked -- helper has no confirmed callers"),
+            ElicitGate::Approved,
+            &mut None,
+        );
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_flow_ask_gate_never_elicits_for_non_hub_edit() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("edit_elicit_nonhub");
+        std::fs::write(dir.join("b.py"), "def x():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def x():\n    return 1\n", 2, 2).unwrap();
+        // No symbols indexed for b.py at all — nothing to gate on: Ask must
+        // behave byte-identically to Off (write immediately, no sentinel).
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(
+            &EditLinesParams {
+                path: "b.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+            ElicitGate::Ask,
+            &mut ask,
+        );
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert!(ask.is_none(), "non-hub edits must never elicit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

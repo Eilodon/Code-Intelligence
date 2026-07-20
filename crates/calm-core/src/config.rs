@@ -28,6 +28,7 @@ pub struct Config {
     pub clang: ClangConfig,
     pub ruby: RubyConfig,
     pub indexing: IndexingConfig,
+    pub edit: EditConfig,
 }
 
 impl Default for Config {
@@ -88,6 +89,7 @@ impl Default for Config {
             clang: ClangConfig::default(),
             ruby: RubyConfig::default(),
             indexing: IndexingConfig::default(),
+            edit: EditConfig::default(),
         }
     }
 }
@@ -102,6 +104,33 @@ pub struct HubThresholdConfig {
 }
 
 /// Phase B (`docs/plans/2026-07-13-phase-b-incremental-graph-update.md`)
+/// Edit-tool behavior flags (`[edit]` in `.calm/config.json`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EditConfig {
+    /// Human-in-the-loop veto for hub/high-risk edits: when `true` AND the
+    /// connected MCP client declared form-mode elicitation support, an edit
+    /// that passed the full machine gate (confirm:true + edit_context +
+    /// grounded reason) additionally asks the human at the client UI before
+    /// writing. Default `false` — zero behavior change unless opted in.
+    /// The veto is fail-closed: decline, timeout, or a broken elicitation
+    /// round-trip all refuse the edit; it can never approve an edit the
+    /// machine gate would have refused.
+    pub elicit_hub_confirm: bool,
+    /// How long to wait for the human's answer before refusing with
+    /// ELICITATION_TIMEOUT. Only read when `elicit_hub_confirm` is on.
+    pub elicit_timeout_secs: u64,
+}
+
+impl Default for EditConfig {
+    fn default() -> Self {
+        Self {
+            elicit_hub_confirm: false,
+            elicit_timeout_secs: 120,
+        }
+    }
+}
+
 /// indexing-pipeline flags.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -1077,6 +1106,33 @@ mod tests {
     #[test]
     fn diff_from_default_is_empty_for_pure_defaults() {
         assert!(diff_from_default(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn edit_elicit_defaults_off_and_parses_override() {
+        // Elicitation human-veto is opt-in: absent [edit] table = off, and
+        // an old config.json without the section must keep parsing.
+        let d = Config::default();
+        assert!(!d.edit.elicit_hub_confirm);
+        assert_eq!(d.edit.elicit_timeout_secs, 120);
+
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_elicit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"edit": {"elicit_hub_confirm": true, "elicit_timeout_secs": 5}}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&tmp).unwrap();
+        assert!(loaded.edit.elicit_hub_confirm);
+        assert_eq!(loaded.edit.elicit_timeout_secs, 5);
+        let diff = diff_from_default(&loaded);
+        assert!(
+            diff.contains(&"edit.elicit_hub_confirm".to_string()),
+            "{diff:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

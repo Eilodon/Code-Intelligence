@@ -25,11 +25,67 @@ impl CalmServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn edit_lines_tool(
+        &self,
+        Parameters(p): Parameters<EditLinesParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Json<ToolOutcome<EditLinesOutput>> {
+        let elicit_timeout = self.elicit_setup(&ctx.peer);
+        let gate = if elicit_timeout.is_some() {
+            ElicitGate::Ask
+        } else {
+            ElicitGate::Off
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let first = self.edit_lines_flow(&p, gate, &mut ask);
+        let (Some(timeout), Some(ask_ctx)) = (elicit_timeout, ask) else {
+            return Json(first);
+        };
+        // `first` has fully returned above — neither the in-process
+        // edit_lock nor the cross-process lock (both scoped inside
+        // edit_lines_impl_gated) is held across this await (audit FM1).
+        let fingerprint = fingerprint_edit_lines(&p);
+        Json(
+            match self
+                .hub_elicit_roundtrip(
+                    &ctx.peer,
+                    "edit_lines",
+                    &p.path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                )
+                .await
+            {
+                Ok(()) => self.edit_lines_flow(&p, ElicitGate::Approved, &mut None),
+                Err(detail) => ToolOutcome::error(detail),
+            },
+        )
+    }
+
+    /// Legacy sync surface — same behavior as `edit_lines_tool` with the
+    /// elicitation gate off; kept so the existing (sync) test suite and any
+    /// in-crate caller keep working unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn edit_lines(
         &self,
         Parameters(p): Parameters<EditLinesParams>,
     ) -> Json<ToolOutcome<EditLinesOutput>> {
-        Json(self.timed_tool("edit_lines", || {
+        Json(self.edit_lines_flow(&p, ElicitGate::Off, &mut None))
+    }
+
+    /// Sync body of `edit_lines` — extracted so the async tool wrapper can
+    /// run it twice (Ask, then Approved) around the elicitation await.
+    /// pub(crate) so tools.rs's test mod can drive the Ask/Approved gate
+    /// states directly (the async wrapper needs a live rmcp peer).
+    pub(crate) fn edit_lines_flow(
+        &self,
+        p: &EditLinesParams,
+        gate: ElicitGate,
+        ask_out: &mut Option<HubAskContext>,
+    ) -> ToolOutcome<EditLinesOutput> {
+        self.timed_tool("edit_lines", || {
             // old_text-mode hunks (see EditHunkParam::old_text) need one
             // live read of the file to resolve against — done once up
             // front, shared by every such hunk in this call, not once per
@@ -55,15 +111,15 @@ impl CalmServer {
             };
 
             let mut hunks: Vec<calm_core::edit::HunkRequest> = Vec::with_capacity(p.edits.len());
-            for h in p.edits {
+            for h in &p.edits {
                 let start = h.start_line.max(0) as usize;
                 let end = h.end_line.max(0) as usize;
-                match h.old_text {
+                match &h.old_text {
                     None => hunks.push(calm_core::edit::HunkRequest {
                         start_line: start,
                         end_line: end,
-                        expected_hash: h.expected_hash,
-                        new_text: h.new_text,
+                        expected_hash: h.expected_hash.clone(),
+                        new_text: h.new_text.clone(),
                     }),
                     Some(old_text) => {
                         // `live` is always Some here: the check above sets it
@@ -73,7 +129,7 @@ impl CalmServer {
                             live_ref,
                             start,
                             end,
-                            &old_text,
+                            old_text,
                             &h.new_text,
                         ) {
                             Ok(hunk) => hunks.push(hunk),
@@ -110,8 +166,17 @@ impl CalmServer {
                     }
                 }
             }
-            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref(), false, None)
-        }))
+            self.edit_lines_impl_gated(
+                &p.path,
+                hunks,
+                p.confirm,
+                p.reason.as_deref(),
+                false,
+                None,
+                gate,
+                ask_out,
+            )
+        })
     }
 
     #[tool(
@@ -124,11 +189,65 @@ impl CalmServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn edit_symbol_tool(
+        &self,
+        Parameters(p): Parameters<EditSymbolParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Json<ResolvedOutcome<EditLinesOutput>> {
+        let elicit_timeout = self.elicit_setup(&ctx.peer);
+        let gate = if elicit_timeout.is_some() {
+            ElicitGate::Ask
+        } else {
+            ElicitGate::Off
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let first = self.edit_symbol_flow(&p, gate, &mut ask);
+        let (Some(timeout), Some(ask_ctx)) = (elicit_timeout, ask) else {
+            return Json(first);
+        };
+        // `first` has fully returned above — no edit/DB lock is held across
+        // this await (all scoped inside edit_lines_impl_gated); audit FM1.
+        let fingerprint = fingerprint_edit_symbol(&p);
+        let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
+        Json(
+            match self
+                .hub_elicit_roundtrip(
+                    &ctx.peer,
+                    "edit_symbol",
+                    &cache_key_path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                )
+                .await
+            {
+                Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
+                Err(detail) => ResolvedOutcome::error(detail),
+            },
+        )
+    }
+
+    /// Legacy sync surface — same behavior as `edit_symbol_tool` with the
+    /// elicitation gate off; kept so the existing (sync) test suite and any
+    /// in-crate caller keep working unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn edit_symbol(
         &self,
         Parameters(p): Parameters<EditSymbolParams>,
     ) -> Json<ResolvedOutcome<EditLinesOutput>> {
-        Json(self.timed_tool("edit_symbol", || {
+        Json(self.edit_symbol_flow(&p, ElicitGate::Off, &mut None))
+    }
+
+    /// Sync body of `edit_symbol` — extracted so the async tool wrapper can
+    /// run it twice (Ask, then Approved) around the elicitation await.
+    fn edit_symbol_flow(
+        &self,
+        p: &EditSymbolParams,
+        gate: ElicitGate,
+        ask_out: &mut Option<HubAskContext>,
+    ) -> ResolvedOutcome<EditLinesOutput> {
+        self.timed_tool("edit_symbol", || {
             if matches!(
                 p.position.as_deref(),
                 Some("top_of_file") | Some("end_of_file")
@@ -186,7 +305,16 @@ impl CalmServer {
                     }
                 };
                 return self
-                    .edit_lines_impl(path, vec![hunk], p.confirm, p.reason.as_deref(), true, None)
+                    .edit_lines_impl_gated(
+                        path,
+                        vec![hunk],
+                        p.confirm,
+                        p.reason.as_deref(),
+                        true,
+                        None,
+                        gate,
+                        ask_out,
+                    )
                     .into_resolved();
             }
             let c = {
@@ -234,8 +362,8 @@ impl CalmServer {
                     None => calm_core::edit::HunkRequest {
                         start_line: c.line_start as usize,
                         end_line: c.line_end as usize,
-                        expected_hash: p.expected_hash,
-                        new_text: p.new_text,
+                        expected_hash: p.expected_hash.clone(),
+                        new_text: p.new_text.clone(),
                     },
                     Some(old_text) => {
                         let full_path = match resolve_repo_path(&self.project_root, &c.path) {
@@ -318,16 +446,18 @@ impl CalmServer {
                     ));
                 }
             };
-            self.edit_lines_impl(
+            self.edit_lines_impl_gated(
                 &c.path,
                 vec![hunk],
                 p.confirm,
                 p.reason.as_deref(),
                 position_anchored,
                 insertion_note,
+                gate,
+                ask_out,
             )
             .into_resolved()
-        }))
+        })
     }
 
     #[tool(
@@ -503,7 +633,8 @@ impl CalmServer {
     /// are tool errors; failures AFTER it surface as a success with
     /// `index_stale: true` — the disk write already happened, and reporting
     /// it as an error made agents re-apply edits that had in fact landed.
-    fn edit_lines_impl(
+    #[allow(clippy::too_many_arguments)]
+    fn edit_lines_impl_gated(
         &self,
         path: &str,
         hunks: Vec<calm_core::edit::HunkRequest>,
@@ -511,6 +642,8 @@ impl CalmServer {
         reason: Option<&str>,
         position_anchored: bool,
         extra_note: Option<String>,
+        gate: ElicitGate,
+        ask_out: &mut Option<HubAskContext>,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -879,6 +1012,32 @@ impl CalmServer {
                     ));
                 }
             }
+
+            // Human veto (elicitation — docs/superskills/specs/
+            // 2026-07-20-calm-elicitation-hub-edit-confirm.md): every machine
+            // check above passed, so this write WOULD proceed. In Ask mode,
+            // hand the question context back to the async wrapper (which
+            // holds no locks) instead of writing; Approved means the human
+            // already said yes to this exact call. Placement inside this
+            // hub/high-risk block is what makes non-hub edits never elicit.
+            if matches!(gate, ElicitGate::Ask) {
+                *ask_out = Some(HubAskContext {
+                    why: why.clone(),
+                    risk: risk.clone(),
+                    hub_kind: hub_kind.clone(),
+                    touched: pre_touched
+                        .iter()
+                        .map(|t| (t.qualified_name.clone(), t.caller_count))
+                        .collect(),
+                });
+                return ToolOutcome::error(error_detail(
+                    "ELICITATION_PENDING",
+                    "hub edit pending human approval — internal sentinel, never \
+                     surfaced to the client (the elicitation round-trip resolves \
+                     it)",
+                    true,
+                ));
+            }
         }
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
             drop(_cross_guard);
@@ -906,6 +1065,7 @@ impl CalmServer {
                 risk = risk.as_deref().unwrap_or("none"),
                 hub_hit,
                 confirmed = confirm,
+                human_approved = matches!(gate, ElicitGate::Approved),
                 old_hash = hash_of(&original),
                 new_hash = hash_of(&new_content),
             );
@@ -1107,6 +1267,225 @@ impl CalmServer {
             )),
         })
     }
+}
+
+/// How the hub/high-risk gate interacts with the human-elicitation veto
+/// (docs/superskills/specs/2026-07-20-calm-elicitation-hub-edit-confirm.md).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ElicitGate {
+    /// Elicitation inactive (config off, or the client never declared the
+    /// capability): the machine gate alone decides, exactly as before.
+    Off,
+    /// Elicitation active: a write that passes the machine gate on a
+    /// hub/high-risk touch returns the ELICITATION_PENDING sentinel instead
+    /// of writing, so the async wrapper can ask the human first.
+    Ask,
+    /// The human approved this exact call — write, and audit-log it.
+    Approved,
+}
+
+/// Question context the gated impl hands back at the sentinel point —
+/// everything the human needs for the veto to be decision-relevant
+/// (audit-design Ab2).
+pub(crate) struct HubAskContext {
+    why: String,
+    risk: Option<String>,
+    hub_kind: Option<String>,
+    /// `(qualified_name, caller_count)` of every touched symbol.
+    touched: Vec<(String, i64)>,
+}
+
+/// Typed answer the human's client returns for the hub-edit veto question.
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct HubEditApproval {
+    /// true = allow this edit to be written; false = refuse it.
+    approve: bool,
+}
+rmcp::elicit_safe!(HubEditApproval);
+
+impl CalmServer {
+    /// `Some(timeout)` when the human-veto flow is active for this
+    /// connection: `[edit] elicit_hub_confirm` opted in AND the client
+    /// declared form-mode elicitation (MCP 2025-06-18 requires clients to
+    /// declare it at initialize). `None` = `ElicitGate::Off`, byte-identical
+    /// legacy behavior — by construction the veto can only ADD a refusal on
+    /// top of the machine gate, never remove one (spec Option A).
+    fn elicit_setup(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Option<std::time::Duration> {
+        let cfg = self.config().edit;
+        if !cfg.elicit_hub_confirm {
+            return None;
+        }
+        if !peer
+            .supported_elicitation_modes()
+            .contains(&rmcp::service::ElicitationMode::Form)
+        {
+            return None;
+        }
+        Some(std::time::Duration::from_secs(cfg.elicit_timeout_secs))
+    }
+
+    /// One human-veto round-trip: declined-cache short-circuit, sanitized
+    /// question, `elicit_with_timeout`, decision mapping, audit logging.
+    /// `Ok(())` = approved; every other outcome is a fail-closed refusal.
+    #[allow(clippy::too_many_arguments)]
+    async fn hub_elicit_roundtrip(
+        &self,
+        peer: &rmcp::Peer<rmcp::RoleServer>,
+        tool: &str,
+        cache_path: &str,
+        fingerprint: &str,
+        ask: &HubAskContext,
+        reason: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<(), ErrorDetail> {
+        if self.elicit_declined_contains(cache_path, fingerprint) {
+            return Err(error_detail(
+                "USER_DECLINED",
+                "a human already declined this exact edit this session — do not \
+                 retry it; surface their veto and let them decide the next step",
+                false,
+            ));
+        }
+        let message = build_hub_elicit_message(tool, cache_path, ask, reason);
+        tracing::info!(
+            target: crate::telemetry::AUDIT_TARGET,
+            session_id = self.session_id,
+            decision = "elicit_asked",
+            tool,
+            path = cache_path,
+        );
+        let started = std::time::Instant::now();
+        let result = peer
+            .elicit_with_timeout::<HubEditApproval>(message, Some(timeout))
+            .await;
+        let (verdict, mapped) = map_elicit_outcome(result);
+        tracing::info!(
+            target: crate::telemetry::AUDIT_TARGET,
+            session_id = self.session_id,
+            decision = verdict,
+            tool,
+            path = cache_path,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+        );
+        if verdict == "elicit_declined" {
+            self.elicit_declined_insert(cache_path, fingerprint);
+        }
+        mapped
+    }
+}
+
+/// Pure decision-table mapping — unit-testable without a live peer. Returns
+/// the audit verdict label plus the tool-facing result. Fail-closed: only an
+/// explicit accept carrying `approve: true` lets the write proceed.
+fn map_elicit_outcome(
+    result: Result<Option<HubEditApproval>, rmcp::service::ElicitationError>,
+) -> (&'static str, Result<(), ErrorDetail>) {
+    use rmcp::service::ElicitationError as E;
+    let declined = || {
+        error_detail(
+            "USER_DECLINED",
+            "the human reviewing this session refused this hub edit — do not \
+             retry; surface their veto and let them decide the next step",
+            false,
+        )
+    };
+    match result {
+        Ok(Some(HubEditApproval { approve: true })) => ("elicit_approved", Ok(())),
+        Ok(Some(HubEditApproval { approve: false })) | Ok(None) => {
+            ("elicit_declined", Err(declined()))
+        }
+        Err(E::UserDeclined) | Err(E::UserCancelled) => ("elicit_declined", Err(declined())),
+        Err(E::Service(rmcp::ServiceError::Timeout { .. })) => (
+            "elicit_timeout",
+            Err(error_detail(
+                "ELICITATION_TIMEOUT",
+                "no human answered the hub-edit approval question in time — \
+                 nothing was written (fail-closed). If this session is headless \
+                 (CI, batch agents), turn off `elicit_hub_confirm` under `edit` \
+                 in .calm/config.json instead of retrying",
+                false,
+            )),
+        ),
+        Err(_) => (
+            "elicit_failed",
+            Err(error_detail(
+                "ELICITATION_FAILED",
+                "the elicitation round-trip to the client failed — nothing was \
+                 written (fail-closed). The client declared elicitation support \
+                 but could not complete it; check the client, or turn off \
+                 `elicit_hub_confirm` under `edit` in .calm/config.json",
+                false,
+            )),
+        ),
+    }
+}
+
+/// Builds the human-facing question. `reason` is agent-authored text about
+/// to cross into a human approval UI — run through the same redaction layer
+/// as source output and hard-capped, per audit FM3 (the reason field must
+/// not become an injection surface against the approver).
+fn build_hub_elicit_message(
+    tool: &str,
+    path: &str,
+    ask: &HubAskContext,
+    reason: Option<&str>,
+) -> String {
+    let mut msg = format!(
+        "CALM hub-edit approval — the agent wants {tool} to modify {path}: it \
+         touches {}",
+        ask.why
+    );
+    if let Some(k) = &ask.hub_kind {
+        msg.push_str(&format!(", hub_kind={k}"));
+    }
+    if let Some(r) = &ask.risk {
+        msg.push_str(&format!(", risk={r}"));
+    }
+    let mut touched = ask.touched.clone();
+    touched.sort_by_key(|t| std::cmp::Reverse(t.1));
+    for (qn, callers) in touched.iter().take(3) {
+        msg.push_str(&format!("\n- {qn} ({callers} callers)"));
+    }
+    let sanitized = calm_core::sanitize::sanitize_source_output(reason.unwrap_or("(none given)"));
+    let capped: String = sanitized.chars().take(400).collect();
+    msg.push_str(&format!("\nAgent's stated reason: {capped}"));
+    msg.push_str(
+        "\nApprove this write? (approve=false, declining, or ignoring this \
+         refuses the edit)",
+    );
+    msg
+}
+
+/// Content fingerprint for the per-session declined-cache — keyed by what
+/// would actually be written, never by path alone (audit L7: changed content
+/// is a NEW question and must re-ask; the identical retry must not re-harass
+/// the human).
+fn fingerprint_edit_lines(p: &EditLinesParams) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.path.hash(&mut h);
+    for e in &p.edits {
+        e.start_line.hash(&mut h);
+        e.end_line.hash(&mut h);
+        e.expected_hash.hash(&mut h);
+        e.old_text.hash(&mut h);
+        e.new_text.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// See `fingerprint_edit_lines` — same contract for `edit_symbol` params.
+fn fingerprint_edit_symbol(p: &EditSymbolParams) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.symbol.hash(&mut h);
+    p.path.hash(&mut h);
+    p.line.hash(&mut h);
+    p.position.hash(&mut h);
+    p.expected_hash.hash(&mut h);
+    p.old_text.hash(&mut h);
+    p.new_text.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Symbols in `path` whose `[line_start, line_end]` overlaps any of `ranges`
@@ -1749,4 +2128,115 @@ pub(crate) struct FormatFilesOutput {
     pub(crate) index_stale: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[cfg(test)]
+mod elicit_tests {
+    use super::*;
+
+    fn approval(approve: bool) -> Result<Option<HubEditApproval>, rmcp::service::ElicitationError> {
+        Ok(Some(HubEditApproval { approve }))
+    }
+
+    #[test]
+    fn map_elicit_outcome_approve_true_is_the_only_ok() {
+        let (verdict, mapped) = map_elicit_outcome(approval(true));
+        assert_eq!(verdict, "elicit_approved");
+        assert!(mapped.is_ok());
+    }
+
+    #[test]
+    fn map_elicit_outcome_approve_false_and_empty_accept_decline() {
+        for res in [approval(false), Ok(None)] {
+            let (verdict, mapped) = map_elicit_outcome(res);
+            assert_eq!(verdict, "elicit_declined");
+            assert_eq!(mapped.unwrap_err().code, "USER_DECLINED");
+        }
+    }
+
+    #[test]
+    fn map_elicit_outcome_decline_and_cancel_are_user_declined() {
+        use rmcp::service::ElicitationError as E;
+        for e in [E::UserDeclined, E::UserCancelled] {
+            let (verdict, mapped) = map_elicit_outcome(Err(e));
+            assert_eq!(verdict, "elicit_declined");
+            assert_eq!(mapped.unwrap_err().code, "USER_DECLINED");
+        }
+    }
+
+    #[test]
+    fn map_elicit_outcome_timeout_names_the_off_switch() {
+        let err = rmcp::service::ElicitationError::Service(rmcp::ServiceError::Timeout {
+            timeout: std::time::Duration::from_secs(1),
+        });
+        let (verdict, mapped) = map_elicit_outcome(Err(err));
+        assert_eq!(verdict, "elicit_timeout");
+        let detail = mapped.unwrap_err();
+        assert_eq!(detail.code, "ELICITATION_TIMEOUT");
+        // Audit FM2/Ab1: the refusal must point at the config off-switch so
+        // a headless session's operator can fix the setup instead of
+        // retry-looping into repeated 120s hangs.
+        assert!(
+            detail.message.contains("elicit_hub_confirm"),
+            "{}",
+            detail.message
+        );
+    }
+
+    #[test]
+    fn map_elicit_outcome_other_errors_fail_closed() {
+        let err = rmcp::service::ElicitationError::CapabilityNotSupported;
+        let (verdict, mapped) = map_elicit_outcome(Err(err));
+        assert_eq!(verdict, "elicit_failed");
+        assert_eq!(mapped.unwrap_err().code, "ELICITATION_FAILED");
+    }
+
+    fn lines_params(new_text: &str) -> EditLinesParams {
+        EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some("abc".into()),
+                old_text: None,
+                new_text: new_text.into(),
+            }],
+            confirm: true,
+            reason: Some("r".into()),
+        }
+    }
+
+    #[test]
+    fn fingerprint_tracks_content_not_just_path() {
+        // Audit L7: identical params must dedup, changed content must NOT
+        // (a new question deserves a fresh ask — identity-reuse ≠ safe-to-
+        // dedup).
+        let a = fingerprint_edit_lines(&lines_params("    return 2\n"));
+        let b = fingerprint_edit_lines(&lines_params("    return 2\n"));
+        let c = fingerprint_edit_lines(&lines_params("    return 3\n"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn elicit_message_caps_the_reason_and_keeps_context() {
+        let ask = HubAskContext {
+            why: "a hub symbol (is_hub=true)".into(),
+            risk: Some("high".into()),
+            hub_kind: Some("degree".into()),
+            touched: vec![("a.py::helper".into(), 12), ("a.py::other".into(), 3)],
+        };
+        let long_reason = "x".repeat(5000);
+        let msg = build_hub_elicit_message("edit_lines", "a.py", &ask, Some(&long_reason));
+        // Audit FM3: hard cap — the 5000-char reason must not reach the
+        // human's approval UI at full length.
+        assert!(
+            msg.len() < 1200,
+            "message unexpectedly long: {} chars",
+            msg.len()
+        );
+        assert!(msg.contains("a.py::helper (12 callers)"));
+        assert!(msg.contains("hub_kind=degree"));
+        assert!(msg.contains("risk=high"));
+    }
 }

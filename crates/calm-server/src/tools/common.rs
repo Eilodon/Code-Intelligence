@@ -352,6 +352,24 @@ impl CalmServer {
         self.touch_active_session(Some(path));
     }
 
+    /// See `SessionLog::elicit_declined` — true when a human already vetoed
+    /// this exact `(path, hunk-content fingerprint)` pair this session.
+    pub(crate) fn elicit_declined_contains(&self, path: &str, fingerprint: &str) -> bool {
+        self.session_log.lock().is_ok_and(|log| {
+            log.elicit_declined
+                .contains(&(path.to_string(), fingerprint.to_string()))
+        })
+    }
+
+    /// Records a human veto for this exact `(path, fingerprint)` pair — the
+    /// identical retry short-circuits to USER_DECLINED without re-asking.
+    pub(crate) fn elicit_declined_insert(&self, path: &str, fingerprint: &str) {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.elicit_declined
+                .insert((path.to_string(), fingerprint.to_string()));
+        }
+    }
+
     /// Refreshes this connection's own entry in the shared `active_sessions`
     /// map — `last_touched_file` (when `path` is `Some`), `last_touched_at`,
     /// and `tool_calls` (read from `session_log`, already bumped by

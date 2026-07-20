@@ -2092,6 +2092,63 @@ pub(crate) fn zero_caller_count_is_uncertain(dead_code_confidence: &str) -> bool
     matches!(dead_code_confidence, "none" | "low")
 }
 
+/// Why a touched symbol's `caller_count == 0` shouldn't be read as "safe to
+/// edit without a closer look" — see `zero_caller_count_is_uncertain`. Kept
+/// distinct from that boolean so a denial message can name the actual
+/// cause instead of defaulting to "entry point" even when the real trigger
+/// was `is_test` or a borderline coverage/scope call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UncertainZeroCallerReason {
+    /// `is_entry_point`: real invocation is a framework/macro/language
+    /// dispatch mechanism (rmcp `#[tool]`, `main`, a trait-dispatch name, a
+    /// bodyless trait method declaration, ...) invisible to the static
+    /// call graph — `caller_count == 0` here is permanent and structural.
+    EntryPoint,
+    /// `is_test` (and not also an entry point): the test harness discovers
+    /// and runs it by convention/reflection, not a literal call site.
+    /// Same static-graph blind spot as `EntryPoint`, different cause and
+    /// consequence — nothing external depends on it, so the risk on edit
+    /// is to test coverage silently breaking, not production blast radius.
+    TestOnly,
+    /// Neither of the above, but `compute_dead_code_confidence` still came
+    /// back `"none"`/`"low"` for a function/method (e.g. runtime coverage
+    /// shows it executing despite no static callers). A genuine but
+    /// unlabeled "this doesn't look confidently safe" signal.
+    LowConfidence,
+}
+
+/// Classifies *why* `dead_code_confidence` disagreed a zero-caller
+/// function/method looks safely removable, or returns `None` if it
+/// didn't (`zero_caller_count_is_uncertain` was false). `is_entry_point`
+/// takes priority over `is_test` when — in principle — both were somehow
+/// true at once, since it's the stronger, more specific signal.
+pub(crate) fn classify_uncertain_zero_caller(
+    is_entry_point: bool,
+    is_test: bool,
+    dead_code_confidence: &str,
+) -> Option<UncertainZeroCallerReason> {
+    if !zero_caller_count_is_uncertain(dead_code_confidence) {
+        return None;
+    }
+    Some(if is_entry_point {
+        UncertainZeroCallerReason::EntryPoint
+    } else if is_test {
+        UncertainZeroCallerReason::TestOnly
+    } else {
+        UncertainZeroCallerReason::LowConfidence
+    })
+}
+
+/// Priority ordering when multiple touched symbols disagree on why —
+/// mirrors `hub_kind_strength`'s "pick the strongest signal found" shape.
+pub(crate) fn uncertain_zero_caller_strength(reason: UncertainZeroCallerReason) -> u8 {
+    match reason {
+        UncertainZeroCallerReason::EntryPoint => 2,
+        UncertainZeroCallerReason::TestOnly => 1,
+        UncertainZeroCallerReason::LowConfidence => 0,
+    }
+}
+
 const CALL_SITE_PREVIEW_MAX_CHARS: usize = 160;
 
 /// Read the trimmed source line at `line` (1-indexed) from `project_root/path`

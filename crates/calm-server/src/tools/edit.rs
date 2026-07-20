@@ -827,7 +827,7 @@ impl CalmServer {
             None => "skipped_unrecognized_language",
         };
 
-        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, entry_point_uncertain, pre_touched) = {
+        let (risk, hub_hit, hub_kind, bridge_downgrade_eligible, uncertain_zero_caller, pre_touched) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
@@ -837,7 +837,7 @@ impl CalmServer {
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (risk, hub_hit, hub_kind, entry_point_uncertain, touched) =
+            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched) =
                 compute_touch_risk(&conn, path, &ranges, &coverage);
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
@@ -846,11 +846,13 @@ impl CalmServer {
             // doc comment for why textual/ambiguous callers disqualify it
             // regardless of hub_kind: the true blast radius can exceed the
             // counted caller_count). Never eligible when
-            // `entry_point_uncertain` -- that signal means the real caller
-            // is invisible to the graph entirely, not just under-confident.
+            // `uncertain_zero_caller` is set -- that signal means the real
+            // caller is invisible to the graph entirely (or the coverage/
+            // dead-code heuristic disagrees it's safe), not just under-
+            // confident about a caller edge that does exist.
             let eligible = hub_kind.as_deref() == Some("bridge")
                 && risk.as_deref() != Some("high")
-                && !entry_point_uncertain
+                && uncertain_zero_caller.is_none()
                 && all_caller_edges_confident(
                     &conn,
                     &touched
@@ -859,13 +861,23 @@ impl CalmServer {
                         .map(|t| t.qualified_name.clone())
                         .collect::<Vec<_>>(),
                 );
-            (risk, hub_hit, hub_kind, eligible, entry_point_uncertain, touched)
+            (risk, hub_hit, hub_kind, eligible, uncertain_zero_caller, touched)
         };
-        if hub_hit || risk.as_deref() == Some("high") || entry_point_uncertain {
+        if hub_hit || risk.as_deref() == Some("high") || uncertain_zero_caller.is_some() {
             let why = if hub_hit {
                 "a hub symbol (is_hub=true)".to_string()
-            } else if entry_point_uncertain {
-                "a zero-confirmed-caller entry point (e.g. an rmcp #[tool(name = \"...\")] MCP handler, main, or similar framework/macro dispatch -- the real invocation isn't visible to the static call graph, so a low caller_count can't be trusted as low blast radius)".to_string()
+            } else if let Some(reason) = uncertain_zero_caller {
+                match reason {
+                    UncertainZeroCallerReason::EntryPoint => {
+                        "a zero-confirmed-caller entry point (e.g. an rmcp #[tool(name = \"...\")] MCP handler, main, a trait-dispatch protocol method, a bodyless trait method declaration, or similar framework/macro/language dispatch -- the real invocation isn't visible to the static call graph, so a low caller_count can't be trusted as low blast radius)".to_string()
+                    }
+                    UncertainZeroCallerReason::TestOnly => {
+                        "a zero-confirmed-caller test-only symbol (only the test harness discovers and runs it by convention/reflection, not a literal call site -- editing it risks silently breaking test coverage the static call graph can't see)".to_string()
+                    }
+                    UncertainZeroCallerReason::LowConfidence => {
+                        "a zero-confirmed-caller symbol the dead-code heuristic isn't confident is safe to treat as unused (e.g. runtime coverage shows it executing despite no static callers) -- treat the zero caller_count as inconclusive, not proof of low blast radius".to_string()
+                    }
+                }
             } else {
                 "a high-risk symbol (>10 callers)".to_string()
             };
@@ -1600,6 +1612,27 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// real caller is invisible to the static call graph by construction, so
 /// `caller_count == 0` can't be read as "safe" the way it can for an
 /// ordinary non-entry-point symbol.
+/// `(risk_level, hub_hit, strongest_hub_kind, uncertain_zero_caller,
+/// touched_symbols)` for whatever symbols in `path` overlap `ranges`.
+/// `risk_level` is `None` when nothing overlaps (editing dead space
+/// between symbols, or a file with no parsed symbols at all — Cargo.toml,
+/// docs) — that's not an error, just nothing to gate on.
+/// `strongest_hub_kind` is `None` when nothing touched is a hub,
+/// `Some("bridge")` only when every touched hub is bridge-only, and
+/// `Some("degree")`/`Some("both")` if any touched hub is stronger than
+/// bridge-only (see `hub_kind_strength`). `uncertain_zero_caller` is
+/// `Some(reason)` when a touched **function or method** has
+/// `caller_count == 0` AND the same dead-code heuristic `edit_context`
+/// uses disagrees it looks safely removable — see
+/// `classify_uncertain_zero_caller` for what `reason` distinguishes.
+/// Deliberately gated on `kind` being `"function"`/`"method"`:
+/// `compute_dead_code_confidence` returns `"none"` for every other kind
+/// (the dead-code question isn't well-formed for a struct/enum/etc. — see
+/// its own doc comment: "confirmed: 100% of this repo's own struct
+/// symbols have caller_count=0") — that `"none"` is a vacuous "not
+/// applicable", not a "confirmed safe" signal, so counting it here would
+/// force the full write gate on nearly every struct/enum edit in this
+/// codebase for no real reason.
 fn compute_touch_risk(
     conn: &rusqlite::Connection,
     path: &str,
@@ -1609,14 +1642,14 @@ fn compute_touch_risk(
     Option<String>,
     bool,
     Option<String>,
-    bool,
+    Option<UncertainZeroCallerReason>,
     Vec<TouchedSymbolOutput>,
 ) {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
     let mut strongest_hub_kind: Option<String> = None;
-    let mut entry_point_uncertain = false;
+    let mut uncertain_zero_caller: Option<UncertainZeroCallerReason> = None;
     let mut touched = Vec::with_capacity(rows.len());
     for row in rows {
         max_callers = max_callers.max(row.caller_count);
@@ -1629,7 +1662,7 @@ fn compute_touch_risk(
                 strongest_hub_kind = Some(k.clone());
             }
         }
-        if row.caller_count == 0 {
+        if row.caller_count == 0 && matches!(row.kind.as_str(), "function" | "method") {
             let is_private = calm_core::analysis::dead_code::is_private_symbol(
                 &row.language,
                 &row.name,
@@ -1650,8 +1683,15 @@ fn compute_touch_risk(
                     coverage,
                     &row.kind,
                 );
-            if zero_caller_count_is_uncertain(dead_code_confidence) {
-                entry_point_uncertain = true;
+            if let Some(reason) =
+                classify_uncertain_zero_caller(row.is_entry_point, row.is_test, dead_code_confidence)
+            {
+                let stronger = uncertain_zero_caller.is_none_or(|cur| {
+                    uncertain_zero_caller_strength(reason) > uncertain_zero_caller_strength(cur)
+                });
+                if stronger {
+                    uncertain_zero_caller = Some(reason);
+                }
             }
         }
         touched.push(TouchedSymbolOutput {
@@ -1662,7 +1702,7 @@ fn compute_touch_risk(
         });
     }
     let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
-    (risk, hub_hit, strongest_hub_kind, entry_point_uncertain, touched)
+    (risk, hub_hit, strongest_hub_kind, uncertain_zero_caller, touched)
 }
 
 /// Plan 3 §3.3 (F10): true iff every caller edge (`call_edges.to_symbol`)

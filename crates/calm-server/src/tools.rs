@@ -6880,6 +6880,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn edit_lines_struct_with_zero_confirmed_callers_does_not_force_confirm_gate() {
+        // Regression: `compute_dead_code_confidence` returns "none" for any
+        // non-function/method kind (the dead-code question isn't well-formed
+        // for a struct/enum/etc. -- see its own doc comment: "confirmed:
+        // 100% of this repo's own struct symbols have caller_count=0"). That
+        // "none" is a vacuous "not applicable", not a "confirmed safe"
+        // signal -- treating it as an uncertainty trigger would force the
+        // full edit_context/confirm/reason gate on nearly every struct edit
+        // in this codebase, which is neither what is_entry_point/is_test
+        // uncertainty is about nor a usable default. Only function/method
+        // kinds should ever contribute to this escalation.
+        let (dir, server) = test_server("edit_confirm_gate_plain_struct");
+        std::fs::write(dir.join("a.py"), "class Foo:\n    x = 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("class Foo:\n    x = 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.py::Foo', 'Foo', 'class', 'python', 'a.py', 1, 2, '', '', 'Foo', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    x = 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(outcome);
+        assert_eq!(v["applied"], true, "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_zero_caller_test_only_symbol_names_test_not_entry_point_in_denial() {
+        // Regression: a test-only symbol (`is_test=1`, no `is_entry_point`)
+        // with zero confirmed callers also trips the gate (the test harness
+        // discovers/runs it by convention, not a literal call site -- same
+        // category of static-graph blind spot as is_entry_point, just a
+        // different cause) -- but the denial message must say so, not
+        // reuse the entry-point wording verbatim.
+        let (dir, server) = test_server("edit_confirm_gate_test_only");
+        std::fs::write(dir.join("a.py"), "def test_something():\n    assert True\n").unwrap();
+        let hash =
+            calm_core::edit::range_checksum("def test_something():\n    assert True\n", 2, 2)
+                .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.py::test_something', 'test_something', 'function', 'python', 'a.py', 1, 2, '', '', 'test_something', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "test_something".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    assert False\n".into(),
+                }],
+                confirm: false,
+                reason: Some("looks fine".into()),
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("test"), "response: {v}");
+        assert!(!message.contains("entry point"), "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Elicitation human-veto gate (docs/superskills/specs/
     // 2026-07-20-calm-elicitation-hub-edit-confirm.md): the Ask gate may
     // only fire AFTER the full machine gate passes, and only on hub touches.

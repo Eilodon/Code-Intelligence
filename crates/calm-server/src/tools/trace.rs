@@ -159,8 +159,17 @@ impl CalmServer {
             // Zero direct AND zero ambiguous callers is the exact "0 usages"
             // trap a pre-edit safety check can be fooled by — attach an
             // advisory caveat rather than let an empty list read as proof.
-            let no_usage_caveat =
-                (count == 0 && ambiguous_count == 0).then(|| Caveat::no_direct_usage(&p.symbol));
+            // `is_entry_point` symbols (rmcp #[tool] handlers, main, trait-
+            // dispatch protocol methods, decorator-registered handlers, ...)
+            // get a distinct caveat: for them, zero is the expected,
+            // permanent shape, not a "maybe dead code" signal.
+            let no_usage_caveat = (count == 0 && ambiguous_count == 0).then(|| {
+                if c.is_entry_point {
+                    Caveat::entry_point_dispatch(&p.symbol)
+                } else {
+                    Caveat::no_direct_usage(&p.symbol)
+                }
+            });
 
             // Cap the raw per-entry dump AFTER everything above (etag, sn,
             // caveat) has already looked at the full sets — direct_count/

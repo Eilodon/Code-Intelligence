@@ -2097,6 +2097,72 @@ mod tests {
     }
 
     #[test]
+    fn callers_zero_usage_caveat_distinguishes_entry_point_from_generic() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_callers_entry_point_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/tools.rs::repo_overview', 'repo_overview', 'method', 'rust', 'src/tools.rs', 1, 1, 'fn repo_overview()', '', 'repo_overview', 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/util.rs::orphan_helper', 'orphan_helper', 'function', 'rust', 'src/util.rs', 1, 1, 'fn orphan_helper()', '', 'orphan_helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let entry_point = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
+            CallersParams {
+                symbol: "repo_overview".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            },
+        )));
+        assert_eq!(
+            entry_point["caveat"]["class"], "entry_point_dispatch",
+            "response: {entry_point}"
+        );
+        assert!(
+            entry_point["caveat"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("entry point"),
+            "response: {entry_point}"
+        );
+
+        let generic = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
+            CallersParams {
+                symbol: "orphan_helper".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            },
+        )));
+        assert_eq!(
+            generic["caveat"]["class"], "no_direct_usage",
+            "response: {generic}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn callers_reports_db_error_when_call_edges_table_missing() {
         // audit F4 extended (Plan 1's resolve_reports_db_error_not_not_found
         // pattern, applied to trace.rs::callers' own prepare()/query_map()):
@@ -6636,6 +6702,180 @@ mod tests {
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_requires_confirm_for_zero_caller_entry_point() {
+        // Mirrors `edit_lines_requires_confirm_for_hub_symbol`, but the
+        // trigger is `is_entry_point` with zero confirmed callers (e.g. an
+        // rmcp `#[tool(name = "...")]` MCP handler -- real invocation comes
+        // from the framework's dispatch table, never a literal call site
+        // tree-sitter/SCIP can see) instead of `is_hub`. Without this gate,
+        // a symbol whose real blast radius is invisible to the static call
+        // graph reads as the *safest* possible edit target (caller_count=0,
+        // is_hub=false -> risk="low") when it's actually the opposite.
+        let (dir, server) = test_server("edit_confirm_gate_entry_point");
+        std::fs::write(dir.join("a.py"), "def mcp_tool_handler():\n    return 1\n").unwrap();
+        let hash =
+            calm_core::edit::range_checksum("def mcp_tool_handler():\n    return 1\n", 2, 2)
+                .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::mcp_tool_handler', 'mcp_tool_handler', 'function', 'python', 'a.py', 1, 2, '', '', 'mcp_tool_handler', 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Layer 1 -- structural: edit_context was never called this
+        // session, so confirm:true + a plausible reason still isn't enough.
+        let never_reviewed = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("looks fine".into()),
+            },
+        ));
+        let v = jv(never_reviewed);
+        assert_eq!(v["error"]["code"], "EDIT_CONTEXT_REQUIRED", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def mcp_tool_handler():\n    return 1\n"
+        );
+
+        // Satisfy layer 1.
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "mcp_tool_handler".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        // Layer 2 -- confirm still required even after edit_context ran, and
+        // the denial names the real reason (entry point), not a generic
+        // hub/high-caller one.
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: Some("looks fine".into()),
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("entry point"),
+            "response: {v}"
+        );
+
+        // Layer 3 -- content-grounded: a blank reason doesn't count even
+        // though this symbol has 0 confirmed callers (the "nothing to
+        // cite" fallback still requires *some* non-empty reason).
+        let blank_reason = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("   ".into()),
+            },
+        ));
+        let v = jv(blank_reason);
+        assert_eq!(v["error"]["code"], "REASON_NOT_GROUNDED", "response: {v}");
+
+        // All three layers satisfied.
+        let with_all = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("checked -- entry point, no confirmed callers, dispatched externally".into()),
+            },
+        ));
+        let v = jv(with_all);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def mcp_tool_handler():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_entry_point_with_confirmed_caller_does_not_force_confirm_gate() {
+        // Documents the fix's boundary: the entry-point escalation only
+        // fires when caller_count==0 (the case where the invisible
+        // framework/macro dispatch caller would otherwise be the ONLY
+        // caller). A symbol that already has a real confirmed caller isn't
+        // in that blind spot, so it keeps ordinary caller_count-based risk
+        // tiering untouched -- this fix does not force confirm on every
+        // is_entry_point symbol, only the zero-confirmed-caller ones.
+        let (dir, server) = test_server("edit_confirm_gate_entry_point_with_caller");
+        std::fs::write(dir.join("a.py"), "def handler():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def handler():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::handler', 'handler', 'function', 'python', 'a.py', 1, 2, '', '', 'handler', 1, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(outcome);
+        assert_eq!(v["applied"], true, "response: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

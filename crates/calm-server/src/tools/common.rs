@@ -1141,6 +1141,34 @@ impl Caveat {
         }
     }
 
+    /// Same "zero direct callers" situation as `no_direct_usage`, but for a
+    /// symbol the parser already flagged `is_entry_point` at index time
+    /// (`detect_entry_point`/`rust_attr_is_dispatch_signal` and their
+    /// per-language equivalents — `main`, a trait-dispatch protocol method,
+    /// a decorator/annotation-registered handler, or a macro-attribute
+    /// dispatch target such as an rmcp `#[tool(name = "...")]` MCP handler).
+    /// For these, zero static callers isn't a "maybe dead, maybe hidden"
+    /// judgment call — it's the expected, permanent shape: the real
+    /// invocation happens through a mechanism (framework dispatch table,
+    /// operator/protocol sugar, decorator registration) that never appears
+    /// as a literal call-site token in source, so no amount of indexing —
+    /// tree-sitter or a compiler-grade SCIP overlay alike — can ever
+    /// populate this count. Distinct wording from `no_direct_usage` so a
+    /// caller doesn't read this as a dead-code hint to chase down.
+    pub(crate) fn entry_point_dispatch(symbol: &str) -> Self {
+        Caveat {
+            class: "entry_point_dispatch",
+            message: format!(
+                "'{symbol}' has zero direct callers in the index, but is flagged as a \
+                 language/framework entry point (e.g. an rmcp #[tool(...)] MCP handler, \
+                 `main`, a trait-dispatch protocol method, a decorator/annotation-registered \
+                 handler, or similar). Its real invocation happens through a mechanism \
+                 CALM's static call graph can't lexically capture — a near-zero caller_count \
+                 here is expected by design, not a dead-code signal."
+            ),
+        }
+    }
+
     /// Some, but not all, of a `symbols_batch` call's requested
     /// `qualified_names` matched nothing in the index. Names the first
     /// few missing ids so the caller doesn't have to diff the request
@@ -2045,6 +2073,23 @@ pub(crate) fn risk_level_from_caller_count(caller_count: i64) -> &'static str {
     } else {
         "low"
     }
+}
+
+/// Whether `caller_count == 0` on a risk-relevant symbol should be treated
+/// as an opaque/uncertain signal rather than genuine low-blast-radius
+/// usage: true when the dead-code heuristic (`is_entry_point`/`is_test`/
+/// coverage-aware `compute_dead_code_confidence`) disagrees this symbol
+/// looks safely removable. Shared by `edit_context`'s advisory risk
+/// escalation and `compute_touch_risk`'s hard write-gate so the two
+/// independent consumers of `caller_count` can't silently drift apart the
+/// way `risk_level_from_caller_count`'s three former copies once did (see
+/// its own docstring) — confirmed live: before this was wired into
+/// `compute_touch_risk`, editing a real zero-caller `#[tool(name = "...")]`
+/// MCP handler via `edit_lines`/`edit_symbol` bypassed the mandatory
+/// confirm/edit_context gate entirely, because `is_hub`/raw `caller_count`
+/// alone can't see the framework dispatch that's its actual caller.
+pub(crate) fn zero_caller_count_is_uncertain(dead_code_confidence: &str) -> bool {
+    matches!(dead_code_confidence, "none" | "low")
 }
 
 const CALL_SITE_PREVIEW_MAX_CHARS: usize = 160;

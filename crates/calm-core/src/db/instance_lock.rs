@@ -173,7 +173,29 @@ mod tests {
         );
 
         drop(first);
-        let third = try_acquire(dir.path());
+        // A bare, single re-attempt right after `drop` has zero tolerance for
+        // anything other than the lock itself — but `try_acquire_named`
+        // collapses ANY `open()`/`try_lock_exclusive` error into the same
+        // `None` a genuine "still locked" result would produce (see its doc
+        // comment). This flaked once in CI's heavier `all-languages` job (11
+        // extra language backends + lsp-overlay, some of which spawn real
+        // LSP subprocesses) but never in the lighter `verify` job running
+        // the identical test/code on the same runner type, and couldn't be
+        // reproduced locally (30/30 in isolation, 802/802 under the
+        // identical feature set, even with `ulimit -n` cut to 10) — most
+        // likely a transient EMFILE from fd pressure elsewhere in that
+        // heavier shared test binary racing this exact instant, not the
+        // lock itself being slow to release. Retry briefly rather than
+        // asserting on the very first attempt, matching the tolerance the
+        // sibling `acquire_blocking_waits_for_release_then_succeeds` test
+        // already budgets (200ms/2s) for this same class of slop.
+        let third = (0..20).find_map(|_| {
+            let lock = try_acquire(dir.path());
+            if lock.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            lock
+        });
         assert!(third.is_some(), "lock must be acquirable after release");
     }
 

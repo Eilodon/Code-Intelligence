@@ -877,7 +877,17 @@ impl CalmServer {
                 touched,
             )
         };
-        if hub_hit || risk.as_deref() == Some("high") || uncertain_zero_caller.is_some() {
+        // `always_require_edit_context` (Config.edit) widens this gate to
+        // every touched symbol regardless of risk -- see OrientationConfig/
+        // EditConfig's own doc comments (config.rs) for why this exists as a
+        // protocol-level, client-agnostic alternative to a Claude-Code-only
+        // hook.
+        let force_gate_always = self.config().edit.always_require_edit_context;
+        if hub_hit
+            || risk.as_deref() == Some("high")
+            || uncertain_zero_caller.is_some()
+            || force_gate_always
+        {
             let why = if hub_hit {
                 "a hub symbol (is_hub=true)".to_string()
             } else if let Some(reason) = uncertain_zero_caller {
@@ -892,8 +902,10 @@ impl CalmServer {
                         "a zero-confirmed-caller symbol the dead-code heuristic isn't confident is safe to treat as unused (e.g. runtime coverage shows it executing despite no static callers) -- treat the zero caller_count as inconclusive, not proof of low blast radius".to_string()
                     }
                 }
-            } else {
+            } else if risk.as_deref() == Some("high") {
                 "a high-risk symbol (>10 callers)".to_string()
+            } else {
+                "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
             };
 
             if bridge_downgrade_eligible {

@@ -62,6 +62,7 @@ impl CalmServer {
             next_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             edit_lock: Arc::new(Mutex::new(())),
+            oriented: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preset,
             tool_router,
         })
@@ -108,6 +109,11 @@ impl CalmServer {
         Self {
             session_id,
             session_log: Arc::new(Mutex::new(SessionLog::default())),
+            // Must be a fresh Arc here, NOT inherited via `..self.clone()` —
+            // see `CalmServer::oriented`'s own doc comment for why leaving
+            // this out would silently share one gate flag across every
+            // connection on a shared daemon.
+            oriented: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ..self.clone()
         }
     }
@@ -398,6 +404,107 @@ impl CalmServer {
             .lock()
             .map(|log| log.written_files.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Tool names that already satisfy the session-start orientation gate
+    /// (`CalmServer::call_tool`, `Config.orientation`) on their own — calling
+    /// any of these IS the orientation, so the gate never needs to inject
+    /// into, or block around, a call to one of them.
+    const ORIENTATION_ADJACENT_TOOLS: &'static [&'static str] =
+        &["repo_overview", "indexing_status", "session_context"];
+
+    /// Whether `name` is one of `ORIENTATION_ADJACENT_TOOLS`.
+    pub(crate) fn is_orientation_adjacent(name: &str) -> bool {
+        Self::ORIENTATION_ADJACENT_TOOLS.contains(&name)
+    }
+
+    /// Whether the active (preset-scoped) `tool_router` registers at least
+    /// one orientation-adjacent tool. `"block"` mode's only escape hatch is
+    /// calling one of them — a preset that excludes the whole `orient`
+    /// toolset entirely (e.g. `--preset "security"` alone, or any composed
+    /// spec that subtracts it, like `"full,-orient"`) registers none of
+    /// them, so a literal block there would refuse every call for the rest
+    /// of the connection with no way out at all.
+    pub(crate) fn orientation_escape_hatch_available(&self) -> bool {
+        self.tool_router
+            .list_all()
+            .iter()
+            .any(|t| Self::is_orientation_adjacent(t.name.as_ref()))
+    }
+
+    /// `Config.orientation.mode`, downgraded from `Block` to `Inject` when
+    /// `orientation_escape_hatch_available()` is false — see
+    /// `calm_core::config::OrientationMode::Block`'s own doc comment for why
+    /// a literal block with no escape hatch would deadlock the connection.
+    pub(crate) fn effective_orientation_mode(&self) -> calm_core::config::OrientationMode {
+        let mode = self.config().orientation.mode;
+        if mode == calm_core::config::OrientationMode::Block
+            && !self.orientation_escape_hatch_available()
+        {
+            calm_core::config::OrientationMode::Inject
+        } else {
+            mode
+        }
+    }
+
+    /// Content merged into the first non-orientation-adjacent tool response
+    /// of a session under `"inject"` mode — deliberately compact (mirrors
+    /// `repo_overview`'s `compact:true` shape), since the full
+    /// `repo_overview` response remains one real tool call away for an
+    /// agent that wants more.
+    pub(crate) fn orientation_injection_text(&self) -> String {
+        serde_json::json!({
+            "_calm_orientation": {
+                "note": "Auto-attached: this session hasn't called repo_overview yet. \
+                         Call it (or the calm_workflow prompt) for the full 8-stage workflow.",
+                "indexing_phase": self.phase_str(),
+                "embeddings_status": self.embed_status_str(),
+            }
+        })
+        .to_string()
+    }
+
+    /// `{"error": {code, message, recoverable}}`-shaped `ORIENTATION_REQUIRED`
+    /// refusal for `"block"` mode — same envelope every other tool-level
+    /// error in this server uses (see `error_detail`), so existing
+    /// client-side error handling doesn't need a special case for this one.
+    pub(crate) fn orientation_required_message(&self) -> String {
+        serde_json::to_string(&ErrorOutput {
+            error: error_detail(
+                "ORIENTATION_REQUIRED",
+                "call repo_overview first this session (session-start orientation gate, \
+                 [orientation] mode=\"block\" in .calm/config.json) — every other tool is \
+                 refused until then",
+                true,
+            ),
+        })
+        .unwrap_or_default()
+    }
+
+    /// Content merged into a tool response when this connection has written
+    /// files (`written_files_snapshot`) that haven't had `diff_impact` run
+    /// on them since — surfaced on every response while pending, not just
+    /// when `session_context` is asked. Always advisory: `diff_impact`-
+    /// before-commit can never be a hard server-side gate at all (an MCP
+    /// server has no visibility into a client's own native Bash/Edit tool
+    /// calls, e.g. `git commit`), so this only makes an already-real signal
+    /// (`session_context.pending_diff_impact`) harder to miss, on every
+    /// client uniformly, instead of adding new enforcement.
+    pub(crate) fn pending_diff_impact_reminder_text(&self) -> Option<String> {
+        let files = self.written_files_snapshot();
+        if files.is_empty() {
+            return None;
+        }
+        Some(
+            serde_json::json!({
+                "_calm_pending_diff_impact": {
+                    "note": "Files written this session have not had diff_impact run on \
+                             them yet — call diff_impact before commit/push.",
+                    "files": files,
+                }
+            })
+            .to_string(),
+        )
     }
 
     /// Clears the written-files set — `diff_impact` calls this only from its

@@ -29,6 +29,7 @@ pub struct Config {
     pub ruby: RubyConfig,
     pub indexing: IndexingConfig,
     pub edit: EditConfig,
+    pub orientation: OrientationConfig,
 }
 
 impl Default for Config {
@@ -90,6 +91,7 @@ impl Default for Config {
             ruby: RubyConfig::default(),
             indexing: IndexingConfig::default(),
             edit: EditConfig::default(),
+            orientation: OrientationConfig::default(),
         }
     }
 }
@@ -120,6 +122,16 @@ pub struct EditConfig {
     /// How long to wait for the human's answer before refusing with
     /// ELICITATION_TIMEOUT. Only read when `elicit_hub_confirm` is on.
     pub elicit_timeout_secs: u64,
+    /// Widens `edit_lines`/`edit_symbol`'s write-time risk gate
+    /// (`EDIT_CONTEXT_REQUIRED`/`CONFIRM_REQUIRED`/`REASON_NOT_GROUNDED`,
+    /// see `crates/calm-server/src/tools/edit.rs`) to fire on every touched
+    /// symbol, not just one that's `is_hub`/`risk_assessment: "high"`/an
+    /// uncertain-zero-caller symbol. Default `false` — zero behavior change
+    /// unless opted in; the existing hub/high-risk-only gate already applies
+    /// regardless of this flag. This is a protocol-level gate (the tool's
+    /// own JSON-RPC error response), so unlike a Claude-Code-only hook it
+    /// applies identically to every MCP client.
+    pub always_require_edit_context: bool,
 }
 
 impl Default for EditConfig {
@@ -127,6 +139,75 @@ impl Default for EditConfig {
         Self {
             elicit_hub_confirm: false,
             elicit_timeout_secs: 120,
+            always_require_edit_context: false,
+        }
+    }
+}
+
+/// `mode` values for `[orientation]` in `.calm/config.json` — see
+/// `OrientationConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationMode {
+    /// No session-start orientation behavior at all — today's pre-2026-07-22
+    /// behavior (only the advisory `get_info().with_instructions()` push and
+    /// tool descriptions, neither of them enforced).
+    Off,
+    /// The first tool call of a session that isn't already orientation-
+    /// adjacent (`repo_overview`, `indexing_status`, `session_context`) still
+    /// runs normally, but the server merges a compact orientation summary
+    /// into that same response — impossible to miss, never fails the call.
+    /// Default: a session that ignores the advisory push still can't avoid
+    /// seeing this on its very first real tool response, on any MCP client.
+    #[default]
+    Inject,
+    /// The first non-orientation-adjacent tool call of a session is refused
+    /// outright with `ORIENTATION_REQUIRED` until `repo_overview` has been
+    /// called. Automatically no-ops (falls back to `Inject`) when the
+    /// active tool_router (preset-scoped, see `resolve_preset`) doesn't
+    /// register any orientation-adjacent tool at all — e.g. a single-toolset
+    /// preset like `--preset "security"` never includes `repo_overview`, and
+    /// a literal block with no escape hatch would deadlock every call for
+    /// that session permanently.
+    Block,
+}
+
+impl OrientationMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Inject => "inject",
+            Self::Block => "block",
+        }
+    }
+}
+
+/// Session-start orientation gate (`[orientation]` in `.calm/config.json`) —
+/// the single, client-agnostic dispatch chokepoint every `tools/call` request
+/// passes through (`CalmServer::call_tool`), regardless of MCP client
+/// (Claude Code, Cursor, Windsurf, Codex CLI, or a hand-rolled client), since
+/// it's server-side protocol logic rather than a Claude-Code-only hook.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OrientationConfig {
+    pub mode: OrientationMode,
+    /// Whether every tool response (not just `session_context`, which
+    /// already surfaces this today) should carry a reminder while this
+    /// connection has files written (`written_files_snapshot`) that haven't
+    /// had `diff_impact` run on them since. Default `true`. Always advisory
+    /// — `diff_impact`-before-commit can never be a hard server-side gate at
+    /// all (an MCP server has no visibility into a client's own native
+    /// Bash/Edit tool calls, e.g. `git commit`), so this only makes an
+    /// already-real signal harder to miss, on every client uniformly,
+    /// instead of adding new enforcement.
+    pub remind_pending_diff_impact: bool,
+}
+
+impl Default for OrientationConfig {
+    fn default() -> Self {
+        Self {
+            mode: OrientationMode::default(),
+            remind_pending_diff_impact: true,
         }
     }
 }
@@ -1132,6 +1213,75 @@ mod tests {
             diff.contains(&"edit.elicit_hub_confirm".to_string()),
             "{diff:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_always_require_edit_context_defaults_off_and_parses_override() {
+        // Widened edit gate is opt-in: absent [edit] table = off (today's
+        // hub/high-risk-only behavior unchanged), and an old config.json
+        // without this field must keep parsing.
+        let d = Config::default();
+        assert!(!d.edit.always_require_edit_context);
+
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_always_edit_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"edit": {"always_require_edit_context": true}}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&tmp).unwrap();
+        assert!(loaded.edit.always_require_edit_context);
+        let diff = diff_from_default(&loaded);
+        assert!(
+            diff.contains(&"edit.always_require_edit_context".to_string()),
+            "{diff:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn orientation_config_defaults_to_inject_and_parses_override() {
+        let d = Config::default();
+        assert_eq!(d.orientation.mode, OrientationMode::Inject);
+        assert!(d.orientation.remind_pending_diff_impact);
+
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_orientation_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"orientation": {"mode": "block", "remind_pending_diff_impact": false}}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&tmp).unwrap();
+        assert_eq!(loaded.orientation.mode, OrientationMode::Block);
+        assert!(!loaded.orientation.remind_pending_diff_impact);
+        let diff = diff_from_default(&loaded);
+        assert!(diff.contains(&"orientation.mode".to_string()), "{diff:?}");
+        assert!(
+            diff.contains(&"orientation.remind_pending_diff_impact".to_string()),
+            "{diff:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn orientation_mode_off_round_trips_through_json() {
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_orientation_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"orientation": {"mode": "off"}}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&tmp).unwrap();
+        assert_eq!(loaded.orientation.mode, OrientationMode::Off);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

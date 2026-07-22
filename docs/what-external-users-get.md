@@ -44,6 +44,7 @@ This page describes exactly what you get from **installing CALM via `npx @eilodo
 ## 3. The safety layer around letting an agent edit code — CALM's core differentiator
 
 - **Blocks stale overwrites**: `edit_lines`/`edit_symbol` require an `expected_hash` from a prior read; a hash mismatch is rejected.
+- **Write-time risk gate**: touching a hub symbol, a high-caller symbol, or an uncertain-zero-caller symbol (e.g. an entry point only a framework macro ever dispatches) without first calling `edit_context` this session, and citing a real caller in `reason`, is refused outright (`EDIT_CONTEXT_REQUIRED`/`CONFIRM_REQUIRED`/`REASON_NOT_GROUNDED` in the tool's own JSON-RPC response) — protocol-level, so it applies identically on every MCP client, not just Claude Code. `edit.always_require_edit_context` (off by default, `.calm/config.json`) widens it to every touched symbol regardless of risk.
 - **Real cross-process locking**: a `flock` on `.calm/edit.lock` (the `fs4` crate) stops two different CALM processes (e.g. Cursor and Claude Code open on the same repo) from both passing the hash check and silently overwriting each other.
 - **Blocks symlink/path traversal**: `resolve_repo_path` canonicalizes the target and checks it against the project root, exercised by real filesystem tests including a real symlink.
 - **Two independent sanitization systems**, both in `sanitize.rs`:
@@ -84,8 +85,17 @@ Three providers: `rust-analyzer` (a live-session path distinct from its batch SC
 ## 5. Workflow guidance built in
 
 - **The `calm_workflow` MCP Prompt** is available in every binary and callable anytime with no flags — it returns the condensed 8-stage workflow.
-- **`get_info().with_instructions()`** is pushed automatically during the MCP `initialize` handshake, so every MCP client sees a "call `calm_workflow` first" pointer with zero setup on the user's part.
+- **`get_info().with_instructions()`** is pushed automatically during the MCP `initialize` handshake, so every MCP client sees a "call `calm_workflow` first" pointer with zero setup on the user's part. Advisory only, like the rest of this section — see §5a for the enforced version.
 - **`calm init --agents-md`** (opt-in, off by default) writes a condensed version (~700 characters, 8 lines) into the target project's AGENTS.md, wrapped in `<!-- calm:workflow:start/end -->` markers and safe to re-run — not the full AGENTS.md this repo uses for its own development.
+
+### 5a. Session-start orientation gate — the one client-agnostic *enforced* piece
+
+Everything above is a **push**, not a gate: a capable agent can (and, observed directly during this feature's own design review, sometimes does) simply ignore it with zero technical consequence. `[orientation]` in `.calm/config.json` closes that gap at the one place every `tools/call` request from *any* MCP client is guaranteed to pass through — `CalmServer::call_tool`, the `rmcp::ServerHandler` dispatch method itself, not a Claude-Code-only hook:
+
+- **`mode = "inject"` (default)** — the first non-orientation-adjacent tool call of a session (i.e. not `repo_overview`/`indexing_status`/`session_context`) still runs and returns its normal result, but the server merges a compact orientation summary into that same response. Never fails a call, never adds a round trip, works identically on Claude Code, Cursor, Windsurf, Codex CLI, or a hand-rolled MCP client.
+- **`mode = "block"`** — the same first call is refused outright with `ORIENTATION_REQUIRED` until `repo_overview` has actually been called. Automatically downgrades to `inject` when the active (preset-scoped) tool router doesn't register `repo_overview`/`indexing_status`/`session_context` at all — e.g. `--preset "security"` alone never includes them — so a literal block can never deadlock a session with no escape hatch.
+- **`mode = "off"`** — reverts to pre-2026-07-22 behavior (push only, nothing enforced).
+- **`remind_pending_diff_impact`** (default `true`) — while this connection has files written that haven't had `diff_impact` run on them since, every subsequent tool response (not just `session_context`, which already surfaced this) carries a reminder. Still advisory, not a hard gate — an MCP server has no visibility into a client's own native Bash/Edit tool calls (e.g. `git commit`), so `diff_impact`-before-commit can never be enforced this way on any client, Claude Code included.
 
 ---
 
@@ -97,6 +107,7 @@ Three providers: `rust-analyzer` (a live-session path distinct from its batch SC
 - **Honest best-effort framing** — the install output states the concrete ways the hook can be bypassed (overwriting `.calm/hooks.mode`, deleting the script, editing `settings.json`) rather than overclaiming it's unbypassable.
 - **`calm doctor` reports real status** by cross-checking the mode file, the `settings.json` wiring, and whether the script itself still exists — not trusting any single source.
 - **Downgrading the mode is never silent** — it leaves a trace in `.calm/audit.log` plus a one-time notice.
+- **Complements, not replaces, §5a** — this hook layer is Claude-Code-only (hooks are a Claude Code CLI feature, not an MCP-protocol capability) and specifically plugs the one hole §5a's server-side gate structurally cannot close: an agent bypassing CALM's own tools entirely via the client's *native* Edit/Write/Bash. §5a's orientation gate and the `edit.always_require_edit_context` widened edit gate (§3) work on every client without it.
 
 Shipped in `v0.3.0`; see `docs/superskills/specs/2026-07-15-calm-hooks-transparent-reactivation.md` for the full design.
 

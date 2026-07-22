@@ -318,6 +318,17 @@ pub struct CalmServer {
     /// source of truth for both `list_tools` and `call_tool`'s preset
     /// scoping — no separate availability check needed at dispatch time.
     tool_router: rmcp::handler::server::router::tool::ToolRouter<CalmServer>,
+    /// `true` once this connection's session-start orientation gate
+    /// (`call_tool`, `Config.orientation`) has fired — either because
+    /// `repo_overview`/`indexing_status`/`session_context` was actually
+    /// called, or because an `"inject"`/`"block"` gate already handled the
+    /// first non-orientation-adjacent call. MUST be explicitly reset to a
+    /// fresh `Arc` inside `for_connection` (like `session_log`, NOT like
+    /// `phase`/`coverage`/etc.) — leaving it out of that reset list would
+    /// silently share one daemon-wide flag across every forwarded
+    /// connection via `..self.clone()`, so only the FIRST client to ever
+    /// connect to a shared daemon would see the gate at all.
+    oriented: Arc<std::sync::atomic::AtomicBool>,
 }
 impl CalmServer {
     /// Merges every module's `#[tool_router]`-generated router into one —
@@ -616,9 +627,57 @@ impl rmcp::ServerHandler for CalmServer {
             tool = %request.name,
             traceparent = %traceparent
         );
+
+        // Session-start orientation gate (`Config.orientation`) — the one
+        // client-agnostic dispatch chokepoint every `tools/call` request
+        // passes through regardless of MCP client (Claude Code, Cursor,
+        // Windsurf, Codex CLI, or a hand-rolled client), since this is
+        // server-side protocol logic rather than a Claude-Code-only hook.
+        // See `calm_core::config::OrientationConfig`'s doc comment for the
+        // full rationale; the helper methods used below
+        // (`is_orientation_adjacent`/`effective_orientation_mode`/
+        // `orientation_injection_text`/`orientation_required_message`/
+        // `pending_diff_impact_reminder_text`) live in `tools/common.rs`.
+        let tool_name = request.name.to_string();
+        let already_oriented = self.oriented.load(std::sync::atomic::Ordering::SeqCst);
+        let is_adjacent = Self::is_orientation_adjacent(&tool_name);
+        let orientation_mode =
+            (!already_oriented && !is_adjacent).then(|| self.effective_orientation_mode());
+        if orientation_mode == Some(calm_core::config::OrientationMode::Block) {
+            tracing::info!(
+                target: crate::telemetry::AUDIT_TARGET,
+                session_id = self.session_id,
+                decision = "denied",
+                reason_code = "ORIENTATION_REQUIRED",
+                tool = %tool_name,
+            );
+            return Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(self.orientation_required_message()),
+            ]));
+        }
+
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tool_context).instrument(span).await
+        let mut result = self.tool_router.call(tool_context).instrument(span).await;
+        if let Ok(r) = &mut result {
+            if is_adjacent {
+                self.oriented
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if orientation_mode == Some(calm_core::config::OrientationMode::Inject) {
+                r.content.push(rmcp::model::ContentBlock::text(
+                    self.orientation_injection_text(),
+                ));
+                self.oriented
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.config().orientation.remind_pending_diff_impact
+                && tool_name != "diff_impact"
+                && let Some(reminder) = self.pending_diff_impact_reminder_text()
+            {
+                r.content.push(rmcp::model::ContentBlock::text(reminder));
+            }
+        }
+        result
     }
     fn list_prompts(
         &self,
@@ -2775,6 +2834,126 @@ mod tests {
         );
         assert_eq!(b_ctx["explored_files"], serde_json::json!([]));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_connection_gives_oriented_flag_fresh_state_per_connection() {
+        // Regression guard for a bug caught during design review: `oriented`
+        // MUST be freshly allocated by `for_connection`, not inherited via
+        // `..self.clone()` (unlike `phase`/`coverage`/etc., which correctly
+        // stay shared) — otherwise the first client to ever connect to a
+        // shared daemon would silently suppress the orientation gate for
+        // every connection after it.
+        let dir = std::env::temp_dir().join(format!("ci_oriented_fresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        conn_a
+            .oriented
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let conn_b = shared.for_connection();
+        assert!(
+            !conn_b.oriented.load(std::sync::atomic::Ordering::SeqCst),
+            "conn_b must start unoriented even though conn_a already flipped its own flag"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&conn_a.oriented, &conn_b.oriented));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_orientation_adjacent_matches_only_the_documented_tools() {
+        for name in ["repo_overview", "indexing_status", "session_context"] {
+            assert!(CalmServer::is_orientation_adjacent(name), "{name}");
+        }
+        for name in ["search", "edit_lines", "diff_impact", "locate", ""] {
+            assert!(!CalmServer::is_orientation_adjacent(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn orientation_escape_hatch_available_for_full_preset() {
+        let (dir, server) = test_server("orientation_escape_full");
+        assert!(server.orientation_escape_hatch_available());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orientation_escape_hatch_missing_for_security_only_preset() {
+        // The exact deadlock scenario the design pre-mortem caught:
+        // `--preset "security"` never registers repo_overview/
+        // indexing_status/session_context at all (they all live in the
+        // separate `orient`/`recover` toolsets), so a literal "block" gate
+        // with no fallback would refuse every tool call for the rest of the
+        // connection with no way out.
+        let dir =
+            std::env::temp_dir().join(format!("ci_orientation_escape_sec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server =
+            CalmServer::new_with_preset(dir.clone(), dir.join("index.db"), "security".into())
+                .unwrap();
+        assert!(!server.orientation_escape_hatch_available());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_orientation_mode_downgrades_block_to_inject_without_escape_hatch() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_orientation_downgrade_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"orientation": {"mode": "block"}}"#,
+        )
+        .unwrap();
+        let server =
+            CalmServer::new_with_preset(dir.clone(), dir.join("index.db"), "security".into())
+                .unwrap();
+        assert_eq!(
+            server.effective_orientation_mode(),
+            calm_core::config::OrientationMode::Inject
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_orientation_mode_stays_block_with_escape_hatch_present() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_orientation_stayblock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"orientation": {"mode": "block"}}"#,
+        )
+        .unwrap();
+        // Default "full" preset includes repo_overview.
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        assert_eq!(
+            server.effective_orientation_mode(),
+            calm_core::config::OrientationMode::Block
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_diff_impact_reminder_text_is_none_then_some_after_write() {
+        let (dir, server) = test_server("orientation_reminder");
+        assert!(server.pending_diff_impact_reminder_text().is_none());
+        server.mark_written("a.rs");
+        let reminder = server.pending_diff_impact_reminder_text();
+        assert!(reminder.is_some());
+        let v: serde_json::Value = serde_json::from_str(&reminder.unwrap()).unwrap();
+        assert_eq!(
+            v["_calm_pending_diff_impact"]["files"],
+            serde_json::json!(["a.rs"])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6079,6 +6258,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn always_require_edit_context_forces_gate_on_low_risk_edit() {
+        let dir = std::env::temp_dir().join(format!("ci_always_edit_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"always_require_edit_context": true}}"#,
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        // A genuinely boring symbol -- not a hub, 1 confirmed caller (so
+        // neither `risk == "high"` nor any `uncertain_zero_caller` path can
+        // fire), same shape `edit_lines_requires_confirm_for_hub_symbol`
+        // uses but with is_hub=0/caller_count=1 instead of is_hub=1. With
+        // the default config this symbol's edit would apply unconfirmed
+        // (no gate at all); `edit.always_require_edit_context` gates it
+        // anyway. Needs an actual symbols-table row (unlike the sibling
+        // no-op-fixture test right above) so `pre_touched` is non-empty and
+        // the EDIT_CONTEXT_REQUIRED check has something to require
+        // edit_context for by name.
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "EDIT_CONTEXT_REQUIRED", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
